@@ -113,7 +113,16 @@ function makeStorage(appId, token) {
 // doesn't bake it in; surfaced via runtime.esm_deps in the manifest so
 // the user sees it on install. ?bundle inlines the CSS-less JS and we
 // also fetch the stylesheet so display math doesn't render unstyled.
+//
+// Offline-reload behaviour: a dynamic import to an external host hangs
+// indefinitely on a flaky/offline link (the browser doesn't time out
+// `import()` itself), so we race against a 5s deadline. The .tex
+// editor and the paragraph/heading layer don't depend on KaTeX —
+// math falls back to its raw `$...$` source in a `math-error` span —
+// so editing and reading prose keep working while preview math is
+// degraded. A later retry (next online open) gets a fresh attempt.
 // ----------------------------------------------------------------------
+const KATEX_LOAD_TIMEOUT_MS = 5000
 let _katexPromise = null
 function loadKatex() {
   if (_katexPromise) return _katexPromise
@@ -126,7 +135,11 @@ function loadKatex() {
     link.href = 'https://esm.sh/katex@0.16/dist/katex.min.css'
     document.head.appendChild(link)
   }
-  _katexPromise = import('https://esm.sh/katex@0.16?bundle').catch((err) => {
+  const importPromise = import('https://esm.sh/katex@0.16?bundle')
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('katex-load-timeout')), KATEX_LOAD_TIMEOUT_MS)
+  })
+  _katexPromise = Promise.race([importPromise, timeoutPromise]).catch((err) => {
     // Reset so a later retry (back online) can try again.
     _katexPromise = null
     throw err
@@ -389,7 +402,12 @@ function TexTextBlock({ katex, segments }) {
 }
 
 // Top-level .tex renderer. Loads KaTeX on first mount, then renders
-// the planned block list.
+// the planned block list. If the dynamic import fails or times out
+// (offline / flaky link), we render the rest of the .tex (headings,
+// paragraphs, bold/italic) and the math falls back to its raw source
+// in a `math-error` span — the user can still read and edit. The
+// banner explains why preview math is degraded and disappears once
+// the user is back online + reopens the app.
 function TexPreview({ source }) {
   const [katex, setKatex] = useState(null)
   const [error, setError] = useState(null)
@@ -397,8 +415,11 @@ function TexPreview({ source }) {
     let cancelled = false
     loadKatex().then((m) => {
       if (!cancelled) setKatex(m.default || m)
-    }).catch((err) => {
-      if (!cancelled) setError(err.message || 'Failed to load KaTeX')
+    }).catch(() => {
+      // We don't surface the underlying error (timeout vs network vs
+      // CORS) — the user just needs to know the math preview will
+      // come back once they're online again.
+      if (!cancelled) setError(true)
     })
     return () => { cancelled = true }
   }, [])
@@ -406,7 +427,9 @@ function TexPreview({ source }) {
   return (
     <div className="tex-preview">
       {error && (
-        <div className="preview-note">Math rendering unavailable: {error}</div>
+        <div className="preview-banner">
+          Preview math loads on next online open. Editing still works.
+        </div>
       )}
       {plan.map((b, i) => <TexBlock key={i} block={b} katex={katex} />)}
     </div>
@@ -1660,6 +1683,20 @@ const CSS = `
   font-size: 13px;
   padding: 16px 0;
   text-align: center;
+}
+/* Subtle accent-tinted strip sitting at the top of the .tex preview
+   when KaTeX failed to load (offline / flaky link). Loud enough to
+   notice, quiet enough not to dominate the page; matches the news
+   app's offline banner so the two apps feel like one family. */
+.preview-banner {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
 }
 
 /* ---- .tex render ---- */
