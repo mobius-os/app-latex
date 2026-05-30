@@ -730,6 +730,16 @@ function FileDrawer({
 // system_prompt override (see chats.py:create_chat — it inherits the
 // shell's default skill), so an opening "here's the contract" user
 // message is the practical lever.
+//
+// The user message is sent with hidden:true so the main Möbius shell
+// (where the same chat may be opened from the drawer) renders it as
+// nothing — see frontend/ChatView.jsx, which skips m.hidden. The
+// agent's "Ready." reply is NOT auto-hidden by the backend; we live
+// with that one-line leak rather than depend on an explicit hidden
+// flag the backend doesn't apply to assistant turns. In-app, we use
+// `dropBootstrap()` (below) to strip both turns from the rendered
+// thread — more robust than slice(2), which silently mis-slices if
+// the API ever returns fewer than two messages mid-bootstrap.
 function bootstrapPrompt(appId) {
   return [
     `You are the LaTeX-editor sub-agent for Möbius app id ${appId}.`,
@@ -749,6 +759,19 @@ function bootstrapPrompt(appId) {
     '',
     'Reply with “Ready.” to confirm you’ve read this brief.',
   ].join('\n')
+}
+
+// Strip the bootstrap user message (which we sent with hidden:true)
+// and the assistant turn that immediately follows it from a message
+// list. Robust to weird states (missing first turn, multi-turn
+// bootstrap retry) where a hardcoded slice(2) would mis-slice and
+// leak the contract into the user-visible thread.
+function dropBootstrap(msgs) {
+  if (!msgs || msgs.length === 0) return msgs || []
+  let i = 0
+  if (msgs[i] && msgs[i].role === 'user' && msgs[i].hidden) i += 1
+  if (msgs[i] && msgs[i].role === 'assistant' && i > 0) i += 1
+  return msgs.slice(i)
 }
 
 // One assistant turn's plain text — concatenate text blocks, ignoring
@@ -813,7 +836,7 @@ function ChatPanel({
       const data = await r.json()
       // Hide the bootstrap turn (first user + assistant) from the UI.
       // The bootstrap prompt is implementation detail.
-      const msgs = (data.messages || []).slice(2)
+      const msgs = dropBootstrap(data.messages || [])
       setMessages(msgs)
     } catch (e) {
       // Quietly ignore — the chat might have been deleted; user can
@@ -842,7 +865,11 @@ function ChatPanel({
       await fetch(`/api/chats/${data.id}/messages`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: bootstrapPrompt(appId), hidden: false }),
+        // hidden:true so the main Möbius shell (drawer → this chat)
+        // doesn't render the contract as a user turn. The agent's
+        // "Ready." reply still posts as a normal assistant message;
+        // see comment on bootstrapPrompt() for the trade-off.
+        body: JSON.stringify({ content: bootstrapPrompt(appId), hidden: true }),
       })
       return data.id
     } catch (e) {
@@ -865,7 +892,7 @@ function ChatPanel({
         })
         if (!r.ok) return
         const data = await r.json()
-        const msgs = (data.messages || []).slice(2)
+        const msgs = dropBootstrap(data.messages || [])
         setMessages(msgs)
         if (!data.running) {
           consecutiveIdle += 1
