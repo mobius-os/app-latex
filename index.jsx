@@ -58,12 +58,16 @@ function safeHtml(raw) {
 
 // Storage fallback shim — prefer the runtime's offline-aware
 // window.mobius.storage when present, fall back to direct
-// fetch() against /api/storage on older shells. The offline runtime
-// lives on a sibling worktree (session-offline) that isn't on main
-// yet; this lets us ship today without waiting for it, and pick up
-// outbox-style write buffering automatically when it merges.
+// fetch() against /api/storage on older shells. The runtime's
+// `set/remove` resolve to `{synced:true}` (online, server ack'd) or
+// `{queued:true}` (offline / network fail, IndexedDB outbox will
+// drain on `online`); `pendingCount()` exposes outbox depth so the
+// header pill can surface unsynced work. The fallback path (no
+// runtime) returns a normalised `{synced:true}` from writes and 0
+// from pendingCount — we have no outbox to lie about.
 function makeStorage(appId, token) {
   const ms = (typeof window !== 'undefined' && window.mobius && window.mobius.storage) || null
+  const hasRuntime = !!ms
   async function get(path) {
     if (ms && typeof ms.get === 'function') return ms.get(path)
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
@@ -84,28 +88,40 @@ function makeStorage(appId, token) {
   }
   async function setText(path, text) {
     if (ms && typeof ms.set === 'function') return ms.set(path, text)
-    return fetch(`/api/storage/apps/${appId}/${path}`, {
+    const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' },
       body: text,
     })
+    if (!r.ok) throw new Error(`set ${path} → ${r.status}`)
+    return { synced: true }
   }
   async function setJSON(path, obj) {
     if (ms && typeof ms.set === 'function') return ms.set(path, obj)
-    return fetch(`/api/storage/apps/${appId}/${path}`, {
+    const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(obj),
     })
+    if (!r.ok) throw new Error(`set ${path} → ${r.status}`)
+    return { synced: true }
   }
   async function remove(path) {
     if (ms && typeof ms.remove === 'function') return ms.remove(path)
-    return fetch(`/api/storage/apps/${appId}/${path}`, {
+    const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
     })
+    if (!r.ok && r.status !== 404) throw new Error(`remove ${path} → ${r.status}`)
+    return { synced: true }
   }
-  return { get, getBlob, setText, setJSON, remove }
+  async function pendingCount() {
+    if (ms && typeof ms.pendingCount === 'function') {
+      try { return await ms.pendingCount() } catch { return 0 }
+    }
+    return 0
+  }
+  return { get, getBlob, setText, setJSON, remove, pendingCount, hasRuntime }
 }
 
 // ----------------------------------------------------------------------
