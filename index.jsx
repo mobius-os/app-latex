@@ -1259,6 +1259,59 @@ export default function App({ appId, token }) {
   const [fileLoading, setFileLoading] = useState(false)
   const [fileError, setFileError] = useState(null)
 
+  // moebius:nav-back integration — when the drawer is open and the
+  // user swipes back / presses the device back button, the shell hands
+  // us the back-press. We close the drawer instead of dismissing the
+  // whole app. openDrawer / closeDrawer keep our state in lock-step
+  // with the shell's back-sentinel via the moebius:nav-push / nav-pop
+  // protocol (same shape prod's klix-filter and our app-store use).
+  useEffect(() => {
+    function onMessage(event) {
+      if (event.origin !== window.location.origin) return
+      if (event.data?.type === 'moebius:nav-back') {
+        setDrawerOpen(false)
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [])
+
+  const openDrawer = useCallback(async () => {
+    const requestId = `np-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          window.removeEventListener('message', onAck)
+          reject(new Error('nav-push timeout'))
+        }, 5000)
+        function onAck(event) {
+          if (event.origin !== window.location.origin) return
+          if (event.data?.requestId !== requestId) return
+          if (event.data.type === 'moebius:nav-push-ack') {
+            clearTimeout(timer); window.removeEventListener('message', onAck); resolve()
+          } else if (event.data.type === 'moebius:nav-push-rejected') {
+            clearTimeout(timer); window.removeEventListener('message', onAck); reject()
+          }
+        }
+        window.addEventListener('message', onAck)
+        window.parent.postMessage(
+          { type: 'moebius:nav-push', label: 'latex-files', requestId },
+          window.location.origin,
+        )
+      })
+    } catch {
+      // Older shell — open without the sentinel.
+    }
+    setDrawerOpen(true)
+  }, [])
+
+  const closeDrawer = useCallback(() => {
+    window.parent.postMessage(
+      { type: 'moebius:nav-pop' }, window.location.origin,
+    )
+    setDrawerOpen(false)
+  }, [])
+
   // Pull the canonical file list out of files-index.json. Falls back
   // to ["files/welcome.tex"] when the index doesn't exist (older
   // install, or the seed didn't apply for some reason).
@@ -1400,11 +1453,11 @@ export default function App({ appId, token }) {
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       setSelectedPath(path)
-      setDrawerOpen(false)
+      closeDrawer()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [files, storage, modal])
+  }, [files, storage, modal, closeDrawer])
 
   const handleCreateFolder = useCallback(async () => {
     // Folders don't exist on the storage backend until a file lives
@@ -1490,7 +1543,7 @@ export default function App({ appId, token }) {
       <header className="top-bar">
         <button
           className="drawer-toggle"
-          onClick={() => setDrawerOpen(true)}
+          onClick={openDrawer}
           aria-label="Open file tree"
         >
           ☰
@@ -1511,7 +1564,7 @@ export default function App({ appId, token }) {
       />
       <FileDrawer
         open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
+        onClose={closeDrawer}
         files={files}
         selectedPath={selectedPath}
         onSelect={setSelectedPath}
