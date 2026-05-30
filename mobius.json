@@ -7,6 +7,7 @@
   "license": "MIT",
   "homepage": "https://github.com/mobius-os/app-latex",
   "entry": "index.jsx",
+  "icon": "icon.png",
   "offline_capable": true,
   "permissions": {
     "cross_app_access": "none",
@@ -15,10 +16,18 @@
   "storage_seeds": {
     "files/welcome.tex": "files/welcome.tex",
     "chat_id.json": null,
-    "files-index.json": ["files/welcome.tex"]
+    "files-index.json": [
+      "files/welcome.tex"
+    ]
   },
   "runtime": {
-    "imports": ["react", "react-dom"],
-    "esm_deps": ["katex", "dompurify"]
+    "imports": [
+      "react",
+      "react-dom"
+    ],
+    "esm_deps": [
+      "katex",
+      "dompurify"
+    ]
   }
 }
