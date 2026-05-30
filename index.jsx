@@ -839,6 +839,14 @@ function assistantPlainText(message) {
     .join('\n')
 }
 
+// localStorage key for the chat composer draft. Per-app so two app
+// installs don't trample each other; same shape as the news report
+// read-cache (which uses localStorage rather than the outbox-backed
+// storage shim so we don't queue keystrokes into the sync queue).
+function draftKey(appId) {
+  return `latex:${appId}:chat-draft:v1`
+}
+
 function ChatPanel({
   appId, token, storage, online,
   onFilesMaybeChanged,
@@ -846,13 +854,35 @@ function ChatPanel({
   const [chatId, setChatId] = useState(null)
   const [bootstrapping, setBootstrapping] = useState(true)
   const [messages, setMessages] = useState([])  // [{role, content|blocks}]
-  const [draft, setDraft] = useState('')
+  // Draft is persisted to localStorage so flipping offline (and the
+  // subsequent re-mount many shells do on visibility change) doesn't
+  // eat what the user was typing. localStorage rather than the
+  // outbox-backed storage shim: keystrokes shouldn't enqueue server
+  // writes, and the draft is single-user, single-device by nature.
+  const [draft, setDraft] = useState(() => {
+    if (typeof localStorage === 'undefined') return ''
+    try { return localStorage.getItem(draftKey(appId)) || '' } catch { return '' }
+  })
   const [sending, setSending] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [error, setError] = useState(null)
   const scrollerRef = useRef(null)
   const pollRef = useRef(null)
   const filesPollRef = useRef(null)
+
+  // Persist the draft on every change. The set call is synchronous so
+  // there's no race with a quick send; the storage write is bounded
+  // (~140KB max in practice, well under the 5MB quota).
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return
+    try {
+      if (draft) localStorage.setItem(draftKey(appId), draft)
+      else localStorage.removeItem(draftKey(appId))
+    } catch {
+      // Quota / disabled — keep going. The in-memory draft survives
+      // this session even if persistence fails.
+    }
+  }, [appId, draft])
 
   // Discover or create the chat id. We persist {id: "uuid"} to
   // chat_id.json so subsequent app loads land in the same conversation.
@@ -1098,24 +1128,29 @@ function ChatPanel({
       </div>
       <div className="chat-composer">
         {!online && (
-          <div className="chat-offline">
-            Agent chat is offline — your message will not be sent.
+          <div className="chat-offline" role="status" aria-live="polite">
+            Offline — replies resume when you reconnect. Your draft is saved.
           </div>
         )}
         <div className="chat-input-row">
+          {/* The textarea stays enabled while offline so the user can
+              keep drafting; only Send is gated. The brief: drafts
+              should NOT be lost on an offline transition, so making
+              the input read-only would be the wrong shape. */}
           <textarea
             className="chat-input"
-            placeholder={online ? 'Describe your document…' : 'Offline'}
+            placeholder={online ? 'Describe your document…' : 'Type your message — sends when online'}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
-            disabled={!online || sending}
+            disabled={sending}
             rows={2}
           />
           <button
             className="chat-send"
             onClick={handleSend}
             disabled={!online || sending || !draft.trim()}
+            title={!online ? 'Reconnect to send' : undefined}
           >
             {sending ? '…' : 'Send'}
           </button>
@@ -2035,10 +2070,19 @@ const CSS = `
   background: var(--bg);
   padding: 10px 12px;
 }
+/* Inline composer banner shown when the user is offline. Subtle
+   accent-tinted strip — loud enough to notice, quiet enough not to
+   dominate the chat. Matches the news app's offlineBanner so the
+   two surfaces feel like one family. */
 .chat-offline {
+  margin: 0 0 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
   font-size: 12px;
-  color: var(--accent);
-  padding: 4px 6px 8px;
+  line-height: 1.4;
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid var(--border);
   text-align: center;
 }
 .chat-input-row {
