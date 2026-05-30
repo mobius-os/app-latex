@@ -613,15 +613,23 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
       </button>
     )
   }
-  // Folder node — own row plus indented children.
-  const sortedChildren = [...node.children.values()].sort((a, b) => {
-    // Folders first, then files, both alphabetical. Folder = has
-    // non-empty children and isn't itself a leaf file.
-    const af = a.children.size > 0 && !a.isFile
-    const bf = b.children.size > 0 && !b.isFile
-    if (af !== bf) return af ? -1 : 1
-    return a.name.localeCompare(b.name)
-  })
+  // Folder node — own row plus indented children. We filter `.keep`
+  // entries before sorting: those exist only so empty folders survive
+  // a backend that has no mkdir endpoint (handleCreateFolder writes
+  // `files/<name>/.keep` to materialise the folder), and showing
+  // them in the tree would just look like noise the user can't act
+  // on. The path stays in files-index.json so the folder itself is
+  // still visible as an intermediate node here.
+  const sortedChildren = [...node.children.values()]
+    .filter((c) => !(c.isFile && c.name === '.keep'))
+    .sort((a, b) => {
+      // Folders first, then files, both alphabetical. Folder = has
+      // non-empty children and isn't itself a leaf file.
+      const af = a.children.size > 0 && !a.isFile
+      const bf = b.children.size > 0 && !b.isFile
+      if (af !== bf) return af ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
   // Root folder (depth -1) renders just its children, no row of its own.
   if (depth < 0) {
     return (
@@ -756,6 +764,11 @@ function bootstrapPrompt(appId) {
     `array at /data/apps/${appId}/files-index.json. The mini-app reads`,
     'that file to populate its file tree; new files are invisible to the',
     'user until the index is updated.',
+    '',
+    'Folders created by the user appear as a `<folder>/.keep` placeholder',
+    'in the index — the storage backend has no mkdir, so an empty folder',
+    'is materialised by writing that 0-byte file. Leave .keep files alone',
+    'unless the user explicitly asks to remove the folder.',
     '',
     'Reply with “Ready.” to confirm you’ve read this brief.',
   ].join('\n')
@@ -1274,10 +1287,14 @@ export default function App({ appId, token }) {
   }, [])
 
   // Auto-select the first file once we have one, so the preview pane
-  // isn't blank on first open.
+  // isn't blank on first open. Skip `.keep` placeholders — those are
+  // folder-existence markers, not real files, and selecting one would
+  // show an empty preview pane on first open if the user's only files
+  // happen to live inside folders.
   useEffect(() => {
     if (!selectedPath && files.length > 0) {
-      setSelectedPath(files[0])
+      const firstReal = files.find((p) => !p.endsWith('/.keep'))
+      if (firstReal) setSelectedPath(firstReal)
     }
   }, [files, selectedPath])
 
@@ -1418,7 +1435,11 @@ export default function App({ appId, token }) {
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       if (selectedPath === path) {
-        setSelectedPath(next[0] || null)
+        // Prefer a real file over a `.keep` placeholder for the
+        // post-delete selection — landing on .keep would show a
+        // blank preview pane.
+        const nextReal = next.find((p) => !p.endsWith('/.keep'))
+        setSelectedPath(nextReal || null)
       }
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete' })
