@@ -1072,11 +1072,136 @@ function useOnline() {
 }
 
 // ----------------------------------------------------------------------
+// In-app modal. Möbius mini-apps run in an iframe with the
+// `allow-modals` sandbox token deliberately excluded, so window.alert
+// / .confirm / .prompt silently no-op and return false — which would
+// turn "type a name and tap OK" into a dead button. We render our own
+// modal on top of the app instead. `useModal` returns an imperative
+// {alert, confirm, prompt} surface that resolves with a Promise, plus
+// the React node to render somewhere stable in the tree.
+// ----------------------------------------------------------------------
+function useModal() {
+  const [state, setState] = useState(null)
+  // state shape:
+  //   { kind: 'alert'|'confirm'|'prompt',
+  //     title, body, placeholder, defaultValue, danger, resolve }
+
+  const close = useCallback(() => setState(null), [])
+
+  const alert = useCallback((body, opts = {}) => new Promise((resolve) => {
+    setState({
+      kind: 'alert',
+      title: opts.title || 'Heads up',
+      body,
+      resolve: () => { close(); resolve(undefined) },
+    })
+  }), [close])
+
+  const confirm = useCallback((body, opts = {}) => new Promise((resolve) => {
+    setState({
+      kind: 'confirm',
+      title: opts.title || 'Confirm',
+      body,
+      danger: !!opts.danger,
+      resolve: (ok) => { close(); resolve(!!ok) },
+    })
+  }), [close])
+
+  const prompt = useCallback((body, opts = {}) => new Promise((resolve) => {
+    setState({
+      kind: 'prompt',
+      title: opts.title || 'Enter a value',
+      body,
+      placeholder: opts.placeholder || '',
+      defaultValue: opts.defaultValue || '',
+      resolve: (val) => { close(); resolve(val) },
+    })
+  }), [close])
+
+  const node = state ? (
+    <ModalView state={state} />
+  ) : null
+
+  return { node, alert, confirm, prompt }
+}
+
+function ModalView({ state }) {
+  const [value, setValue] = useState(state.kind === 'prompt' ? (state.defaultValue || '') : '')
+  const inputRef = useRef(null)
+  useEffect(() => {
+    if (state.kind === 'prompt' && inputRef.current) {
+      // Autofocus + select-all so the user can replace any prefilled
+      // value with a single keypress.
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        if (state.kind === 'alert') state.resolve()
+        else state.resolve(state.kind === 'prompt' ? null : false)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [state])
+  function onSubmit(e) {
+    e.preventDefault()
+    if (state.kind === 'prompt') state.resolve(value)
+    else if (state.kind === 'confirm') state.resolve(true)
+    else state.resolve()
+  }
+  return (
+    <div className="modal-scrim" onClick={() => {
+      // Click outside cancels (except for alert, which only has OK).
+      if (state.kind === 'alert') state.resolve()
+      else state.resolve(state.kind === 'prompt' ? null : false)
+    }}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <form onSubmit={onSubmit}>
+          <div className="modal-title">{state.title}</div>
+          <div className="modal-body">{state.body}</div>
+          {state.kind === 'prompt' && (
+            <input
+              ref={inputRef}
+              className="modal-input"
+              type="text"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder={state.placeholder}
+            />
+          )}
+          <div className="modal-actions">
+            {(state.kind === 'confirm' || state.kind === 'prompt') && (
+              <button
+                type="button"
+                className="modal-btn modal-btn--secondary"
+                onClick={() => state.resolve(state.kind === 'prompt' ? null : false)}
+              >
+                Cancel
+              </button>
+            )}
+            <button
+              type="submit"
+              className={`modal-btn ${state.danger ? 'modal-btn--danger' : 'modal-btn--primary'}`}
+            >
+              {state.kind === 'confirm' ? (state.danger ? 'Delete' : 'OK')
+                : state.kind === 'prompt' ? 'OK'
+                : 'OK'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// ----------------------------------------------------------------------
 // Top-level app.
 // ----------------------------------------------------------------------
 export default function App({ appId, token }) {
   const storage = useMemo(() => makeStorage(appId, token), [appId, token])
   const online = useOnline()
+  const modal = useModal()
   const [files, setFiles] = useState([])
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [selectedPath, setSelectedPath] = useState(null)
@@ -1197,9 +1322,9 @@ export default function App({ appId, token }) {
   }, [refreshFiles, selectedPath, storage])
 
   const handleCreateFile = useCallback(async () => {
-    // eslint-disable-next-line no-alert
-    const name = window.prompt(
-      'New file name (e.g. chapter1.tex or notes/draft.md):',
+    const name = await modal.prompt(
+      'Path under files/ — e.g. chapter1.tex or notes/draft.md',
+      { title: 'New file', placeholder: 'chapter1.tex' },
     )
     if (!name) return
     const clean = name.replace(/^\/+/, '').trim()
@@ -1207,14 +1332,12 @@ export default function App({ appId, token }) {
     // Reject characters the storage backend rejects (matches its
     // _SAFE_RE on the server: [\w.\-/]+ — strict but reasonable).
     if (!/^[\w.\-/]+$/.test(clean)) {
-      // eslint-disable-next-line no-alert
-      window.alert('Invalid characters. Use letters, digits, . - _ /')
+      await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
       return
     }
     const path = `files/${clean}`
     if (files.includes(path)) {
-      // eslint-disable-next-line no-alert
-      window.alert('A file with that name already exists.')
+      await modal.alert(`“${path}” already exists.`, { title: 'Name taken' })
       return
     }
     try {
@@ -1225,24 +1348,24 @@ export default function App({ appId, token }) {
       setSelectedPath(path)
       setDrawerOpen(false)
     } catch (e) {
-      // eslint-disable-next-line no-alert
-      window.alert(`Could not create file: ${e.message || e}`)
+      await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [files, storage])
+  }, [files, storage, modal])
 
   const handleCreateFolder = useCallback(async () => {
     // Folders don't exist on the storage backend until a file lives
     // inside one (no mkdir endpoint). We approximate by creating a
     // placeholder .keep file inside the new folder — it shows in the
     // tree and ensures the path exists.
-    // eslint-disable-next-line no-alert
-    const name = window.prompt('New folder name (e.g. chapter1 or notes/2026):')
+    const name = await modal.prompt(
+      'Folder name under files/ — e.g. chapter1 or notes/2026',
+      { title: 'New folder', placeholder: 'chapter1' },
+    )
     if (!name) return
     const clean = name.replace(/^\/+/, '').replace(/\/+$/, '').trim()
     if (!clean) return
     if (!/^[\w.\-/]+$/.test(clean)) {
-      // eslint-disable-next-line no-alert
-      window.alert('Invalid characters. Use letters, digits, . - _ /')
+      await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
       return
     }
     const path = `files/${clean}/.keep`
@@ -1252,14 +1375,16 @@ export default function App({ appId, token }) {
       await storage.setJSON('files-index.json', next)
       setFiles(next)
     } catch (e) {
-      // eslint-disable-next-line no-alert
-      window.alert(`Could not create folder: ${e.message || e}`)
+      await modal.alert(e.message || String(e), { title: 'Could not create folder' })
     }
-  }, [files, storage])
+  }, [files, storage, modal])
 
   const handleDeleteFile = useCallback(async (path) => {
-    // eslint-disable-next-line no-alert
-    if (!window.confirm(`Delete ${path}? This cannot be undone.`)) return
+    const ok = await modal.confirm(
+      `Delete “${path}”? This cannot be undone.`,
+      { title: 'Delete file', danger: true },
+    )
+    if (!ok) return
     try {
       await storage.remove(path)
       const next = files.filter((p) => p !== path)
@@ -1269,10 +1394,9 @@ export default function App({ appId, token }) {
         setSelectedPath(next[0] || null)
       }
     } catch (e) {
-      // eslint-disable-next-line no-alert
-      window.alert(`Could not delete: ${e.message || e}`)
+      await modal.alert(e.message || String(e), { title: 'Could not delete' })
     }
-  }, [files, selectedPath, storage])
+  }, [files, selectedPath, storage, modal])
 
   // Choose the preview renderer based on the file extension.
   function renderPreview() {
@@ -1337,6 +1461,7 @@ export default function App({ appId, token }) {
         onCreateFolder={handleCreateFolder}
         onDeleteFile={handleDeleteFile}
       />
+      {modal.node}
     </div>
   )
 }
@@ -1778,4 +1903,79 @@ const CSS = `
   opacity: 0.5;
   cursor: default;
 }
+
+/* ---- modal ---- */
+.modal-scrim {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 50;
+  padding: 16px;
+}
+.modal {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  width: 100%;
+  max-width: 360px;
+  padding: 18px 20px;
+}
+.modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.modal-body {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  margin-bottom: 14px;
+}
+.modal-input {
+  display: block;
+  width: 100%;
+  padding: 9px 11px;
+  font-size: 14px;
+  font-family: var(--font);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+  margin-bottom: 14px;
+  box-sizing: border-box;
+}
+.modal-input:focus { border-color: var(--accent); }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.modal-btn {
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.modal-btn--primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.modal-btn--danger {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.modal-btn--secondary { background: var(--surface); }
 `
