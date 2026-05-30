@@ -1554,14 +1554,17 @@ const CSS = `
 }
 .drawer-toggle {
   flex: 0 0 auto;
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-size: 18px;
+  font-size: 20px;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .drawer-toggle:active { background: var(--surface2, var(--surface)); }
 .top-title {
@@ -1643,7 +1646,11 @@ const CSS = `
 .math-error {
   color: var(--accent);
   font-family: ui-monospace, SFMono-Regular, monospace;
-  background: rgba(255, 0, 0, 0.08);
+  /* Tinted backdrop follows --accent instead of pinning to red,
+     so the malformed-math flag stays visible on themes whose
+     accent isn't red. color-mix is supported in every browser
+     Möbius targets. */
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
   padding: 0 4px;
   border-radius: 3px;
 }
@@ -1741,15 +1748,18 @@ const CSS = `
 }
 .drawer-title { font-size: 16px; font-weight: 700; }
 .drawer-close {
-  width: 32px;
-  height: 32px;
-  border-radius: 6px;
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-size: 20px;
+  font-size: 22px;
   cursor: pointer;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .drawer-actions {
   display: flex;
@@ -1759,7 +1769,8 @@ const CSS = `
 }
 .drawer-btn {
   flex: 1 1 0;
-  padding: 8px 10px;
+  min-height: 44px;
+  padding: 10px 12px;
   border-radius: 6px;
   border: 1px solid var(--border);
   background: var(--bg);
@@ -1786,7 +1797,8 @@ const CSS = `
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 8px 14px;
+  min-height: 44px;
+  padding: 10px 14px;
   text-align: left;
   background: none;
   border: none;
@@ -1955,7 +1967,8 @@ const CSS = `
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  min-width: 60px;
+  min-width: 64px;
+  min-height: 44px;
 }
 .chat-send:disabled {
   opacity: 0.5;
@@ -2015,7 +2028,8 @@ const CSS = `
   gap: 8px;
 }
 .modal-btn {
-  padding: 8px 14px;
+  min-height: 44px;
+  padding: 10px 16px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--surface);
