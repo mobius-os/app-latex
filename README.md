@@ -36,7 +36,7 @@ Three stacked regions, mobile-first:
 
 The chat panel POSTs to `/api/chats/<id>/messages` — the same endpoint the main Möbius chat uses. On first send the app creates a dedicated chat and primes it with a short brief telling the sub-agent its working directory (`/data/apps/<your-app-id>/files/`) and the file-index convention (see below). The chat id is persisted to `chat_id.json` so the conversation survives reloads.
 
-While the agent is working, the app polls the chat detail endpoint every second for new replies and the file index every three seconds for new files. As soon as the chat reports idle, the currently-selected file is re-fetched so an edit shows up immediately.
+While the agent is working, the app polls the chat detail endpoint every two seconds for new replies and the file index every five seconds for new files. As soon as the chat reports idle, the currently-selected file is re-fetched so an edit shows up immediately.
 
 ### File index
 

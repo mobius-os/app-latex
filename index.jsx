@@ -891,9 +891,16 @@ function ChatPanel({
     }
   }
 
-  // Poll loop: every 1s while we expect activity, fetch the chat and
+  // Poll loop: every 2s while we expect activity, fetch the chat and
   // refresh the message list. Stops when `running: false` AND the
   // last message is an assistant turn (i.e. the agent has spoken).
+  // 2s (was 1s) is responsive enough for an embedded panel — the
+  // surface only renders the final assistant message anyway, so we
+  // don't need sub-second turn-of-bubble updates. Costs us roughly
+  // half the GETs per build. The SSE stream would be cheaper still,
+  // but its 12-event-type protocol would require us to re-implement
+  // the shell's interpretation of tool_start/tool_end/question/...
+  // and that's out of scope for the polish pass.
   function startPolling(id) {
     if (pollRef.current) clearInterval(pollRef.current)
     setStreaming(true)
@@ -926,12 +933,15 @@ function ChatPanel({
       } catch (e) {
         // Network blip — keep polling. The next tick will retry.
       }
-    }, 1000)
+    }, 2000)
   }
 
   // Separate, slower poll for the file index while a turn is active.
   // The chat detail tells us what the agent SAID; this tells us what
-  // it DID. 3s cadence matches the spec.
+  // it DID. 5s cadence — the agent's edit-then-summarise turn takes
+  // tens of seconds, so a 5s lag on the tree refresh is invisible
+  // and a final post-turn refresh (in startPolling) catches the
+  // last write within ~2s of the agent finishing.
   useEffect(() => {
     if (!streaming) {
       if (filesPollRef.current) {
@@ -942,7 +952,7 @@ function ChatPanel({
     }
     filesPollRef.current = setInterval(() => {
       onFilesMaybeChanged()
-    }, 3000)
+    }, 5000)
     return () => {
       if (filesPollRef.current) clearInterval(filesPollRef.current)
       filesPollRef.current = null
