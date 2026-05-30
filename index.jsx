@@ -1320,18 +1320,107 @@ function ModalView({ state }) {
 }
 
 // ----------------------------------------------------------------------
+// localStorage snapshot of the file index + recently-viewed file
+// contents so an offline reload paints SOMETHING — `storage.get()`
+// returns null offline. Same shape as news's read-cache: small,
+// per-app, deliberately not a write store. The server stays the
+// source of truth; this exists purely so the first paint after a
+// flaky-network reload shows last-known state.
+//
+// We cache up to FILE_CONTENT_CACHE_LIMIT bodies. Files-index is
+// always cached (it's tiny). Cap chosen as roughly "all the files a
+// user actively flicks between in a session" — large enough that a
+// reload usually paints whatever they were last working on, small
+// enough to stay well under the 5MB localStorage quota even for
+// document-heavy users.
+// ----------------------------------------------------------------------
+const FILE_CONTENT_CACHE_LIMIT = 20
+const FILE_CACHE_VERSION = 1
+
+function fileCacheKey(appId) {
+  return `latex:${appId}:files-cache:v${FILE_CACHE_VERSION}`
+}
+
+function readFileCache(appId) {
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(fileCacheKey(appId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return null
+    const index = Array.isArray(parsed.index)
+      ? parsed.index.filter((p) => typeof p === 'string')
+      : []
+    const contents = (parsed.contents && typeof parsed.contents === 'object')
+      ? parsed.contents : {}
+    const lastPath = typeof parsed.lastPath === 'string' ? parsed.lastPath : null
+    return { index, contents, lastPath }
+  } catch {
+    return null
+  }
+}
+
+function writeFileCache(appId, index, contents, lastPath) {
+  if (typeof localStorage === 'undefined') return
+  try {
+    // Trim contents to the index — orphaned bodies (deleted files)
+    // get GC'd here; only string bodies are kept (binary previews
+    // fetch from the server on demand).
+    const trimmed = {}
+    const indexSet = new Set(index)
+    const entries = Object.entries(contents)
+      .filter(([p, v]) => indexSet.has(p) && typeof v === 'string')
+      .slice(-FILE_CONTENT_CACHE_LIMIT)
+    for (const [p, v] of entries) trimmed[p] = v
+    localStorage.setItem(
+      fileCacheKey(appId),
+      JSON.stringify({
+        index,
+        contents: trimmed,
+        // lastPath persists across reloads so an offline reload
+        // reopens the file the user was last editing rather than
+        // jumping back to the first entry in the tree.
+        lastPath: (lastPath && indexSet.has(lastPath)) ? lastPath : null,
+      }),
+    )
+  } catch {
+    // Quota / disabled / serialization — leave the previous snapshot
+    // in place; the in-memory state still works this session.
+  }
+}
+
+// ----------------------------------------------------------------------
 // Top-level app.
 // ----------------------------------------------------------------------
 export default function App({ appId, token }) {
   const storage = useMemo(() => makeStorage(appId, token), [appId, token])
   const online = useOnline()
   const modal = useModal()
-  const [files, setFiles] = useState([])
+  // Hydrate files + recent contents from the localStorage snapshot
+  // synchronously on first render so an offline reload has SOMETHING
+  // to paint before any storage.get() resolves (or returns null
+  // offline). The server still gets fetched on mount and overwrites
+  // this with the canonical state when online.
+  const cached = useMemo(() => readFileCache(appId), [appId])
+  const [files, setFiles] = useState(() => cached?.index || [])
+  const [fileCache, setFileCache] = useState(() => cached?.contents || {})
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [selectedPath, setSelectedPath] = useState(null)
+  // Restore the file the user was viewing last session so an offline
+  // reload opens straight into their work-in-progress (assuming we
+  // have its body cached — handled by the cache-first load below).
+  const [selectedPath, setSelectedPath] = useState(() => cached?.lastPath || null)
   const [fileContent, setFileContent] = useState('')
   const [fileLoading, setFileLoading] = useState(false)
   const [fileError, setFileError] = useState(null)
+
+  // Persist the file-cache snapshot whenever the index, contents, or
+  // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
+  // inside writeFileCache. The path field lets an offline reload land
+  // on the file the user was last editing instead of bouncing to the
+  // first tree entry.
+  useEffect(() => {
+    writeFileCache(appId, files, fileCache, selectedPath)
+  }, [appId, files, fileCache, selectedPath])
 
   // moebius:nav-back integration — when the drawer is open and the
   // user swipes back / presses the device back button, the shell hands
@@ -1388,7 +1477,10 @@ export default function App({ appId, token }) {
 
   // Pull the canonical file list out of files-index.json. Falls back
   // to ["files/welcome.tex"] when the index doesn't exist (older
-  // install, or the seed didn't apply for some reason).
+  // install, or the seed didn't apply for some reason). When the
+  // runtime is offline, storage.get returns null — we keep whatever
+  // we hydrated from the localStorage snapshot rather than blanking
+  // the tree.
   const refreshFiles = useCallback(async () => {
     try {
       const idx = await storage.get('files-index.json')
@@ -1399,14 +1491,28 @@ export default function App({ appId, token }) {
         setFiles(cleaned)
         // If the currently-selected file vanished from the index,
         // unselect so the preview pane shows the empty state rather
-        // than a stale buffer.
+        // than a stale buffer. Also drop its cache entry so we
+        // don't keep a body for a path that's been deleted.
         if (selectedPath && !cleaned.includes(selectedPath)) {
           setSelectedPath(null)
           setFileContent('')
+          setFileCache((prev) => {
+            if (!(selectedPath in prev)) return prev
+            const next = { ...prev }
+            delete next[selectedPath]
+            return next
+          })
         }
+      } else if (idx === null && !online) {
+        // Offline + nothing in storage — keep the hydrated snapshot.
+        // The next online refresh reconciles with the server.
+        return
       } else {
         // Index missing or malformed — seed it from the welcome file
-        // if that exists, otherwise leave empty.
+        // if that exists, otherwise leave empty. Only attempt to
+        // re-seed when online; offline we'd just queue a write that
+        // collides with whatever lands first when we reconnect.
+        if (!online) return
         const probe = await storage.get('files/welcome.tex')
         const seed = probe ? ['files/welcome.tex'] : []
         await storage.setJSON('files-index.json', seed)
@@ -1416,7 +1522,7 @@ export default function App({ appId, token }) {
       // Don't blank the UI on a transient read failure — just keep
       // the previous list and let the next poll retry.
     }
-  }, [storage, selectedPath])
+  }, [storage, selectedPath, online])
 
   useEffect(() => {
     refreshFiles()
@@ -1435,18 +1541,45 @@ export default function App({ appId, token }) {
     }
   }, [files, selectedPath])
 
-  // Load the selected file's content. For .tex/.md we want the text
-  // body; for binary previews (images, PDF) the dedicated component
-  // does its own fetch so we just set selectedPath and let it render.
+  // Load the selected file's content. Cache-first: if the body lives
+  // in fileCache we paint it from state without fetching. Selection
+  // alone doesn't trigger a re-fetch — agent edits propagate via
+  // `onFilesMaybeChanged` after every chat turn, which is the only
+  // place a server-side change can come from in this app. That keeps
+  // file switching instant (no flicker) and means offline reselect
+  // never blanks a file the user just had open.
+  //
+  // For binary previews (images, PDF) the dedicated component does
+  // its own blob fetch; we just clear textual state and let it render.
   useEffect(() => {
     if (!selectedPath) {
       setFileContent('')
+      setFileError(null)
+      setFileLoading(false)
       return
     }
     const ext = selectedPath.split('.').pop().toLowerCase()
     if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(ext)) {
-      // Binary preview component handles its own loading.
       setFileContent('')
+      setFileLoading(false)
+      setFileError(null)
+      return
+    }
+    // Cache hit — paint synchronously. No background refetch: agent
+    // edits land via onFilesMaybeChanged, the only other writer.
+    const cachedBody = fileCache[selectedPath]
+    if (typeof cachedBody === 'string') {
+      setFileContent(cachedBody)
+      setFileError(null)
+      setFileLoading(false)
+      return
+    }
+    // Cache miss. Offline → show a friendly note rather than the
+    // "File not found" misnomer the old code used when storage.get
+    // returned null offline. Online → fetch + memoise.
+    if (!online) {
+      setFileContent('')
+      setFileError('Not available offline. Open this file once online to cache it.')
       setFileLoading(false)
       return
     }
@@ -1456,14 +1589,20 @@ export default function App({ appId, token }) {
     storage.get(selectedPath).then((data) => {
       if (cancelled) return
       if (data == null) {
+        // Online + null body means the file genuinely doesn't exist
+        // on the server (404). Drop any stale cache entry too.
         setFileError('File not found — was it deleted?')
         setFileContent('')
-      } else if (typeof data === 'string') {
-        setFileContent(data)
       } else {
-        // JSON came back as an object — stringify so the preview
-        // shows something legible.
-        setFileContent(JSON.stringify(data, null, 2))
+        const body = typeof data === 'string'
+          ? data
+          // JSON came back as an object — stringify so the preview
+          // shows something legible.
+          : JSON.stringify(data, null, 2)
+        setFileContent(body)
+        setFileError(null)
+        // Memoise for instant re-select + offline-reload survival.
+        setFileCache((prev) => (prev[selectedPath] === body ? prev : { ...prev, [selectedPath]: body }))
       }
       setFileLoading(false)
     }).catch((e) => {
@@ -1473,7 +1612,12 @@ export default function App({ appId, token }) {
       }
     })
     return () => { cancelled = true }
-  }, [selectedPath, storage])
+    // fileCache is intentionally omitted: we read it inside the
+    // effect, but reacting to its mutations would refire on every
+    // memoise and double-fetch. Selection + connectivity are the
+    // only triggers we want.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPath, storage, online])
 
   // Periodically refresh the file index so externally-written changes
   // (the agent in another chat, a sibling tool) show up. Also runs
@@ -1484,23 +1628,31 @@ export default function App({ appId, token }) {
   }, [drawerOpen, refreshFiles])
 
   // After-turn refresh + re-fetch of selected file. The chat panel
-  // pings this via onFilesMaybeChanged.
+  // pings this via onFilesMaybeChanged. Refetched contents land in
+  // both `fileContent` (what's painted now) and `fileCache` (what an
+  // offline reload paints) so the agent's edits survive a refresh.
   const onFilesMaybeChanged = useCallback(async () => {
     await refreshFiles()
-    if (selectedPath) {
-      // Force a re-fetch of the current file's body — the agent may
-      // have edited it. We do this by reading directly rather than
-      // depending on the selectedPath useEffect (which only fires on
-      // path change, not on content change).
+    if (selectedPath && online) {
       try {
         const data = await storage.get(selectedPath)
-        if (typeof data === 'string') setFileContent(data)
-        else if (data == null) setFileContent('')
+        if (typeof data === 'string') {
+          setFileContent(data)
+          setFileCache((prev) => (prev[selectedPath] === data ? prev : { ...prev, [selectedPath]: data }))
+        } else if (data == null) {
+          setFileContent('')
+          setFileCache((prev) => {
+            if (!(selectedPath in prev)) return prev
+            const next = { ...prev }
+            delete next[selectedPath]
+            return next
+          })
+        }
       } catch (e) {
         // Silent — selectedPath useEffect will retry on next select.
       }
     }
-  }, [refreshFiles, selectedPath, storage])
+  }, [refreshFiles, selectedPath, storage, online])
 
   const handleCreateFile = useCallback(async () => {
     const name = await modal.prompt(
@@ -1526,6 +1678,10 @@ export default function App({ appId, token }) {
       const next = [...files, path].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
+      // Seed the cache with the empty body so a subsequent offline
+      // reload doesn't show "Not available offline" for a file we
+      // just created.
+      setFileCache((prev) => ({ ...prev, [path]: '' }))
       setSelectedPath(path)
       closeDrawer()
     } catch (e) {
@@ -1571,6 +1727,14 @@ export default function App({ appId, token }) {
       const next = files.filter((p) => p !== path)
       await storage.setJSON('files-index.json', next)
       setFiles(next)
+      // Drop the cached body so a future offline reload doesn't
+      // resurrect a deleted file.
+      setFileCache((prev) => {
+        if (!(path in prev)) return prev
+        const ncache = { ...prev }
+        delete ncache[path]
+        return ncache
+      })
       if (selectedPath === path) {
         // Prefer a real file over a `.keep` placeholder for the
         // post-delete selection — landing on .keep would show a
