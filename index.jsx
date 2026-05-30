@@ -1390,6 +1390,43 @@ function writeFileCache(appId, index, contents, lastPath) {
 }
 
 // ----------------------------------------------------------------------
+// Sync pill. Three observable states, in priority order:
+//   pending > 0 + offline  → "Offline · N pending"
+//   pending > 0 + online   → "Saving · N pending"
+//   offline + pending == 0 → "Offline"
+//   online + pending == 0  → null (idle steady state — don't clutter
+//                            the surface with a persistent "Saved"
+//                            sticker).
+// hasRuntime=false (older shell without the offline runtime) means
+// writes go straight to the server with no outbox to surface; we
+// hide the pill in that mode rather than fabricate a queue depth.
+// ----------------------------------------------------------------------
+function SyncPill({ online, pending, hasRuntime }) {
+  if (!hasRuntime) return null
+  let label = null
+  let variant = null
+  if (pending > 0) {
+    label = online ? `Saving · ${pending} pending` : `Offline · ${pending} pending`
+    variant = online ? 'pending' : 'offline'
+  } else if (!online) {
+    label = 'Offline'
+    variant = 'offline'
+  }
+  if (!label) return null
+  return (
+    <div
+      className={`sync-pill sync-pill--${variant}`}
+      role="status"
+      aria-live="polite"
+      title="Changes save locally and sync when you're back online."
+    >
+      <span className="sync-pill-dot" aria-hidden="true" />
+      {label}
+    </div>
+  )
+}
+
+// ----------------------------------------------------------------------
 // Top-level app.
 // ----------------------------------------------------------------------
 export default function App({ appId, token }) {
@@ -1412,6 +1449,10 @@ export default function App({ appId, token }) {
   const [fileContent, setFileContent] = useState('')
   const [fileLoading, setFileLoading] = useState(false)
   const [fileError, setFileError] = useState(null)
+  // Outbox depth — surfaced by the SyncPill in the header. Refreshed
+  // on every storage write (handled inline at each call site below)
+  // and on a 10s background poll.
+  const [pending, setPending] = useState(0)
 
   // Persist the file-cache snapshot whenever the index, contents, or
   // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
@@ -1421,6 +1462,28 @@ export default function App({ appId, token }) {
   useEffect(() => {
     writeFileCache(appId, files, fileCache, selectedPath)
   }, [appId, files, fileCache, selectedPath])
+
+  const refreshPending = useCallback(async () => {
+    try {
+      const n = await storage.pendingCount()
+      setPending(n)
+    } catch {
+      // Leave the previous count alone on transient errors.
+    }
+  }, [storage])
+
+  // 10s background poll for outbox depth — catches drains the runtime
+  // did on its own (online/focus/pageshow events) that we didn't
+  // observe directly. Also rerun on online/offline transitions so the
+  // pill updates immediately when connectivity flips.
+  useEffect(() => {
+    refreshPending()
+    const id = setInterval(refreshPending, 10000)
+    return () => clearInterval(id)
+  }, [refreshPending])
+  useEffect(() => {
+    refreshPending()
+  }, [online, refreshPending])
 
   // moebius:nav-back integration — when the drawer is open and the
   // user swipes back / presses the device back button, the shell hands
@@ -1684,10 +1747,11 @@ export default function App({ appId, token }) {
       setFileCache((prev) => ({ ...prev, [path]: '' }))
       setSelectedPath(path)
       closeDrawer()
+      refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [files, storage, modal, closeDrawer])
+  }, [files, storage, modal, closeDrawer, refreshPending])
 
   const handleCreateFolder = useCallback(async () => {
     // Folders don't exist on the storage backend until a file lives
@@ -1711,10 +1775,11 @@ export default function App({ appId, token }) {
       const next = [...files, path].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
+      refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create folder' })
     }
-  }, [files, storage, modal])
+  }, [files, storage, modal, refreshPending])
 
   const handleDeleteFile = useCallback(async (path) => {
     const ok = await modal.confirm(
@@ -1742,10 +1807,11 @@ export default function App({ appId, token }) {
         const nextReal = next.find((p) => !p.endsWith('/.keep'))
         setSelectedPath(nextReal || null)
       }
+      refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete' })
     }
-  }, [files, selectedPath, storage, modal])
+  }, [files, selectedPath, storage, modal, refreshPending])
 
   // Choose the preview renderer based on the file extension.
   function renderPreview() {
@@ -1810,6 +1876,7 @@ export default function App({ appId, token }) {
         onCreateFolder={handleCreateFolder}
         onDeleteFile={handleDeleteFile}
       />
+      <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
       {modal.node}
     </div>
   )
@@ -2364,4 +2431,49 @@ const CSS = `
   border-color: var(--accent);
 }
 .modal-btn--secondary { background: var(--surface); }
+
+/* ---- sync pill ----
+   Bottom-right floating pill that surfaces unsynced writes / offline
+   state. Hidden in the steady state (online + 0 pending) so it
+   doesn't clutter the preview pane with a persistent "Saved" sticker;
+   only appears when there's something to say. Same shape as the
+   countries + gym apps so the platform feels coherent. */
+.sync-pill {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  z-index: 40;
+  /* Stay above the chat composer so it remains visible while typing. */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  pointer-events: auto;
+}
+.sync-pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.sync-pill--pending .sync-pill-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.sync-pill--offline {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sync-pill--offline .sync-pill-dot {
+  background: var(--accent);
+}
 `
