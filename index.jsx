@@ -709,8 +709,13 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
   )
 }
 
+// `canMutate` is false until the file index has been confirmed against
+// the server (App owns the check). While false we disable add/delete so
+// the user can't queue an index write derived from an unconfirmed list —
+// the handler refuses too, but greying the buttons is the honest surface
+// rather than a tap that pops an explanatory modal.
 function FileDrawer({
-  open, onClose, files, selectedPath, onSelect,
+  open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile,
 }) {
   const root = useMemo(() => buildTree(files), [files])
@@ -726,14 +731,24 @@ function FileDrawer({
           <button className="drawer-close" onClick={onClose} aria-label="Close">×</button>
         </div>
         <div className="drawer-actions">
-          <button className="drawer-btn" onClick={onCreateFile}>+ New file</button>
-          <button className="drawer-btn" onClick={onCreateFolder}>+ New folder</button>
+          <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>+ New file</button>
+          <button className="drawer-btn" onClick={onCreateFolder} disabled={!canMutate}>+ New folder</button>
         </div>
+        {!canMutate && (
+          <div className="drawer-syncing" role="status">
+            Loading your files… add and delete are available once they sync.
+          </div>
+        )}
         <div className="drawer-tree">
           {files.length === 0 ? (
-            <div className="drawer-empty">
-              No files yet. Tap “+ New file” or ask the agent to make one.
-            </div>
+            // While the index is still syncing the syncing note above
+            // already explains the empty tree; don't also tell the user
+            // to tap a button we've disabled.
+            canMutate ? (
+              <div className="drawer-empty">
+                No files yet. Tap “+ New file” or ask the agent to make one.
+              </div>
+            ) : null
           ) : (
             <FileNode
               node={root}
@@ -748,6 +763,7 @@ function FileDrawer({
             <button
               className="drawer-btn drawer-btn--danger"
               onClick={() => onDeleteFile(selectedPath)}
+              disabled={!canMutate}
             >
               Delete “{selectedPath}”
             </button>
@@ -778,15 +794,16 @@ function FileDrawer({
 // shell's default skill), so an opening "here's the contract" user
 // message is the practical lever.
 //
-// The user message is sent with hidden:true so the main Möbius shell
-// (where the same chat may be opened from the drawer) renders it as
-// nothing — see frontend/ChatView.jsx, which skips m.hidden. The
-// agent's "Ready." reply is NOT auto-hidden by the backend; we live
-// with that one-line leak rather than depend on an explicit hidden
-// flag the backend doesn't apply to assistant turns. In-app, we use
-// `dropBootstrap()` (below) to strip both turns from the rendered
-// thread — more robust than slice(2), which silently mis-slices if
-// the API ever returns fewer than two messages mid-bootstrap.
+// The brief is sent with hidden:true so the main Möbius shell (where
+// the same chat may be opened from the drawer) renders it as nothing —
+// see frontend/ChatView.jsx, which skips m.hidden. The backend only
+// stamps the hidden flag onto user messages, not assistant turns, so
+// any assistant reply to the brief WOULD show up in the shell as a
+// stray bubble. We therefore tell the agent NOT to acknowledge the
+// brief: it stays silent until the user's first real message, so there
+// is no assistant turn to leak. The app never awaits an acknowledgement
+// either — createChat() fires the brief and returns; the user's message
+// queues behind it — so dropping the confirmation costs us nothing.
 function bootstrapPrompt(appId) {
   return [
     `You are the LaTeX-editor sub-agent for Möbius app id ${appId}.`,
@@ -809,20 +826,21 @@ function bootstrapPrompt(appId) {
     'is materialised by writing that 0-byte file. Leave .keep files alone',
     'unless the user explicitly asks to remove the folder.',
     '',
-    'Reply with “Ready.” to confirm you’ve read this brief.',
+    'This is a silent setup brief — do NOT reply to it. Wait for the',
+    'user’s first message and act on that.',
   ].join('\n')
 }
 
-// Strip the bootstrap user message (which we sent with hidden:true)
-// and the assistant turn that immediately follows it from a message
-// list. Robust to weird states (missing first turn, multi-turn
-// bootstrap retry) where a hardcoded slice(2) would mis-slice and
-// leak the contract into the user-visible thread.
+// Strip the hidden setup brief from a loaded message list so the app's
+// own chat panel never shows it. Only the brief (a hidden user turn) is
+// dropped — the agent is told not to acknowledge it, so there is no
+// assistant turn to strip. Scanning from the front (rather than a
+// hardcoded slice) stays correct if the API returns the list with the
+// brief already filtered, or not yet present mid-bootstrap.
 function dropBootstrap(msgs) {
   if (!msgs || msgs.length === 0) return msgs || []
   let i = 0
   if (msgs[i] && msgs[i].role === 'user' && msgs[i].hidden) i += 1
-  if (msgs[i] && msgs[i].role === 'assistant' && i > 0) i += 1
   return msgs.slice(i)
 }
 
@@ -948,9 +966,9 @@ function ChatPanel({
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         // hidden:true so the main Möbius shell (drawer → this chat)
-        // doesn't render the contract as a user turn. The agent's
-        // "Ready." reply still posts as a normal assistant message;
-        // see comment on bootstrapPrompt() for the trade-off.
+        // doesn't render the contract as a user turn. The brief tells
+        // the agent not to reply, so there's no assistant turn to leak
+        // into the shell either — see comment on bootstrapPrompt().
         body: JSON.stringify({ content: bootstrapPrompt(appId), hidden: true }),
       })
       return data.id
@@ -1161,35 +1179,26 @@ function ChatPanel({
 }
 
 // ----------------------------------------------------------------------
-// Online/offline detection. window.mobius.online is the runtime's
-// own signal (richer than navigator.onLine — it pings the API);
-// navigator.onLine is the browser-level fallback that's accurate
-// enough for an "are we able to talk to the agent" check.
+// Online/offline detection. The runtime's `window.mobius.online` is a
+// getter over `navigator.onLine` (see mobius-runtime.js) — same source,
+// no separate change event — so we track `navigator.onLine` directly
+// and react to the browser's own 'online'/'offline' events. That's the
+// only signal the runtime actually emits; an earlier version subscribed
+// to a `window.mobius.onChange` callback the runtime never exposes, so
+// offline transitions only updated on a reload.
 // ----------------------------------------------------------------------
 function useOnline() {
-  const initial = (() => {
-    if (typeof window === 'undefined') return true
-    if (typeof window.mobius?.online === 'boolean') return window.mobius.online
-    return navigator.onLine !== false
-  })()
-  const [online, setOnline] = useState(initial)
+  const [online, setOnline] = useState(() =>
+    typeof navigator === 'undefined' ? true : navigator.onLine !== false,
+  )
   useEffect(() => {
     if (typeof window === 'undefined') return
-    const onUp = () => setOnline(true)
-    const onDown = () => setOnline(false)
-    window.addEventListener('online', onUp)
-    window.addEventListener('offline', onDown)
-    // Subscribe to the richer mobius signal if present.
-    let mobiusUnsub = null
-    if (window.mobius && typeof window.mobius.onChange === 'function') {
-      mobiusUnsub = window.mobius.onChange((s) => {
-        if (typeof s?.online === 'boolean') setOnline(s.online)
-      })
-    }
+    const sync = () => setOnline(navigator.onLine !== false)
+    window.addEventListener('online', sync)
+    window.addEventListener('offline', sync)
     return () => {
-      window.removeEventListener('online', onUp)
-      window.removeEventListener('offline', onDown)
-      if (mobiusUnsub) mobiusUnsub()
+      window.removeEventListener('online', sync)
+      window.removeEventListener('offline', sync)
     }
   }, [])
   return online
@@ -1441,6 +1450,15 @@ export default function App({ appId, token }) {
   const cached = useMemo(() => readFileCache(appId), [appId])
   const [files, setFiles] = useState(() => cached?.index || [])
   const [fileCache, setFileCache] = useState(() => cached?.contents || {})
+  // True once `files` reflects the server's index this session — either
+  // refreshFiles read it back or seeded it online. Until then `files` is
+  // only the localStorage snapshot (or empty), which may be stale or
+  // missing entries. We refuse to PERSIST files-index.json while this is
+  // false: an offline write derived from an unconfirmed list would queue
+  // a short/empty index that drains over the server's real one on
+  // reconnect (last-write-wins per path) and destroys files. Gating the
+  // write — not just guarding after — makes that bad state unreachable.
+  const [indexLoaded, setIndexLoaded] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   // Restore the file the user was viewing last session so an offline
   // reload opens straight into their work-in-progress (assuming we
@@ -1552,6 +1570,9 @@ export default function App({ appId, token }) {
         const cleaned = [...new Set(idx.filter((p) => typeof p === 'string' && p.startsWith('files/')))]
         cleaned.sort()
         setFiles(cleaned)
+        // The list now reflects the server — UI writes to the index are
+        // safe (they'll extend/trim a known-good list, not clobber it).
+        setIndexLoaded(true)
         // If the currently-selected file vanished from the index,
         // unselect so the preview pane shows the empty state rather
         // than a stale buffer. Also drop its cache entry so we
@@ -1580,6 +1601,9 @@ export default function App({ appId, token }) {
         const seed = probe ? ['files/welcome.tex'] : []
         await storage.setJSON('files-index.json', seed)
         setFiles(seed)
+        // We just wrote the index to the server online, so `files` is
+        // now authoritative — UI writes are safe from here.
+        setIndexLoaded(true)
       }
     } catch (e) {
       // Don't blank the UI on a transient read failure — just keep
@@ -1717,7 +1741,25 @@ export default function App({ appId, token }) {
     }
   }, [refreshFiles, selectedPath, storage, online])
 
+  // Gate every UI write to files-index.json. Until we've confirmed the
+  // index against the server (indexLoaded), `files` may be a stale or
+  // empty snapshot; writing a list derived from it would queue an index
+  // that drains over the server's real one on reconnect and lose files.
+  // Returns true when writing is safe; otherwise tells the user why and
+  // returns false so the caller bails before touching storage.
+  const ensureIndexWritable = useCallback(async () => {
+    if (indexLoaded) return true
+    await modal.alert(
+      'Your file list hasn’t loaded yet. Reconnect (or wait for it to '
+        + 'sync) before adding or deleting files, so this doesn’t '
+        + 'overwrite work that’s already saved.',
+      { title: 'File list not ready' },
+    )
+    return false
+  }, [indexLoaded, modal])
+
   const handleCreateFile = useCallback(async () => {
+    if (!(await ensureIndexWritable())) return
     const name = await modal.prompt(
       'Path under files/ — e.g. chapter1.tex or notes/draft.md',
       { title: 'New file', placeholder: 'chapter1.tex' },
@@ -1751,9 +1793,10 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [files, storage, modal, closeDrawer, refreshPending])
+  }, [files, storage, modal, closeDrawer, refreshPending, ensureIndexWritable])
 
   const handleCreateFolder = useCallback(async () => {
+    if (!(await ensureIndexWritable())) return
     // Folders don't exist on the storage backend until a file lives
     // inside one (no mkdir endpoint). We approximate by creating a
     // placeholder .keep file inside the new folder — it shows in the
@@ -1779,9 +1822,10 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create folder' })
     }
-  }, [files, storage, modal, refreshPending])
+  }, [files, storage, modal, refreshPending, ensureIndexWritable])
 
   const handleDeleteFile = useCallback(async (path) => {
+    if (!(await ensureIndexWritable())) return
     const ok = await modal.confirm(
       `Delete “${path}”? This cannot be undone.`,
       { title: 'Delete file', danger: true },
@@ -1811,7 +1855,7 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete' })
     }
-  }, [files, selectedPath, storage, modal, refreshPending])
+  }, [files, selectedPath, storage, modal, refreshPending, ensureIndexWritable])
 
   // Choose the preview renderer based on the file extension.
   function renderPreview() {
@@ -1872,6 +1916,7 @@ export default function App({ appId, token }) {
         files={files}
         selectedPath={selectedPath}
         onSelect={setSelectedPath}
+        canMutate={indexLoaded}
         onCreateFile={handleCreateFile}
         onCreateFolder={handleCreateFolder}
         onDeleteFile={handleDeleteFile}
@@ -2153,6 +2198,13 @@ const CSS = `
 }
 .drawer-btn:active { background: var(--surface2, var(--surface)); }
 .drawer-btn--danger { color: var(--accent); border-color: var(--accent); }
+.drawer-btn:disabled { opacity: 0.45; cursor: default; }
+.drawer-syncing {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
 .drawer-tree {
   flex: 1 1 auto;
   overflow-y: auto;
