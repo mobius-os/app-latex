@@ -1111,7 +1111,7 @@ function ChatPanel({
             <b>Describe what you want to write.</b> The agent will create
             <code> .tex </code> files in the file tree on the left. Try:
             <ul>
-              <li>“Make a one-page CV for Hamza Merzic”</li>
+              <li>“Make a one-page CV for a software engineer”</li>
               <li>“Add a section on the chain rule with two worked examples”</li>
               <li>“Convert welcome.tex into a math cheat sheet”</li>
             </ul>
