@@ -382,6 +382,22 @@ function TexTextBlock({ katex, segments }) {
     // thing on the line.
     if (line[0].kind === 'text') {
       const trimmed = line[0].value.replace(/^\s+/, '')
+      // Document-structure boilerplate carries no body content in a math-first
+      // preview — skip it so a COMPLETE .tex (preamble + \begin{document}, the
+      // only shape tectonic can actually build) previews its body cleanly
+      // instead of echoing \documentclass / \usepackage / \begin{document}.
+      if (/^\\(documentclass|usepackage|maketitle|author|date|tableofcontents|newpage|clearpage|pagestyle|thispagestyle|bibliographystyle|bibliography|pagenumbering)\b/.test(trimmed)
+          || /^\\(begin|end)\{document\}/.test(trimmed)) {
+        flushPara()
+        continue
+      }
+      // \title{...} is the document's top heading.
+      const titleMatch = trimmed.match(/^\\title\{([^}]*)\}/)
+      if (titleMatch) {
+        flushPara()
+        out.push({ kind: 'h1', text: titleMatch[1], key: `h${out.length}` })
+        continue
+      }
       const sectionMatch = trimmed.match(/^\\section\{([^}]*)\}/)
       const subsectionMatch = trimmed.match(/^\\subsection\{([^}]*)\}/)
       const subsubMatch = trimmed.match(/^\\subsubsection\{([^}]*)\}/)
@@ -408,6 +424,7 @@ function TexTextBlock({ katex, segments }) {
   return (
     <>
       {out.map((b) => {
+        if (b.kind === 'h1') return <h1 className="tex-h1" key={b.key}>{b.text}</h1>
         if (b.kind === 'h2') return <h2 className="tex-h2" key={b.key}>{b.text}</h2>
         if (b.kind === 'h3') return <h3 className="tex-h3" key={b.key}>{b.text}</h3>
         if (b.kind === 'h4') return <h4 className="tex-h4" key={b.key}>{b.text}</h4>
@@ -2843,6 +2860,12 @@ const CSS = `
   line-height: 1.65;
   word-wrap: break-word;
   overflow-wrap: anywhere;
+}
+.tex-h1 {
+  font-size: 27px;
+  font-weight: 800;
+  margin: 8px 0 14px;
+  letter-spacing: -0.4px;
 }
 .tex-h2 {
   font-size: 22px;
