@@ -2697,7 +2697,6 @@ const CSS = `
   max-height: 60vh;
   display: flex;
   flex-direction: column;
-  min-height: 0;
   background: var(--surface);
   border-top: 1px solid var(--border);
 }
