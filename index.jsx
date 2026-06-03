@@ -1,33 +1,13 @@
 import React, {
   useState, useEffect, useCallback, useMemo, useRef,
 } from 'react'
-import DOMPurify from 'https://esm.sh/dompurify@3'
 
-// Defense-in-depth sanitizer for the two `dangerouslySetInnerHTML`
-// surfaces in this app. The HTML these surfaces inject is built
-// entirely on-device from local files: the .tex tokenizer
-// runs escapeHtml() over every text segment before re-allowing a
-// fixed whitelist (\textbf{}, \emph{}, umlauts); the markdown
-// renderer runs escapeHtml() over every line before applying its
-// own bold/italic/code/link regex. KaTeX writes its rendered math
-// imperatively into empty spans (no innerHTML on user data) with
-// throwOnError disabled. The injected HTML should therefore be safe
-// by construction — but the agent CAN write files on the user's
-// behalf, and a poisoned .tex/.md landing on disk would otherwise
-// flow straight into the DOM with the owner's JWT in localStorage.
-// DOMPurify is a cheap second layer that strips the dangerous
-// shapes (script/style/iframe/event-handlers/javascript: URIs)
-// without affecting the small set of tags we actually emit.
-const SANITIZE_CONFIG = {
-  USE_PROFILES: { html: true },
-  FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'meta', 'link'],
-  FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur', 'onsubmit', 'formaction', 'srcset'],
-  ALLOWED_URI_REGEXP: /^(?:https?):/i,
-}
-function safeHtml(raw) {
-  if (!raw) return ''
-  return DOMPurify.sanitize(raw, SANITIZE_CONFIG)
-}
+// No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
+// markdown preview (the only `dangerouslySetInnerHTML` users) were removed
+// in the Source/PDF redesign. Files are shown as raw source in a textarea
+// or as a pdf.js-rendered canvas, neither of which interprets stored bytes
+// as markup — so DOMPurify is no longer needed and is dropped from the
+// bundle (and can come out of the manifest esm_deps).
 
 // Allowed characters for any storage path the UI writes — mirrors the
 // server's `_SAFE_RE` (`[\w.\-/]+`) so a create/upload/move never 4xx's on a
@@ -35,19 +15,24 @@ function safeHtml(raw) {
 const NAME_RE = /^[\w.\-/]+$/
 
 // ----------------------------------------------------------------------
-// LaTeX editor mini-app for Möbius.
+// LaTeX editor mini-app for Möbius — an Overleaf-style editor.
 //
-// Three stacked regions on mobile (top-to-bottom):
-//   1. preview pane — renders the currently selected file
-//      (.tex math via KaTeX, .md as basic markdown, images as <img>,
-//       .pdf in an iframe).
-//   2. file tree drawer — slide-out left drawer with the contents of
-//      /api/storage/apps/<id>/files/. New file + new folder buttons
-//      at the top. Tapping a file selects it + closes the drawer.
-//   3. chat panel — sticky composer at the bottom, scrolling thread
-//      above it. The user describes the document in prose; the
-//      sub-agent edits files in /data/apps/<id>/files/ via the Edit
-//      and Write tools.
+// Layout (mobile-first, VSCode-shaped):
+//   - Top bar: ☰ (toggle the left file drawer) · the open file's name
+//     (+ a "main" badge if it's the document Build compiles) · a
+//     segmented [Source | PDF] toggle and a primary Build button (both
+//     for .tex only).
+//   - Left drawer: slides in over a backdrop from the left edge — the
+//     file tree + New file/folder/Upload + per-file context actions
+//     (rename / delete / set-as-main). Tapping a file or the backdrop
+//     closes it.
+//   - Main area: the SOURCE editor (a textarea) OR the compiled PDF
+//     (pdf.js canvas), toggled. Images render inline; a .pdf in the
+//     tree renders directly in the pdf.js viewer.
+//   - Chat: a bottom panel with a bounded height so the embedded agent
+//     conversation + composer stay fully visible and scrollable. The
+//     user describes the document in prose; the sub-agent edits files
+//     in /data/apps/<id>/files/ via the Edit and Write tools.
 //
 // Storage layout (under /api/storage/apps/<id>/):
 //   files/<path>           the user's actual .tex/.md/etc. files
@@ -55,6 +40,11 @@ const NAME_RE = /^[\w.\-/]+$/
 //                          We maintain it because the storage API has
 //                          no listing endpoint for apps; without it we
 //                          would have to brute-force-probe paths.
+//   main.json              {path: "files/<root>.tex"} — the designated
+//                          MAIN document. Build always compiles this
+//                          file regardless of which file is open, and
+//                          the PDF view shows its output (Overleaf's
+//                          "main document" concept).
 //   chat_id.json           {id: "uuid"} — the chat the sub-agent runs
 //                          in. Created lazily on first send and
 //                          re-used across reloads so the user always
@@ -74,7 +64,15 @@ function makeStorage(appId, token) {
   const ms = (typeof window !== 'undefined' && window.mobius && window.mobius.storage) || null
   const hasRuntime = !!ms
   async function get(path) {
-    if (ms && typeof ms.get === 'function') return ms.get(path)
+    // Read with the TYPED getter matching how the path was written: .json
+    // paths hold JSON (get); everything else (.tex, build/target.txt) is raw
+    // text (getText). Mixing them throws assertReadKind in the runtime, so the
+    // read kind MUST mirror the write kind (setText/setJSON below).
+    if (ms) {
+      const isJson = path.endsWith('.json')
+      if (isJson && typeof ms.get === 'function') return ms.get(path)
+      if (!isJson && typeof ms.getText === 'function') return ms.getText(path)
+    }
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
@@ -92,7 +90,12 @@ function makeStorage(appId, token) {
     return r.blob()
   }
   async function setText(path, text) {
-    if (ms && typeof ms.set === 'function') return ms.set(path, text)
+    // Write through the runtime's TYPED text writer — ms.set is the JSON writer
+    // (sends application/json + JSON.stringify), which corrupts/400s a .tex or
+    // build/target.txt save. ms.setText sends raw UTF-8 (text/plain). An older
+    // runtime without setText falls through to the direct fetch below, which
+    // also sends text/plain — so both paths agree on the wire shape.
+    if (ms && typeof ms.setText === 'function') return ms.setText(path, text)
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' },
@@ -130,443 +133,6 @@ function makeStorage(appId, token) {
 }
 
 // ----------------------------------------------------------------------
-// KaTeX loader. Imported lazily from esm.sh because the importmap
-// doesn't bake it in; surfaced via runtime.esm_deps in the manifest so
-// the user sees it on install. ?bundle inlines the CSS-less JS and we
-// also fetch the stylesheet so display math doesn't render unstyled.
-//
-// Offline-reload behaviour: a dynamic import to an external host hangs
-// indefinitely on a flaky/offline link (the browser doesn't time out
-// `import()` itself), so we race against a 5s deadline. The .tex
-// editor and the paragraph/heading layer don't depend on KaTeX —
-// math falls back to its raw `$...$` source in a `math-error` span —
-// so editing and reading prose keep working while preview math is
-// degraded. A later retry (next online open) gets a fresh attempt.
-// ----------------------------------------------------------------------
-let _katexPromise = null
-function loadKatex() {
-  if (_katexPromise) return _katexPromise
-  // Inject the stylesheet once. Without this, fractions/integrals
-  // render as unstyled stacked spans — recognizable but ugly.
-  if (typeof document !== 'undefined' && !document.getElementById('katex-css')) {
-    const link = document.createElement('link')
-    link.id = 'katex-css'
-    link.rel = 'stylesheet'
-    link.href = 'https://esm.sh/katex@0.16/dist/katex.min.css'
-    document.head.appendChild(link)
-  }
-  _katexPromise = import('https://esm.sh/katex@0.16?bundle').catch((err) => {
-    // Reset so a later retry (back online) can try again.
-    _katexPromise = null
-    throw err
-  })
-  return _katexPromise
-}
-
-// Render a math string with KaTeX into the given DOM element. Silent
-// failure draws the raw source in a "math-error" span so a typo
-// doesn't bomb the whole preview pane.
-function renderMath(katex, target, source, displayMode) {
-  try {
-    katex.render(source, target, {
-      displayMode,
-      throwOnError: false,
-      output: 'html',
-      strict: 'ignore',
-    })
-  } catch (e) {
-    target.textContent = ''
-    const span = document.createElement('span')
-    span.className = 'math-error'
-    span.textContent = (displayMode ? `$$${source}$$` : `$${source}$`)
-    target.appendChild(span)
-  }
-}
-
-// ----------------------------------------------------------------------
-// .tex → renderable segments. We tokenize on $$ ... $$ first (display
-// math), then $ ... $ (inline math), then apply tiny line-level rules
-// for \section, \subsection, \textbf, \emph, and blank-line paragraph
-// breaks. This is deliberately math-first and not a real LaTeX
-// renderer — the spec calls out math-first preview only; no latexmk.
-// ----------------------------------------------------------------------
-function tokenizeTex(src) {
-  const out = []
-  let i = 0
-  // Math starts at `$`/`$$` OR the LaTeX delimiters `\[` (display) / `\(`
-  // (inline). Modern LaTeX prefers \[...\] and \(...\) over $$...$$, so the
-  // preview honors all of them — otherwise a canonical document (like the
-  // welcome file) would show its display equations as raw source. A lone
-  // backslash (\textbf, \frac, …) is NOT a math start.
-  const mathStart = (k) =>
-    src[k] === '$'
-    || (src[k] === '\\' && (src[k + 1] === '[' || src[k + 1] === '('))
-  while (i < src.length) {
-    if (src[i] === '$' && src[i + 1] === '$') {
-      const end = src.indexOf('$$', i + 2)
-      if (end === -1) {
-        out.push({ kind: 'text', value: src.slice(i) })
-        break
-      }
-      out.push({ kind: 'displayMath', value: src.slice(i + 2, end) })
-      i = end + 2
-    } else if (src[i] === '\\' && src[i + 1] === '[') {
-      const end = src.indexOf('\\]', i + 2)
-      if (end === -1) {
-        out.push({ kind: 'text', value: src.slice(i) })
-        break
-      }
-      out.push({ kind: 'displayMath', value: src.slice(i + 2, end) })
-      i = end + 2
-    } else if (src[i] === '\\' && src[i + 1] === '(') {
-      const end = src.indexOf('\\)', i + 2)
-      if (end === -1) {
-        out.push({ kind: 'text', value: src.slice(i) })
-        break
-      }
-      out.push({ kind: 'inlineMath', value: src.slice(i + 2, end) })
-      i = end + 2
-    } else if (src[i] === '$') {
-      const end = src.indexOf('$', i + 1)
-      if (end === -1) {
-        out.push({ kind: 'text', value: src.slice(i) })
-        break
-      }
-      out.push({ kind: 'inlineMath', value: src.slice(i + 1, end) })
-      i = end + 1
-    } else {
-      // Accumulate plain text until the next math marker.
-      let j = i
-      while (j < src.length && !mathStart(j)) j++
-      out.push({ kind: 'text', value: src.slice(i, j) })
-      i = j
-    }
-  }
-  return out
-}
-
-// Per-line markup pass. Runs on text segments only — math is rendered
-// separately so this never sees backslashes inside math mode.
-function renderTexInline(text) {
-  // \"o → ö etc. FIRST, on the raw text — escapeHtml turns the " in \"o into
-  // &quot;, which would stop the \" pattern from ever matching (so M\"obius
-  // would render the escape literally). A small common set; not exhaustive.
-  const umlaut = { a: 'ä', e: 'ë', i: 'ï', o: 'ö', u: 'ü', A: 'Ä', E: 'Ë', I: 'Ï', O: 'Ö', U: 'Ü' }
-  let s = text.replace(/\\"([aeiouAEIOU])/g, (_, ch) => umlaut[ch] || ch)
-  // Then escape, then re-allow a fixed markup whitelist. escapeHtml leaves
-  // \, {, } and the accented chars untouched, so \textbf{…}/\emph{…} match.
-  let html = escapeHtml(s)
-  html = html.replace(/\\textbf\{([^}]*)\}/g, '<b>$1</b>')
-  html = html.replace(/\\emph\{([^}]*)\}/g, '<i>$1</i>')
-  html = html.replace(/\\textit\{([^}]*)\}/g, '<i>$1</i>')
-  return html
-}
-
-function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[c])
-}
-
-// Split a .tex source into a render plan: a flat array of blocks,
-// each either text-segments-with-inline-math or a display-math span.
-// The text blocks get split into paragraphs (blank-line separated)
-// at render time.
-function planTex(src) {
-  const tokens = tokenizeTex(src)
-  const blocks = []
-  let buffer = []
-  for (const tok of tokens) {
-    if (tok.kind === 'displayMath') {
-      if (buffer.length) {
-        blocks.push({ kind: 'text', segments: buffer })
-        buffer = []
-      }
-      blocks.push({ kind: 'displayMath', value: tok.value })
-    } else {
-      buffer.push(tok)
-    }
-  }
-  if (buffer.length) blocks.push({ kind: 'text', segments: buffer })
-  return blocks
-}
-
-// One paragraph (of mixed text + inline math). Renders the math into
-// spans via KaTeX after mount; the surrounding HTML is built with
-// the tiny markup pass above.
-function TexParagraph({ katex, segments }) {
-  const ref = useRef(null)
-  useEffect(() => {
-    if (!ref.current || !katex) return
-    // Replace the placeholders we left in the HTML with rendered math.
-    const targets = ref.current.querySelectorAll('span[data-tex-inline]')
-    targets.forEach((t) => {
-      renderMath(katex, t, t.getAttribute('data-tex-inline'), false)
-    })
-  }, [katex, segments])
-
-  const html = useMemo(() => {
-    return segments.map((s) => {
-      if (s.kind === 'inlineMath') {
-        // Empty span; KaTeX fills it on mount via the useEffect above.
-        // The raw source is stashed as an attribute (escaped) so we
-        // can re-render after a swap without re-tokenizing.
-        return `<span data-tex-inline="${escapeHtml(s.value)}"></span>`
-      }
-      // Apply the line-level markup AFTER escaping the raw text.
-      return renderTexInline(s.value)
-    }).join('')
-  }, [segments])
-
-  return <p className="tex-para" dangerouslySetInnerHTML={{ __html: safeHtml(html) }} />
-}
-
-function TexBlock({ block, katex }) {
-  if (block.kind === 'displayMath') {
-    return <DisplayMath katex={katex} source={block.value} />
-  }
-  // Section/subsection promotion happens line-by-line, before we hand
-  // off to TexParagraph. The split keeps blank lines as paragraph
-  // breaks.
-  return <TexTextBlock katex={katex} segments={block.segments} />
-}
-
-function DisplayMath({ katex, source }) {
-  const ref = useRef(null)
-  useEffect(() => {
-    if (!ref.current || !katex) return
-    renderMath(katex, ref.current, source, true)
-  }, [katex, source])
-  return <div className="tex-display" ref={ref} />
-}
-
-// Walk the text-segments, promoting line-leading \section{...} and
-// \subsection{...} to <h2>/<h3>. Blank lines split paragraphs.
-function TexTextBlock({ katex, segments }) {
-  // Reassemble the segments into a single string with explicit
-  // markers for inline math so the per-line splitter can keep math
-  // tokens intact.
-  const flat = []
-  for (const s of segments) {
-    if (s.kind === 'text') {
-      flat.push({ kind: 'text', value: s.value })
-    } else {
-      flat.push({ kind: 'inlineMath', value: s.value })
-    }
-  }
-  // Build a line-oriented stream. We split text on \n; math tokens
-  // ride along inside the surrounding line.
-  const lines = []
-  let currentLine = []
-  function flushLine() {
-    lines.push(currentLine)
-    currentLine = []
-  }
-  for (const item of flat) {
-    if (item.kind !== 'text') {
-      currentLine.push(item)
-      continue
-    }
-    const pieces = item.value.split('\n')
-    pieces.forEach((piece, i) => {
-      if (piece.length) currentLine.push({ kind: 'text', value: piece })
-      if (i < pieces.length - 1) flushLine()
-    })
-  }
-  flushLine()
-
-  // Group consecutive non-empty lines into paragraphs; empty lines
-  // are paragraph breaks. Detect heading commands at the start of a
-  // line and emit them as their own block.
-  const out = []
-  let para = []
-  function flushPara() {
-    if (para.length === 0) return
-    // Collapse the line array into a flat segments list for
-    // TexParagraph (join lines with spaces, preserving math tokens).
-    const collapsed = []
-    para.forEach((line, idx) => {
-      line.forEach((seg) => collapsed.push(seg))
-      if (idx < para.length - 1) {
-        // Soft line break inside a paragraph → space.
-        collapsed.push({ kind: 'text', value: ' ' })
-      }
-    })
-    out.push({ kind: 'para', segments: collapsed, key: `p${out.length}` })
-    para = []
-  }
-
-  for (const line of lines) {
-    if (line.length === 0) {
-      flushPara()
-      continue
-    }
-    // Heading commands only fire when they're the first non-whitespace
-    // thing on the line.
-    if (line[0].kind === 'text') {
-      const trimmed = line[0].value.replace(/^\s+/, '')
-      // Document-structure boilerplate carries no body content in a math-first
-      // preview — skip it so a COMPLETE .tex (preamble + \begin{document}, the
-      // only shape tectonic can actually build) previews its body cleanly
-      // instead of echoing \documentclass / \usepackage / \begin{document}.
-      if (/^\\(documentclass|usepackage|maketitle|author|date|tableofcontents|newpage|clearpage|pagestyle|thispagestyle|bibliographystyle|bibliography|pagenumbering)\b/.test(trimmed)
-          || /^\\(begin|end)\{document\}/.test(trimmed)) {
-        flushPara()
-        continue
-      }
-      // \title{...} is the document's top heading.
-      const titleMatch = trimmed.match(/^\\title\{([^}]*)\}/)
-      if (titleMatch) {
-        flushPara()
-        out.push({ kind: 'h1', text: titleMatch[1], key: `h${out.length}` })
-        continue
-      }
-      const sectionMatch = trimmed.match(/^\\section\{([^}]*)\}/)
-      const subsectionMatch = trimmed.match(/^\\subsection\{([^}]*)\}/)
-      const subsubMatch = trimmed.match(/^\\subsubsection\{([^}]*)\}/)
-      if (sectionMatch) {
-        flushPara()
-        out.push({ kind: 'h2', text: sectionMatch[1], key: `h${out.length}` })
-        continue
-      }
-      if (subsectionMatch) {
-        flushPara()
-        out.push({ kind: 'h3', text: subsectionMatch[1], key: `h${out.length}` })
-        continue
-      }
-      if (subsubMatch) {
-        flushPara()
-        out.push({ kind: 'h4', text: subsubMatch[1], key: `h${out.length}` })
-        continue
-      }
-    }
-    para.push(line)
-  }
-  flushPara()
-
-  return (
-    <>
-      {out.map((b) => {
-        // Heading text is LaTeX too (\"o umlauts, \textbf, …). Run it through
-        // the same inline pass paragraphs use, sanitized, so a title like
-        // \title{... M\"obius} renders "Möbius" rather than the raw escape.
-        const hHtml = (t) => ({ __html: safeHtml(renderTexInline(t)) })
-        if (b.kind === 'h1') return <h1 className="tex-h1" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
-        if (b.kind === 'h2') return <h2 className="tex-h2" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
-        if (b.kind === 'h3') return <h3 className="tex-h3" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
-        if (b.kind === 'h4') return <h4 className="tex-h4" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
-        return <TexParagraph katex={katex} segments={b.segments} key={b.key} />
-      })}
-    </>
-  )
-}
-
-// Top-level .tex renderer. Loads KaTeX on first mount, then renders
-// the planned block list. If the dynamic import fails or times out
-// (offline / flaky link), we render the rest of the .tex (headings,
-// paragraphs, bold/italic) and the math falls back to its raw source
-// in a `math-error` span — the user can still read and edit. The
-// banner explains why preview math is degraded and disappears once
-// the user is back online + reopens the app.
-function TexPreview({ source }) {
-  const [katex, setKatex] = useState(null)
-  const [error, setError] = useState(null)
-  useEffect(() => {
-    let cancelled = false
-    loadKatex().then((m) => {
-      if (!cancelled) setKatex(m.default || m)
-    }).catch(() => {
-      // We don't surface the underlying error (timeout vs network vs
-      // CORS) — the user just needs to know the math preview will
-      // come back once they're online again.
-      if (!cancelled) setError(true)
-    })
-    return () => { cancelled = true }
-  }, [])
-  const plan = useMemo(() => planTex(source || ''), [source])
-  return (
-    <div className="tex-preview">
-      {error && (
-        <div className="preview-banner">
-          Preview math loads on next online open. Editing still works.
-        </div>
-      )}
-      {plan.map((b, i) => <TexBlock key={i} block={b} katex={katex} />)}
-    </div>
-  )
-}
-
-// ----------------------------------------------------------------------
-// Markdown preview — hand-rolled. We avoid esm.sh for marked because
-// the user's markdown docs aren't expected to be huge; this keeps the
-// app fully self-contained for offline. Supports headings, bold,
-// italic, inline code, fenced code blocks, links, lists.
-// ----------------------------------------------------------------------
-function renderMarkdown(src) {
-  const lines = src.split('\n')
-  let html = ''
-  let inCode = false
-  let codeBuf = []
-  let inList = false
-  function flushList() {
-    if (inList) {
-      html += '</ul>'
-      inList = false
-    }
-  }
-  function inline(s) {
-    let r = escapeHtml(s)
-    // Code spans first (so we don't bold inside code).
-    r = r.replace(/`([^`]+)`/g, '<code>$1</code>')
-    r = r.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
-    r = r.replace(/\*([^*]+)\*/g, '<i>$1</i>')
-    r = r.replace(/_([^_]+)_/g, '<i>$1</i>')
-    // [text](url) — strict so a stray bracket pair doesn't trigger.
-    r = r.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) =>
-      `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`)
-    return r
-  }
-  for (const line of lines) {
-    if (line.startsWith('```')) {
-      if (inCode) {
-        html += `<pre><code>${escapeHtml(codeBuf.join('\n'))}</code></pre>`
-        codeBuf = []
-        inCode = false
-      } else {
-        flushList()
-        inCode = true
-      }
-      continue
-    }
-    if (inCode) {
-      codeBuf.push(line)
-      continue
-    }
-    if (line.startsWith('# ')) { flushList(); html += `<h1>${inline(line.slice(2))}</h1>`; continue }
-    if (line.startsWith('## ')) { flushList(); html += `<h2>${inline(line.slice(3))}</h2>`; continue }
-    if (line.startsWith('### ')) { flushList(); html += `<h3>${inline(line.slice(4))}</h3>`; continue }
-    if (line.match(/^[-*] /)) {
-      if (!inList) { html += '<ul>'; inList = true }
-      html += `<li>${inline(line.slice(2))}</li>`
-      continue
-    }
-    flushList()
-    if (line.trim() === '') { html += ''; continue }
-    html += `<p>${inline(line)}</p>`
-  }
-  if (inCode) {
-    html += `<pre><code>${escapeHtml(codeBuf.join('\n'))}</code></pre>`
-  }
-  flushList()
-  return html
-}
-
-function MarkdownPreview({ source }) {
-  const html = useMemo(() => renderMarkdown(source || ''), [source])
-  return <div className="md-preview" dangerouslySetInnerHTML={{ __html: safeHtml(html) }} />
-}
-
-// ----------------------------------------------------------------------
 // Image preview. The storage API requires a bearer token, so we
 // fetch the file as a blob and convert to an object URL — <img src>
 // can't carry an Authorization header.
@@ -599,37 +165,71 @@ function ImagePreview({ storage, path }) {
   return <img className="img-preview" src={url} alt={path} />
 }
 
-// PDF preview — same auth dance as images. iframe with the blob URL
-// gives us the browser's native PDF viewer.
+// PDF preview — a real pdf.js canvas render. Mobile browsers refuse to
+// render a blob-URL PDF inline in an <iframe> (they offer an "open
+// externally" button instead), so we fetch the bytes ourselves and
+// rasterize each page to a <canvas>. pdfjs-dist comes from the shell's
+// import map (bare specifier; externalized at compile time); the worker
+// is served from the matching /vendor/pdfjs path.
+//
+// `version` (the build token) is in the deps so a rebuild that produces
+// the SAME deterministic path still refetches + re-renders the fresh
+// bytes. A .pdf opened directly from the tree passes version={undefined}
+// (no build to track). The .pdf-pages host is populated imperatively via
+// appendChild — it MUST NOT also carry React children, or React would
+// clobber the canvases on its next reconcile; that's why the loading
+// note is a SIBLING, not a child of the host.
 function PdfPreview({ storage, path, version }) {
-  const [url, setUrl] = useState(null)
+  const wrapRef = useRef(null)
   const [err, setErr] = useState(null)
-  // `version` (the build token) is in the deps so a rebuild that produces the
-  // SAME deterministic path still refetches the fresh bytes; without it the
-  // effect wouldn't re-run and the iframe would keep showing the prior compile.
+  const [loading, setLoading] = useState(true)
   useEffect(() => {
-    let live = true
-    let revoke = null
-    setUrl(null); setErr(null)
-    storage.getBlob(path).then((blob) => {
-      if (!live || !blob) {
-        if (live) setErr('PDF could not be loaded.')
-        return
+    let cancelled = false
+    setErr(null); setLoading(true)
+    ;(async () => {
+      try {
+        const pdfjs = await import('pdfjs-dist')
+        pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
+        const blob = await storage.getBlob(path)
+        if (!blob) throw new Error('Could not load the PDF.')
+        const data = new Uint8Array(await blob.arrayBuffer())
+        const doc = await pdfjs.getDocument({ data }).promise
+        if (cancelled) { doc.destroy && doc.destroy(); return }
+        const host = wrapRef.current
+        if (!host) return
+        host.innerHTML = ''            // imperative target — keep React children OUT of this node
+        const dpr = Math.min(window.devicePixelRatio || 1, 2)
+        const cw = Math.max(host.clientWidth || 600, 200)
+        for (let i = 1; i <= doc.numPages; i++) {
+          if (cancelled) break
+          const page = await doc.getPage(i)
+          const base = page.getViewport({ scale: 1 })
+          const cssScale = cw / base.width
+          const vp = page.getViewport({ scale: cssScale * dpr })
+          const canvas = document.createElement('canvas')
+          canvas.className = 'pdf-page'
+          canvas.width = Math.floor(vp.width)
+          canvas.height = Math.floor(vp.height)
+          canvas.style.width = '100%'
+          canvas.style.height = 'auto'
+          host.appendChild(canvas)
+          await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
+        }
+        if (!cancelled) setLoading(false)
+        doc.destroy && doc.destroy()
+      } catch (e) {
+        if (!cancelled) { setErr((e && e.message) || 'PDF failed to render.'); setLoading(false) }
       }
-      const u = URL.createObjectURL(blob)
-      revoke = u
-      setUrl(u)
-    }).catch((e) => {
-      if (live) setErr(e.message || 'PDF load failed.')
-    })
-    return () => {
-      live = false
-      if (revoke) URL.revokeObjectURL(revoke)
-    }
+    })()
+    return () => { cancelled = true }
   }, [storage, path, version])
   if (err) return <div className="preview-note">{err}</div>
-  if (!url) return <div className="preview-note">Loading PDF…</div>
-  return <iframe className="pdf-preview" src={url} title={path} />
+  return (
+    <div className="pdf-viewer">
+      {loading && <div className="preview-note">Rendering PDF…</div>}
+      <div className="pdf-pages" ref={wrapRef} />
+    </div>
+  )
 }
 
 // ----------------------------------------------------------------------
@@ -770,7 +370,7 @@ function useLongPress(onLongPress) {
 
 function FileNode({
   node, selectedPath, onSelect, depth,
-  onContextMenu, onMoveInto,
+  onContextMenu, onMoveInto, mainPath,
 }) {
   const [expanded, setExpanded] = useState(true)
   const [dropActive, setDropActive] = useState(false)
@@ -780,6 +380,7 @@ function FileNode({
   })
   if (node.children.size === 0 && node.isFile) {
     const selected = node.path === selectedPath
+    const isMain = node.path === mainPath
     return (
       <button
         type="button"
@@ -801,6 +402,7 @@ function FileNode({
       >
         <span className="tree-icon">{fileIcon(node.name)}</span>
         <span className="tree-name">{node.name}</span>
+        {isMain && <span className="tree-main-badge" title="Build compiles this file">main</span>}
       </button>
     )
   }
@@ -857,6 +459,7 @@ function FileNode({
             depth={0}
             onContextMenu={onContextMenu}
             onMoveInto={onMoveInto}
+            mainPath={mainPath}
           />
         ))}
       </div>
@@ -891,12 +494,19 @@ function FileNode({
           depth={depth + 1}
           onContextMenu={onContextMenu}
           onMoveInto={onMoveInto}
+          mainPath={mainPath}
         />
       ))}
     </>
   )
 }
 
+// Left slide-in file drawer (VSCode explorer shape): a panel that
+// transforms in from the left edge over a dimming backdrop, opened by
+// the ☰ button in the top bar. It is ALWAYS mounted (the `--open` class
+// drives the transform), so the slide animation plays both ways and the
+// tree state survives a close/reopen.
+//
 // `canMutate` is false until the file index has been confirmed against
 // the server (App owns the check). While false we disable add/delete so
 // the user can't queue an index write derived from an unconfirmed list —
@@ -905,7 +515,7 @@ function FileNode({
 function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
-  onUpload, onMove, onRename,
+  onUpload, onMove, onRename, mainPath, onSetMain,
 }) {
   const root = useMemo(() => buildTree(files), [files])
   // Hidden inputs the Upload buttons click programmatically. Two separate
@@ -918,9 +528,14 @@ function FileNavPanel({
   const closeCtx = useCallback(() => setCtx(null), [])
   // Close the menu when the drawer closes so it can't outlive its anchor.
   useEffect(() => { if (!open) setCtx(null) }, [open])
-  if (!open) return null
 
+  // Context actions. A .tex file additionally offers "Set as main
+  // document" (unless it already is the main) so the user can pick which
+  // file Build compiles, Overleaf-style.
   const ctxItems = ctx ? [
+    ...(!ctx.isFolder && ctx.path.endsWith('.tex') && ctx.path !== mainPath
+      ? [{ label: 'Set as main document', onSelect: () => onSetMain(ctx.path) }]
+      : []),
     { label: 'Rename', onSelect: () => onRename(ctx.path) },
     {
       label: 'Delete',
@@ -930,99 +545,95 @@ function FileNavPanel({
   ] : []
 
   return (
-    <section className="file-nav-panel" aria-label="File tree">
-      <div className="nav-panel-head">
-        <span className="nav-panel-title">Files</span>
-        <button className="nav-panel-close" onClick={onClose} aria-label="Close file tree">Close</button>
-      </div>
-      <div className="nav-panel-actions">
-        <button className="nav-panel-btn" onClick={onCreateFile} disabled={!canMutate}>+ New file</button>
-        <button className="nav-panel-btn" onClick={onCreateFolder} disabled={!canMutate}>+ New folder</button>
-        <button
-          className="nav-panel-btn"
-          onClick={() => fileInputRef.current && fileInputRef.current.click()}
-          disabled={!canMutate}
-        >
-          Upload
-        </button>
-        <button
-          className="nav-panel-btn"
-          onClick={() => folderInputRef.current && folderInputRef.current.click()}
-          disabled={!canMutate}
-        >
-          Upload folder
-        </button>
-        {/* Hidden file/folder pickers. Materialise the FileList into a real
-            array SYNCHRONOUSLY before resetting input.value: onUpload is async
-            (it awaits before reading the list), and `e.target.value = ''`
-            empties the live FileList the input still owns — so capturing the
-            reference and resetting first would hand the uploader an
-            already-emptied list and silently upload nothing. The reset still
-            runs (so re-picking the same file fires a change event); it just
-            runs after we've copied the entries out. */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          style={{ display: 'none' }}
-          onChange={(e) => {
-            const fl = Array.from(e.target.files || [])
-            e.target.value = ''
-            onUpload(fl, { asFolder: false })
-          }}
-        />
-        <input
-          ref={folderInputRef}
-          type="file"
-          multiple
-          webkitdirectory=""
-          directory=""
-          style={{ display: 'none' }}
-          onChange={(e) => {
-            const fl = Array.from(e.target.files || [])
-            e.target.value = ''
-            onUpload(fl, { asFolder: true })
-          }}
-        />
-      </div>
-      {!canMutate && (
-        <div className="nav-panel-syncing" role="status">
-          Loading your files... add, upload, and delete are available once they sync.
+    <>
+      <div
+        className={`drawer-scrim ${open ? 'drawer-scrim--open' : ''}`}
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <aside
+        className={`file-drawer ${open ? 'file-drawer--open' : ''}`}
+        aria-label="File tree"
+        aria-hidden={!open}
+      >
+        <div className="drawer-head">
+          <span className="drawer-title">Files</span>
+          <button className="drawer-close" onClick={onClose} aria-label="Close file tree">×</button>
         </div>
-      )}
-      <div className="nav-panel-tree">
-        {files.length === 0 ? (
-          canMutate ? (
-            <div className="nav-panel-empty">
-              No files yet. Tap "+ New file", Upload, or ask the agent to make one.
-            </div>
-          ) : null
-        ) : (
-          <FileNode
-            node={root}
-            selectedPath={selectedPath}
-            onSelect={(p) => { onSelect(p); onClose() }}
-            depth={-1}
-            onContextMenu={setCtx}
-            onMoveInto={onMove}
-          />
-        )}
-      </div>
-      {selectedPath && (
-        <div className="nav-panel-foot">
+        <div className="drawer-actions">
+          <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>New file</button>
+          <button className="drawer-btn" onClick={onCreateFolder} disabled={!canMutate}>New folder</button>
           <button
-            className="nav-panel-btn nav-panel-btn--danger"
-            onClick={() => onDeleteFile(selectedPath)}
+            className="drawer-btn"
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
             disabled={!canMutate}
           >
-            Delete "{selectedPath}"
+            Upload
           </button>
+          {/* Hidden file/folder pickers. Materialise the FileList into a real
+              array SYNCHRONOUSLY before resetting input.value: onUpload is async
+              (it awaits before reading the list), and `e.target.value = ''`
+              empties the live FileList the input still owns — so capturing the
+              reference and resetting first would hand the uploader an
+              already-emptied list and silently upload nothing. The reset still
+              runs (so re-picking the same file fires a change event); it just
+              runs after we've copied the entries out. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const fl = Array.from(e.target.files || [])
+              e.target.value = ''
+              onUpload(fl, { asFolder: false })
+            }}
+          />
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
+            webkitdirectory=""
+            directory=""
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const fl = Array.from(e.target.files || [])
+              e.target.value = ''
+              onUpload(fl, { asFolder: true })
+            }}
+          />
         </div>
-      )}
-      {ctx && (
-        <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems} onClose={closeCtx} />
-      )}
-    </section>
+        {!canMutate && (
+          <div className="drawer-syncing" role="status">
+            Loading your files… add, upload, and delete unlock once they sync.
+          </div>
+        )}
+        <div className="drawer-tree">
+          {files.length === 0 ? (
+            canMutate ? (
+              <div className="drawer-empty">
+                No files yet. Tap “New file”, Upload, or ask the agent below
+                to make one. Long-press a .tex file to set it as the main
+                document.
+              </div>
+            ) : null
+          ) : (
+            <FileNode
+              node={root}
+              selectedPath={selectedPath}
+              onSelect={(p) => { onSelect(p); onClose() }}
+              depth={-1}
+              onContextMenu={setCtx}
+              onMoveInto={onMove}
+              mainPath={mainPath}
+            />
+          )}
+        </div>
+        {ctx && (
+          <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems} onClose={closeCtx} />
+        )}
+      </aside>
+    </>
   )
 }
 
@@ -1052,6 +663,13 @@ function bootstrapPrompt(appId) {
     'in the index — the storage backend has no mkdir, so an empty folder',
     'is materialised by writing that 0-byte file. Leave .keep files alone',
     'unless the user explicitly asks to remove the folder.',
+    '',
+    `The MAIN document — the single root .tex the user compiles — is recorded`,
+    `at /data/apps/${appId}/main.json as {"path": "files/<root>.tex"}. The`,
+    'Build button always compiles that file. If you create a brand-new',
+    'project with a different root than files/welcome.tex, update main.json',
+    'to point at it (and keep its value to an existing .tex). The user can',
+    'also set it from the file drawer.',
     '',
     'This is a silent setup brief — do NOT reply to it. Wait for the',
     'user’s first message and act on that.',
@@ -1186,8 +804,9 @@ function ChatPanel({
 
   return (
     <section className="chat-panel">
-      <div className="pane-head">
-        <span>Agent chat</span>
+      <div className="chat-head">
+        <span className="chat-head-title">Agent</span>
+        <span className="chat-head-hint">Describe your document — it writes the LaTeX</span>
       </div>
       {error && <div className="chat-error">{error}</div>}
       <div className="chat-embed" ref={mountRef} />
@@ -1702,10 +1321,19 @@ export default function App({ appId, token }) {
   // on every storage write (handled inline at each call site below)
   // and on a 10s background poll.
   const [pending, setPending] = useState(0)
-  // Preview viewer mode for the selected source file. 'source' shows the
-  // KaTeX/markdown render; 'pdf' shows the compiled PDF. The PDF tab is only
-  // reachable once the current .tex has a build mapped (see pdfByDoc below).
+  // Viewer mode, toggled by the [Source | PDF] segmented control in the
+  // top bar. 'source' shows the editable textarea for the open file;
+  // 'pdf' shows the MAIN document's compiled PDF (Overleaf-style — Build
+  // always compiles the main file, so the PDF tab shows that one output
+  // regardless of which file is currently open).
   const [viewMode, setViewMode] = useState('source')
+  // The designated MAIN document — the single root .tex that Build
+  // compiles and the PDF view renders. Persisted in main.json and
+  // defaulted (below) to the first .tex (preferring files/welcome.tex).
+  // null until the index loads + a default is resolved.
+  const [mainPath, setMainPath] = useState(null)
+  const mainPathRef = useRef(null)
+  useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
   const build = useBuild({ appId, token, storage, online })
 
   // Persist the file-cache snapshot whenever the index, contents, or
@@ -1820,6 +1448,89 @@ export default function App({ appId, token }) {
       if (firstReal) setSelectedPath(firstReal)
     }
   }, [files, selectedPath])
+
+  // Pick a sensible default main document from the current file list:
+  // files/welcome.tex if it's present (the canonical seed root), else the
+  // first .tex alphabetically, else null.
+  const defaultMain = useCallback((list) => {
+    if (list.includes('files/welcome.tex')) return 'files/welcome.tex'
+    return list.find((p) => p.endsWith('.tex')) || null
+  }, [])
+
+  // Resolve the main document once the index is confirmed. Read main.json;
+  // honor it if it still points at an existing .tex, otherwise fall back to
+  // the default and persist that choice so a future open is stable. Only
+  // writes when online + indexLoaded — same gate as every other UI write,
+  // so an unconfirmed/offline list never clobbers the server.
+  // mainResolvedRef gates the one-shot initial read; mainReady flips true
+  // only AFTER that read has decided, so the maintenance effect below
+  // can't race the in-flight resolve (which would double-write the same
+  // default). The two are separate on purpose: the ref prevents a re-run,
+  // the state unblocks the maintenance pass.
+  const mainResolvedRef = useRef(false)
+  const [mainReady, setMainReady] = useState(false)
+  useEffect(() => {
+    if (!indexLoaded || mainResolvedRef.current) return
+    mainResolvedRef.current = true
+    let cancelled = false
+    ;(async () => {
+      let stored = null
+      try {
+        const m = await storage.get('main.json')
+        if (m && typeof m === 'object' && typeof m.path === 'string') stored = m.path
+      } catch { /* offline / transient — fall through to default */ }
+      if (cancelled) return
+      const list = filesRef.current
+      if (stored && list.includes(stored)) {
+        setMainPath(stored)
+      } else {
+        // No valid stored main — default and persist (best-effort).
+        const fallback = defaultMain(list)
+        setMainPath(fallback)
+        if (fallback && online) {
+          storage.setJSON('main.json', { path: fallback }).catch(() => {})
+        }
+      }
+      setMainReady(true)
+    })()
+    return () => { cancelled = true }
+  }, [indexLoaded, storage, online, defaultMain])
+
+  // Keep the main document valid as the file list changes: re-point it at a
+  // default if it was deleted/renamed away, or adopt one when a .tex first
+  // appears and none is set, so Build + the PDF view never target a vanished
+  // (or missing) file. Runs only after the initial resolve has settled.
+  useEffect(() => {
+    if (!mainReady) return
+    if (mainPath && !files.includes(mainPath)) {
+      const fallback = defaultMain(files)
+      setMainPath(fallback)
+      // Persist a valid { path } object, or CLEAR the pointer when no .tex
+      // remains — never write the literal `null` (main.json's contract is an
+      // object-or-absent, and this mirrors the fallback-guarded write below).
+      if (online) {
+        if (fallback) storage.setJSON('main.json', { path: fallback }).catch(() => {})
+        else storage.remove('main.json').catch(() => {})
+      }
+    } else if (!mainPath && files.some((p) => p.endsWith('.tex'))) {
+      const fallback = defaultMain(files)
+      setMainPath(fallback)
+      if (fallback && online) storage.setJSON('main.json', { path: fallback }).catch(() => {})
+    }
+  }, [files, mainPath, mainReady, online, storage, defaultMain])
+
+  // Set a .tex as the main document (from the drawer context menu).
+  // Persists immediately so Build + reload agree on the target.
+  const handleSetMain = useCallback(async (path) => {
+    if (!path || !path.endsWith('.tex')) return
+    setMainPath(path)
+    try {
+      await storage.setJSON('main.json', { path })
+      refreshPending()
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Could not set main document' })
+    }
+  }, [storage, refreshPending, modal])
 
   // Load the selected file's content. Cache-first: if the body lives
   // in fileCache we paint it from state without fetching. Selection
@@ -2188,6 +1899,15 @@ export default function App({ appId, token }) {
       // them with the folder). forgetDoc(from) only dropped an exact-key match,
       // so a folder rename (keys are children, not `from`) silently lost them.
       build.rewriteDocs(rewrite)
+      // The main document follows a rename/move of itself or its parent
+      // folder, and is re-persisted so Build keeps targeting the right file.
+      if (mainPathRef.current) {
+        const nextMain = rewrite(mainPathRef.current)
+        if (nextMain !== mainPathRef.current) {
+          setMainPath(nextMain)
+          storage.setJSON('main.json', { path: nextMain }).catch(() => {})
+        }
+      }
       refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Move failed' })
@@ -2267,27 +1987,35 @@ export default function App({ appId, token }) {
   const selectedIsBinary = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(selectedExt)
   const canEditSelected = !!selectedPath && !selectedIsBinary && !fileLoading && !fileError
   const selectedIsTex = selectedExt === 'tex'
-  // The PDF compiled from the selected .tex this session, if any: a
-  // { pdf, ver } record (ver is the build token, see useBuild). The viewer's
-  // PDF tab is gated on this so a doc with no build can't show a blank iframe.
-  const pdfForSelected = (selectedPath && build.pdfByDoc[selectedPath]) || null
+  // Whether there is a compilable main document. The [Source | PDF] toggle
+  // and the Build button are meaningful exactly when one exists — Build
+  // always compiles the MAIN file and the PDF view shows its output, so both
+  // controls track the main doc, not the currently-open file (Overleaf model).
+  const hasMain = !!mainPath
+  const selectedIsMain = !!selectedPath && selectedPath === mainPath
+  // The PDF compiled from the MAIN document this session, if any: a
+  // { pdf, ver } record (ver is the build token, see useBuild). The PDF view
+  // is gated on this so a never-built doc can't show a blank canvas.
+  const pdfForMain = (mainPath && build.pdfByDoc[mainPath]) || null
+  // Is the main doc currently building / did its last build fail? (build is
+  // single-flight in the hook, keyed by buildDoc.)
+  const mainBuilding = build.buildStatus === 'building' && build.buildDoc === mainPath
+  const mainBuildError = build.buildStatus === 'error' && build.buildDoc === mainPath
 
-  // Reset the viewer to source whenever the user switches files — a per-doc
-  // PDF tab shouldn't carry over to a different (maybe-never-built) document.
-  // Selecting a .pdf directly is handled by renderPreview (it just shows the
-  // PDF); this only governs the source/pdf TAB state for .tex/.md docs.
+  // Reset the viewer to source whenever the user switches files, so opening a
+  // file always lands on its editable source rather than the (whole-document)
+  // PDF. The toggle stays available so they can flip back to the PDF.
   useEffect(() => {
     setViewMode('source')
   }, [selectedPath])
 
-  // When a build finishes, flip the selected doc's viewer to PDF and make the
+  // When the MAIN doc's build finishes, flip the viewer to PDF and make the
   // new .pdf visible in the tree by adding it to files-index.json if missing.
   // Only writes the index when it's safe to (indexLoaded) — same gate as every
   // other UI index write, so an unconfirmed list never clobbers the server's.
   const onBuildDone = useCallback(async (doc, pdfPath) => {
-    // Only yank the viewer to PDF if the user is still on the doc we built —
-    // a build can finish after they've navigated elsewhere.
-    if (doc === selectedPathRef.current) setViewMode('pdf')
+    // Show the freshly-built PDF if it's the main doc we just compiled.
+    if (doc === mainPathRef.current) setViewMode('pdf')
     if (!pdfPath || !indexLoaded) return
     // The build can finish up to 120s after it started, so `files` captured
     // in this callback's closure may be stale (a chat turn or upload added an
@@ -2331,38 +2059,90 @@ export default function App({ appId, token }) {
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
 
   const handleBuild = useCallback(() => {
-    if (!selectedIsTex || !selectedPath) return
-    if (build.buildStatus === 'building') return
-    // Save unsaved edits first so the compile sees what's on screen, then
-    // kick the build. handleSaveFile resolves once the write lands (or fails
-    // silently into fileError); we build either way so a flaky save doesn't
-    // strand the button.
-    const kick = () => build.build(selectedPath, onBuildDone)
-    if (fileDirty && !fileSaving) {
+    // Build always compiles the MAIN document, regardless of which file is
+    // open (Overleaf-style). useBuild writes build/target.txt = mainPath so
+    // the server-side script compiles the right root file.
+    if (!mainPath || build.buildStatus === 'building') return
+    // Save the currently-open file's unsaved edits first so a compile picks
+    // up on-screen changes to the main doc (or to any \input'd chapter the
+    // user just edited). handleSaveFile resolves once the write lands (or
+    // fails silently into fileError); we build either way so a flaky save
+    // doesn't strand the button.
+    const kick = () => build.build(mainPath, onBuildDone)
+    if (fileDirty && !fileSaving && canEditSelected) {
       handleSaveFile().then(kick, kick)
     } else {
       kick()
     }
-  }, [selectedIsTex, selectedPath, fileDirty, fileSaving, build, onBuildDone, handleSaveFile])
+  }, [mainPath, fileDirty, fileSaving, canEditSelected, build, onBuildDone, handleSaveFile])
 
-  function renderEditor() {
+  // The PDF view: the MAIN document's compiled output (with the build's
+  // running / failed states), since Build always compiles the main file.
+  function renderPdfView() {
+    if (!mainPath) {
+      return (
+        <div className="preview-note">
+          No main document set yet. Open the file drawer and long-press a
+          .tex file to set it as the main document, then Build.
+        </div>
+      )
+    }
+    if (mainBuilding) {
+      return (
+        <div className="preview-note build-note">
+          Building <b>{mainPath.replace(/^files\//, '')}</b>…
+          (first build downloads packages, ~30–60s)
+        </div>
+      )
+    }
+    if (mainBuildError) {
+      return (
+        <div className="build-error">
+          <div className="build-error-title">Build failed</div>
+          <pre className="build-log">{build.buildLog}</pre>
+        </div>
+      )
+    }
+    if (pdfForMain) {
+      return <PdfPreview storage={storage} path={pdfForMain.pdf} version={pdfForMain.ver} />
+    }
+    return (
+      <div className="preview-note build-note">
+        No PDF yet. Tap <b>Build</b> to compile <b>{mainPath.replace(/^files\//, '')}</b>.
+      </div>
+    )
+  }
+
+  // The main content area — source editor OR a viewer, toggled. A .tex
+  // shows its raw source by default and flips to the main doc's PDF via the
+  // top-bar toggle. Images and tree-selected .pdf files render directly.
+  function renderMain() {
     if (!selectedPath) {
       return (
-        <div className="editor-empty">
-          <div className="editor-empty-title">No source selected</div>
-          <div className="editor-empty-body">Open the file tree or create a new file.</div>
+        <div className="preview-empty">
+          <div className="preview-empty-title">LaTeX</div>
+          <div className="preview-empty-body">
+            Open the file drawer to pick a file, or ask the agent below to
+            create one.
+          </div>
         </div>
       )
     }
-    if (selectedIsBinary) {
-      return (
-        <div className="editor-empty">
-          <div className="editor-empty-title">Binary preview</div>
-          <div className="editor-empty-body">{selectedPath}</div>
-        </div>
-      )
+    // Images: always inline. A .pdf opened from the tree: the pdf.js viewer
+    // (static document, no build state).
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(selectedExt)) {
+      return <ImagePreview storage={storage} path={selectedPath} />
     }
-    if (fileLoading) return <div className="preview-note">Loading source...</div>
+    if (selectedExt === 'pdf') {
+      return <PdfPreview storage={storage} path={selectedPath} />
+    }
+    // PDF mode (only reachable for .tex selections via the toggle) shows the
+    // MAIN document's compiled output.
+    if (selectedIsTex && viewMode === 'pdf') {
+      return renderPdfView()
+    }
+    // Otherwise: the editable source for the open text file.
+    if (fileLoading) return <div className="preview-note">Loading source…</div>
     if (fileError) return <div className="preview-note">{fileError}</div>
     return (
       <textarea
@@ -2375,69 +2155,11 @@ export default function App({ appId, token }) {
     )
   }
 
-  // Choose the preview renderer based on the file extension.
-  function renderPreview() {
-    if (!selectedPath) {
-      return (
-        <div className="preview-empty">
-          <div className="preview-empty-title">LaTeX</div>
-          <div className="preview-empty-body">
-            Open the file tree to pick a file, or ask the agent below to
-            create one.
-          </div>
-        </div>
-      )
-    }
-    const ext = selectedExt
-    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
-      return <ImagePreview storage={storage} path={selectedPath} />
-    }
-    // A .pdf selected directly in the tree just shows the PDF — no tabs,
-    // no build state; it's a static document, not a compile target.
-    if (ext === 'pdf') {
-      return <PdfPreview storage={storage} path={selectedPath} />
-    }
-    // For .tex docs, the viewer toggles between the live source render and
-    // the compiled PDF. The PDF view also has to surface the build's own
-    // states (running / failed) since a build is a per-doc async operation.
-    if (ext === 'tex' && viewMode === 'pdf') {
-      // Building / error states only apply to the doc that's actually
-      // compiling (build is single-flight in the hook).
-      const isBuildingThis = build.buildStatus === 'building' && build.buildDoc === selectedPath
-      const isErrorThis = build.buildStatus === 'error' && build.buildDoc === selectedPath
-      if (isBuildingThis) {
-        return (
-          <div className="preview-note build-note">
-            Building… (first build downloads packages, ~30–60s)
-          </div>
-        )
-      }
-      if (isErrorThis) {
-        return (
-          <div className="build-error">
-            <div className="build-error-title">Build failed</div>
-            <pre className="build-log">{build.buildLog}</pre>
-          </div>
-        )
-      }
-      if (pdfForSelected) {
-        return (
-          <PdfPreview
-            storage={storage}
-            path={pdfForSelected.pdf}
-            version={pdfForSelected.ver}
-          />
-        )
-      }
-      // viewMode flipped to pdf but no build yet — fall through to source.
-    }
-    if (fileLoading) return <div className="preview-note">Loading…</div>
-    if (fileError) return <div className="preview-note">{fileError}</div>
-    if (ext === 'md') return <MarkdownPreview source={fileContent} />
-    if (ext === 'tex') return <TexPreview source={fileContent} />
-    // Fallback: render any other text file as plain preformatted text.
-    return <pre className="text-preview">{fileContent}</pre>
-  }
+  // The PDF view shows the MAIN doc's output, so the [Source | PDF] toggle
+  // and Build are meaningful while a .tex is open. (Showing them only on a
+  // .tex keeps a clean toolbar for images/pdf/other files.)
+  const showTexControls = selectedIsTex && hasMain
+  const openName = selectedPath ? selectedPath.replace(/^files\//, '') : null
 
   return (
     <div className="latex-root">
@@ -2446,70 +2168,26 @@ export default function App({ appId, token }) {
         <button
           className="nav-toggle"
           onClick={toggleNav}
-          aria-label={navOpen ? 'Close file tree' : 'Open file tree'}
+          aria-label={navOpen ? 'Close file drawer' : 'Open file drawer'}
           aria-expanded={navOpen}
         >
           ☰
         </button>
         <div className="top-title">
-          <span className="app-title">LaTeX</span>
-          {selectedPath
-            ? <span className="top-path">{selectedPath}</span>
-            : <span className="top-path top-path--muted">No file selected</span>}
+          {openName
+            ? <span className="top-path" title={selectedPath}>{openName}</span>
+            : <span className="top-path top-path--muted">No file open</span>}
+          {selectedIsMain && <span className="top-main-badge" title="Build compiles this file">main</span>}
         </div>
         <div className="top-actions">
-          <button className="toolbar-btn" onClick={handleCreateFile} disabled={!indexLoaded}>New</button>
-          <button
-            className="toolbar-btn"
-            onClick={handleSaveFile}
-            disabled={!canEditSelected || !fileDirty || fileSaving}
-          >
-            {fileSaving ? 'Saving' : fileDirty ? 'Save' : 'Saved'}
-          </button>
-          <button
-            className="toolbar-btn toolbar-btn--primary"
-            onClick={handleBuild}
-            disabled={!selectedIsTex || build.buildStatus === 'building'}
-            title={selectedIsTex
-              ? 'Compile this .tex to PDF'
-              : 'Select a .tex file to build'}
-          >
-            {build.buildStatus === 'building' ? 'Building…' : 'Build'}
-          </button>
-          <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
-        </div>
-      </header>
-      <FileNavPanel
-        open={navOpen}
-        onClose={closeNav}
-        files={files}
-        selectedPath={selectedPath}
-        onSelect={setSelectedPath}
-        canMutate={indexLoaded}
-        onCreateFile={handleCreateFile}
-        onCreateFolder={handleCreateFolder}
-        onDeleteFile={handleDeleteFile}
-        onDeleteFolder={handleDeleteFolder}
-        onUpload={uploadFiles}
-        onMove={movePath}
-        onRename={handleRename}
-      />
-      <main className="workspace">
-        <section className="editor-pane">
-          <div className="pane-head">
-            <span>Source</span>
-          </div>
-          <div className="pane-body">{renderEditor()}</div>
-        </section>
-        <section className="preview-pane">
-          <div className="pane-head">
-            {selectedIsTex ? (
-              <div className="view-tabs" role="tablist" aria-label="Preview mode">
+          {showTexControls && (
+            <>
+              <div className="seg-toggle" role="tablist" aria-label="View mode">
                 <button
                   type="button"
                   role="tab"
                   aria-selected={viewMode === 'source'}
-                  className={`view-tab ${viewMode === 'source' ? 'view-tab--active' : ''}`}
+                  className={`seg-btn ${viewMode === 'source' ? 'seg-btn--active' : ''}`}
                   onClick={() => setViewMode('source')}
                 >
                   Source
@@ -2518,34 +2196,52 @@ export default function App({ appId, token }) {
                   type="button"
                   role="tab"
                   aria-selected={viewMode === 'pdf'}
-                  className={`view-tab ${viewMode === 'pdf' ? 'view-tab--active' : ''}`}
+                  className={`seg-btn ${viewMode === 'pdf' ? 'seg-btn--active' : ''}`}
                   onClick={() => setViewMode('pdf')}
-                  // PDF tab opens once the doc has a build mapped, or while a
-                  // build for THIS doc is in flight (so the user can watch
-                  // progress / see the failure log).
-                  disabled={!pdfForSelected
-                    && !(build.buildStatus !== 'idle' && build.buildDoc === selectedPath)}
-                  title={(!pdfForSelected
-                    && !(build.buildStatus !== 'idle' && build.buildDoc === selectedPath))
-                    ? 'Build this document to see its PDF'
-                    : 'View the compiled PDF'}
                 >
                   PDF
                 </button>
               </div>
-            ) : (
-              <span>Preview</span>
-            )}
-          </div>
-          <div className="pane-body preview-body">{renderPreview()}</div>
-        </section>
+              <button
+                className="toolbar-btn toolbar-btn--primary"
+                onClick={handleBuild}
+                disabled={build.buildStatus === 'building'}
+                title={`Compile the main document (${mainPath.replace(/^files\//, '')})`}
+              >
+                {build.buildStatus === 'building' ? 'Building…' : 'Build'}
+              </button>
+            </>
+          )}
+          <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
+        </div>
+      </header>
+
+      <div className="body">
+        <FileNavPanel
+          open={navOpen}
+          onClose={closeNav}
+          files={files}
+          selectedPath={selectedPath}
+          onSelect={setSelectedPath}
+          canMutate={indexLoaded}
+          onCreateFile={handleCreateFile}
+          onCreateFolder={handleCreateFolder}
+          onDeleteFile={handleDeleteFile}
+          onDeleteFolder={handleDeleteFolder}
+          onUpload={uploadFiles}
+          onMove={movePath}
+          onRename={handleRename}
+          mainPath={mainPath}
+          onSetMain={handleSetMain}
+        />
+        <main className="content">{renderMain()}</main>
         <ChatPanel
           appId={appId}
           token={token}
           storage={storage}
           onFilesMaybeChanged={onFilesMaybeChanged}
         />
-      </main>
+      </div>
       {modal.node}
     </div>
   )
@@ -2604,13 +2300,24 @@ const CSS = `
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-.app-title {
-  display: block;
-  font-size: 15px;
-  color: var(--text);
+.top-path {
+  font-family: var(--font);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
-.top-path { font-family: var(--font); }
 .top-path--muted { color: var(--muted); font-weight: 400; }
+.top-main-badge {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font: 700 10px/1.4 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+}
 .top-actions {
   display: inline-flex;
   align-items: center;
@@ -2619,14 +2326,15 @@ const CSS = `
   min-width: 0;
 }
 .toolbar-btn {
-  min-height: 40px;
-  padding: 8px 12px;
+  min-height: 36px;
+  padding: 8px 14px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
   font: 600 13px/1 var(--font);
   cursor: pointer;
+  white-space: nowrap;
 }
 .toolbar-btn--primary {
   background: var(--accent);
@@ -2638,130 +2346,61 @@ const CSS = `
   cursor: default;
 }
 
-.file-nav-panel {
+/* ---- segmented [Source | PDF] toggle ---- */
+.seg-toggle {
+  display: inline-flex;
   flex: 0 0 auto;
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 10px;
-  align-items: start;
-  width: 100%;
-  max-height: 34vh;
-  overflow: auto;
-  padding: 10px 12px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  box-sizing: border-box;
-}
-.nav-panel-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 40px;
-}
-.nav-panel-title { font-size: 14px; font-weight: 700; }
-.nav-panel-close {
-  min-height: 36px;
-  padding: 7px 10px;
-  border-radius: 8px;
+  padding: 2px;
+  border-radius: 9px;
   border: 1px solid var(--border);
   background: var(--bg);
-  color: var(--text);
-  font: 600 12px/1 var(--font);
-  cursor: pointer;
 }
-.nav-panel-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  min-width: 0;
-}
-.nav-panel-btn {
-  min-height: 40px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-  font: 600 13px/1.2 var(--font);
-  cursor: pointer;
-}
-.nav-panel-btn--danger { color: var(--accent); border-color: var(--accent); }
-.nav-panel-btn:disabled { opacity: 0.45; cursor: default; }
-.nav-panel-syncing,
-.nav-panel-empty {
+.seg-btn {
+  min-height: 30px;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
+  font: 700 11px/1 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
 }
-.nav-panel-tree {
-  grid-column: 1 / -1;
-  min-height: 0;
-  max-height: 22vh;
-  overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
-  padding: 4px 0;
-}
-.nav-panel-foot {
-  grid-column: 1 / -1;
-  display: flex;
-  justify-content: flex-end;
+.seg-btn--active {
+  background: var(--surface2, var(--surface));
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }
 
-.workspace {
+/* ---- body: content area + bounded chat, stacked ----
+   position: relative so the absolutely-positioned file drawer + its
+   backdrop resolve against THIS box — i.e. they overlay only the area
+   below the top bar, leaving the ☰ toggle always tappable. */
+.body {
+  position: relative;
   flex: 1 1 auto;
-  min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr) minmax(300px, 0.9fr);
-  background: var(--bg);
-}
-.editor-pane,
-.preview-pane,
-.chat-panel {
-  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--bg);
-}
-.editor-pane,
-.preview-pane {
-  border-right: 1px solid var(--border);
-}
-.pane-head {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  min-height: 38px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--muted);
-  font: 700 12px/1 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.pane-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
-}
-
-/* ---- preview pane ---- */
-.preview-pane {
   overflow: hidden;
 }
-.preview-body {
-  padding: 18px 18px 24px;
-  overflow-y: auto;
-  overflow-x: hidden;
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
 }
+/* ---- source editor ---- */
 .source-editor {
   display: block;
+  flex: 1 1 auto;
   width: 100%;
   height: 100%;
-  min-height: 300px;
+  min-height: 0;
   padding: 16px;
   box-sizing: border-box;
   resize: none;
@@ -2774,23 +2413,8 @@ const CSS = `
 .source-editor:focus {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
-.editor-empty {
-  display: flex;
-  height: 100%;
-  min-height: 240px;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 20px;
-  color: var(--muted);
-  text-align: center;
-}
-.editor-empty-title {
-  color: var(--text);
-  font-weight: 700;
-}
 
+/* ---- empty / notes ---- */
 .preview-empty {
   display: flex;
   flex-direction: column;
@@ -2800,6 +2424,7 @@ const CSS = `
   text-align: center;
   color: var(--muted);
   gap: 8px;
+  padding: 24px;
 }
 .preview-empty-title { font-size: 26px; font-weight: 700; color: var(--text); letter-spacing: -0.5px; }
 .preview-empty-body { font-size: 14px; line-height: 1.5; max-width: 320px; }
@@ -2807,50 +2432,23 @@ const CSS = `
 .preview-note {
   color: var(--muted);
   font-size: 13px;
-  padding: 16px 0;
+  padding: 24px 18px;
   text-align: center;
-}
-.build-note {
-  padding: 24px 16px;
   line-height: 1.55;
 }
-
-/* ---- Source/PDF viewer tabs ---- */
-.view-tabs {
-  display: inline-flex;
-  gap: 4px;
-}
-.view-tab {
-  min-height: 28px;
-  padding: 5px 12px;
-  border-radius: 7px;
-  border: 1px solid transparent;
-  background: none;
-  color: var(--muted);
-  font: 700 11px/1 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  cursor: pointer;
-}
-.view-tab--active {
-  background: var(--bg);
-  border-color: var(--border);
-  color: var(--text);
-}
-.view-tab:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
+.preview-note b { color: var(--text); }
+.build-note { padding: 32px 18px; }
 
 /* ---- build failure ---- */
 .build-error {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  padding: 16px 18px;
 }
 .build-error-title {
   font-weight: 700;
-  color: var(--accent);
+  color: var(--danger, var(--accent));
   font-size: 14px;
 }
 .build-log {
@@ -2866,127 +2464,36 @@ const CSS = `
   white-space: pre-wrap;
   word-break: break-word;
 }
-/* Subtle accent-tinted strip sitting at the top of the .tex preview
-   when KaTeX failed to load (offline / flaky link). Loud enough to
-   notice, quiet enough not to dominate the page; matches the news
-   app's offline banner so the two apps feel like one family. */
-.preview-banner {
-  margin: 0 0 12px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-size: 12.5px;
-  line-height: 1.45;
-}
 
-/* ---- .tex render ---- */
-.tex-preview {
-  font-size: 15px;
-  line-height: 1.65;
-  word-wrap: break-word;
-  overflow-wrap: anywhere;
-}
-.tex-h1 {
-  font-size: 27px;
-  font-weight: 800;
-  margin: 8px 0 14px;
-  letter-spacing: -0.4px;
-}
-.tex-h2 {
-  font-size: 22px;
-  font-weight: 700;
-  margin: 20px 0 8px;
-  letter-spacing: -0.3px;
-}
-.tex-h3 {
-  font-size: 17px;
-  font-weight: 700;
-  margin: 16px 0 6px;
-}
-.tex-h4 {
-  font-size: 15px;
-  font-weight: 700;
-  margin: 14px 0 4px;
-  color: var(--muted);
-}
-.tex-para {
-  margin: 0 0 12px;
-}
-.tex-display {
-  display: block;
-  margin: 14px 0;
-  padding: 4px 0;
-  overflow-x: auto;
-  text-align: center;
-}
-.math-error {
-  color: var(--accent);
-  font-family: ui-monospace, SFMono-Regular, monospace;
-  /* Tinted backdrop follows --accent instead of pinning to red,
-     so the malformed-math flag stays visible on themes whose
-     accent isn't red. color-mix is supported in every browser
-     Möbius targets. */
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  padding: 0 4px;
-  border-radius: 3px;
-}
-
-/* ---- .md render ---- */
-.md-preview {
-  font-size: 15px;
-  line-height: 1.6;
-}
-.md-preview h1, .md-preview h2, .md-preview h3 {
-  margin-top: 18px;
-  margin-bottom: 8px;
-}
-.md-preview h1 { font-size: 24px; }
-.md-preview h2 { font-size: 19px; }
-.md-preview h3 { font-size: 16px; }
-.md-preview p { margin: 0 0 12px; }
-.md-preview code {
-  background: var(--surface);
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-family: ui-monospace, monospace;
-  font-size: 90%;
-}
-.md-preview pre {
-  background: var(--surface);
-  padding: 10px 12px;
-  border-radius: 6px;
-  overflow-x: auto;
-  font-size: 13px;
-}
-.md-preview pre code { background: none; padding: 0; }
-.md-preview a { color: var(--accent); }
-.md-preview ul { padding-left: 22px; }
-.md-preview li { margin-bottom: 4px; }
-
-/* ---- image/pdf/text ---- */
+/* ---- image preview ---- */
 .img-preview {
   display: block;
   max-width: 100%;
-  margin: 0 auto;
+  margin: 18px auto;
   border-radius: 6px;
 }
-.pdf-preview {
+
+/* ---- pdf.js canvas viewer ---- */
+.pdf-viewer {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--surface2, var(--surface));
+}
+.pdf-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 12px 28px;
+}
+.pdf-page {
   display: block;
   width: 100%;
-  height: 100%;
-  min-height: 50vh;
-  border: none;
-  border-radius: 6px;
-  background: var(--surface);
-}
-.text-preview {
-  font-family: ui-monospace, monospace;
-  font-size: 13px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
+  max-width: 820px;
+  border-radius: 4px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.28);
+  background: #fff;
 }
 
 /* ---- file drawer ---- */
@@ -3099,6 +2606,23 @@ const CSS = `
   background: var(--accent);
   color: #fff;
 }
+.tree-main-badge {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font: 700 9px/1.4 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.tree-file--selected .tree-main-badge {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.22);
+  border-color: rgba(255, 255, 255, 0.4);
+}
 .tree-file[draggable="true"] { cursor: grab; }
 /* Drop-target highlight while a drag hovers a folder or the root. */
 .tree-drop-active {
@@ -3110,10 +2634,12 @@ const CSS = `
   min-height: 40px;
 }
 
-/* In-app context menu (right-click / long-press). Positioned within the
-   relative .latex-root; sits above the drawer + modal layers. */
+/* In-app context menu (right-click / long-press). position: fixed so its
+   left/top (set from the pointer's clientX/clientY — viewport coords) land
+   exactly under the finger regardless of which positioned ancestor (the
+   drawer, .body) it renders inside. Sits above the drawer + modal layers. */
 .ctx-menu {
-  position: absolute;
+  position: fixed;
   z-index: 60;
   min-width: 160px;
   padding: 4px;
@@ -3155,159 +2681,70 @@ const CSS = `
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-.drawer-foot {
-  padding: 10px 14px;
-  border-top: 1px solid var(--border);
-}
-
-/* ---- chat panel ---- */
+/* ---- chat panel (bottom sheet, bounded height) ----
+   The embedded shell chat runs inside an iframe (window.mobius.chat).
+   The classic flexbox overflow trap is what cut the conversation off:
+   the panel needs a BOUNDED height and the embed needs min-height:0
+   so the iframe (which has its own internal scroll + a sticky composer)
+   can shrink to fit and scroll internally instead of overflowing the
+   container and pushing its own composer off-screen. The panel is a
+   fixed-height bottom sheet (about 42vh) so the messages + composer are
+   always fully visible; flex-shrink keeps it from eating the editor. */
 .chat-panel {
-  flex: 1 1 0;
+  flex: 0 0 auto;
+  height: 42vh;
+  min-height: 220px;
+  max-height: 60vh;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--surface);
   border-top: 1px solid var(--border);
 }
-.chat-scroll {
-  flex: 1 1 auto;
-  overflow-y: auto;
-  padding: 12px 14px;
+.chat-head {
+  flex: 0 0 auto;
   display: flex;
-  flex-direction: column;
+  align-items: baseline;
   gap: 10px;
+  min-height: 38px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
 }
-.chat-note {
+.chat-head-title {
+  font: 700 12px/1 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   color: var(--muted);
-  font-size: 13px;
-  line-height: 1.55;
-  padding: 14px;
+}
+.chat-head-hint {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chat-embed {
+  flex: 1 1 auto;
+  min-height: 0;          /* the flexbox overflow fix — lets the iframe scroll internally */
+  overflow: hidden;
   background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
 }
-.chat-note b { color: var(--text); }
-.chat-note ul { margin: 8px 0 0 18px; padding: 0; }
-.chat-note li { margin-bottom: 4px; }
-.chat-note code {
-  background: var(--surface2, var(--surface));
-  padding: 0 4px;
-  border-radius: 3px;
-  font-family: ui-monospace, monospace;
-  font-size: 90%;
-}
-
-.chat-msg {
-  display: flex;
+.chat-embed iframe {
+  display: block;
   width: 100%;
-}
-.chat-msg--user { justify-content: flex-end; }
-.chat-msg--agent { justify-content: flex-start; }
-.chat-bubble {
-  max-width: 86%;
-  padding: 9px 13px;
-  border-radius: 14px;
-  font-size: 14px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  overflow-wrap: anywhere;
-}
-.chat-msg--user .chat-bubble {
-  background: var(--accent);
-  color: #fff;
-  border-bottom-right-radius: 4px;
-}
-.chat-msg--agent .chat-bubble {
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 4px;
-}
-.chat-bubble--typing {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 10px 14px;
-}
-.chat-bubble--typing .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-  animation: latex-pulse 1.2s infinite ease-in-out;
-}
-.chat-bubble--typing .dot:nth-child(2) { animation-delay: 0.15s; }
-.chat-bubble--typing .dot:nth-child(3) { animation-delay: 0.3s; }
-@keyframes latex-pulse {
-  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
-  30% { opacity: 1; transform: translateY(-2px); }
+  height: 100%;
+  border: 0;
 }
 .chat-error {
-  color: var(--accent);
-  font-size: 12px;
-  padding: 4px 6px;
-}
-
-.chat-composer {
   flex: 0 0 auto;
-  border-top: 1px solid var(--border);
-  background: var(--bg);
-  padding: 10px 12px;
-}
-/* Inline composer banner shown when the user is offline. Subtle
-   accent-tinted strip — loud enough to notice, quiet enough not to
-   dominate the chat. Matches the news app's offlineBanner so the
-   two surfaces feel like one family. */
-.chat-offline {
-  margin: 0 0 8px;
-  padding: 7px 10px;
+  margin: 8px 14px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--text);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border: 1px solid var(--border);
-  text-align: center;
-}
-.chat-input-row {
-  display: flex;
-  gap: 8px;
-  align-items: flex-end;
-}
-.chat-input {
-  flex: 1 1 auto;
-  resize: none;
-  padding: 9px 12px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--surface);
   color: var(--text);
-  font-family: var(--font);
-  font-size: 14px;
-  line-height: 1.4;
-  outline: none;
-  min-height: 40px;
-  max-height: 140px;
-}
-.chat-input:focus { border-color: var(--accent); }
-.chat-input:disabled { opacity: 0.6; }
-.chat-send {
-  flex: 0 0 auto;
-  padding: 10px 16px;
-  border-radius: 10px;
-  border: none;
-  background: var(--accent);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  min-width: 64px;
-  min-height: 44px;
-}
-.chat-send:disabled {
-  opacity: 0.5;
-  cursor: default;
+  font-size: 12px;
 }
 
 /* ---- modal ---- */
@@ -3431,30 +2868,9 @@ const CSS = `
   background: var(--accent);
 }
 
-/* ---- final layout overrides ---- */
-.chat-panel {
-  flex: initial;
-  min-height: 300px;
-  overflow: hidden;
-  background: var(--surface);
-  border-top: 0;
-  border-left: 1px solid var(--border);
-}
-.chat-embed {
-  flex: 1 1 auto;
-  min-height: 300px;
-  overflow: auto;
-  background: var(--bg);
-}
-.chat-error {
-  flex: 0 0 auto;
-  margin: 8px 12px 0;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--text);
-}
+/* The SyncPill component defaults to a floating bottom-right pill (its
+   absolute position is shared with other apps). Here it lives inline in
+   the header, so un-float it. */
 .top-actions .sync-pill {
   position: static;
   right: auto;
@@ -3464,49 +2880,17 @@ const CSS = `
   white-space: nowrap;
 }
 
-@media (max-width: 980px) {
-  .workspace {
-    grid-template-columns: 1fr;
-    overflow: auto;
-  }
-  .editor-pane,
-  .preview-pane,
-  .chat-panel {
-    min-height: 340px;
-    border-right: 0;
-    border-left: 0;
-    border-bottom: 1px solid var(--border);
-  }
-  .chat-panel,
-  .chat-embed {
-    min-height: 360px;
-  }
-  .file-nav-panel {
-    grid-template-columns: 1fr;
-    max-height: 42vh;
-  }
-  .nav-panel-actions {
-    flex-wrap: wrap;
-  }
-  .nav-panel-tree {
-    max-height: 24vh;
-  }
-}
-
-@media (max-width: 620px) {
+/* Narrow phones: let the top bar wrap its actions onto a second row so
+   the [Source | PDF] toggle + Build never crowd the filename. */
+@media (max-width: 560px) {
   .top-bar {
     grid-template-columns: auto minmax(0, 1fr);
   }
   .top-actions {
     grid-column: 1 / -1;
     width: 100%;
-    justify-content: stretch;
+    justify-content: flex-end;
   }
-  .toolbar-btn {
-    flex: 1 1 0;
-  }
-  .top-actions .sync-pill {
-    margin-left: auto;
-  }
+  .chat-panel { height: 46vh; }
 }
 `

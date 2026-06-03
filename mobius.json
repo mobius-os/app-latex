@@ -1,8 +1,8 @@
 {
   "id": "latex",
   "name": "LaTeX",
-  "version": "2.0.0",
-  "description": "Overleaf-style LaTeX editor: a VSCode-like file drawer, a real tectonic PDF build, and an embedded agent that writes your .tex for you.",
+  "version": "2.1.0",
+  "description": "Overleaf-style LaTeX editor: a VSCode-like side file drawer, a real in-app PDF viewer (pdf.js), a Source/PDF toggle, a settable main document, and an embedded agent that writes your .tex for you.",
   "author": "mobius-os",
   "license": "MIT",
   "homepage": "https://github.com/mobius-os/app-latex",
@@ -23,12 +23,10 @@
   "runtime": {
     "imports": [
       "react",
-      "react-dom"
+      "react-dom",
+      "pdfjs-dist"
     ],
-    "esm_deps": [
-      "katex",
-      "dompurify"
-    ]
+    "esm_deps": []
   },
   "schedule": {
     "job": "build.sh"
