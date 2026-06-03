@@ -1,0 +1,68 @@
+import assert from 'node:assert/strict'
+import { mkdir, rm } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import test from 'node:test'
+
+const execFileAsync = promisify(execFile)
+const root = dirname(fileURLToPath(import.meta.url))
+const buildDir = join(root, '.build')
+const bundled = join(buildDir, 'index.mjs')
+
+async function bundle() {
+  await rm(buildDir, { recursive: true, force: true })
+  await mkdir(buildDir, { recursive: true })
+  await execFileAsync('/home/hmzmrzx/projects/mobius/frontend/node_modules/.bin/esbuild', [
+    join(root, '..', 'index.jsx'),
+    '--bundle',
+    '--format=esm',
+    '--platform=node',
+    '--jsx=automatic',
+    '--external:pdfjs-dist',
+    `--outfile=${bundled}`,
+  ])
+  return import(pathToFileURL(bundled))
+}
+
+test('path guards accept only safe paths inside files/', async () => {
+  const { isSafeRelPath, isSafeStoragePath, normalizeFileCacheSnapshot } = await bundle()
+
+  assert.equal(isSafeRelPath('chapter1.tex'), true)
+  assert.equal(isSafeRelPath('notes/2026/draft.md'), true)
+  assert.equal(isSafeRelPath('folder/.keep'), true)
+
+  assert.equal(isSafeRelPath('../secret.tex'), false)
+  assert.equal(isSafeRelPath('notes/../secret.tex'), false)
+  assert.equal(isSafeRelPath('/absolute.tex'), false)
+  assert.equal(isSafeRelPath('notes//draft.tex'), false)
+  assert.equal(isSafeRelPath('notes\\draft.tex'), false)
+  assert.equal(isSafeRelPath('draft with spaces.tex'), false)
+
+  assert.equal(isSafeStoragePath('files/chapter1.tex'), true)
+  assert.equal(isSafeStoragePath('files/notes/2026/draft.md'), true)
+  assert.equal(isSafeStoragePath('build/status.json'), false)
+  assert.equal(isSafeStoragePath('files/../secret.tex'), false)
+  assert.equal(isSafeStoragePath('files/notes/../../secret.tex'), false)
+
+  const snapshot = normalizeFileCacheSnapshot({
+    index: [
+      'files/z.tex',
+      'files/a.tex',
+      'files/../secret.tex',
+      'build/status.json',
+      'files/a.tex',
+    ],
+    contents: {
+      'files/a.tex': 'a',
+      'files/z.tex': 'z',
+      'files/../secret.tex': 'secret',
+      'files/orphan.tex': 'orphan',
+    },
+    lastPath: 'files/../secret.tex',
+  })
+  assert.deepEqual(snapshot.index, ['files/a.tex', 'files/z.tex'])
+  assert.deepEqual(snapshot.contents, { 'files/a.tex': 'a', 'files/z.tex': 'z' })
+  assert.equal(snapshot.lastPath, null)
+})

@@ -9,10 +9,44 @@ import React, {
 // as markup — so DOMPurify is no longer needed and is dropped from the
 // bundle (and can come out of the manifest esm_deps).
 
-// Allowed characters for any storage path the UI writes — mirrors the
-// server's `_SAFE_RE` (`[\w.\-/]+`) so a create/upload/move never 4xx's on a
-// stray character. Used by the new-file, upload, and move/rename paths.
+// Allowed characters for any storage path the UI writes. NAME_RE mirrors the
+// server's `_SAFE_RE` (`[\w.\-/]+`); isSafeRelPath adds browser-side semantic
+// guards (`.` / `..`, empty segments, absolute paths) so user input can never
+// escape the app's files/ tree before it reaches storage.
 const NAME_RE = /^[\w.\-/]+$/
+
+export function isSafeRelPath(path) {
+  const value = typeof path === 'string' ? path.trim() : ''
+  if (!value || value.startsWith('/') || value.includes('\\')) return false
+  if (!NAME_RE.test(value)) return false
+  const parts = value.split('/')
+  return parts.every((part) => part && part !== '.' && part !== '..')
+}
+
+export function isSafeStoragePath(path) {
+  return typeof path === 'string'
+    && path.startsWith('files/')
+    && isSafeRelPath(path.slice('files/'.length))
+}
+
+function cleanIndexPaths(paths) {
+  return [...new Set((paths || []).filter(isSafeStoragePath))].sort()
+}
+
+export function normalizeFileCacheSnapshot(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null
+  const index = cleanIndexPaths(parsed.index)
+  const indexSet = new Set(index)
+  const contents = {}
+  const rawContents = (parsed.contents && typeof parsed.contents === 'object')
+    ? parsed.contents : {}
+  for (const [path, body] of Object.entries(rawContents)) {
+    if (indexSet.has(path) && typeof body === 'string') contents[path] = body
+  }
+  const lastPath = (typeof parsed.lastPath === 'string' && indexSet.has(parsed.lastPath))
+    ? parsed.lastPath : null
+  return { index, contents, lastPath }
+}
 
 // ----------------------------------------------------------------------
 // LaTeX editor mini-app for Möbius — an Overleaf-style editor.
@@ -83,6 +117,7 @@ function makeStorage(appId, token) {
     return r.text()
   }
   async function getBlob(path) {
+    if (ms && typeof ms.getBlob === 'function') return ms.getBlob(path)
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
@@ -100,6 +135,17 @@ function makeStorage(appId, token) {
       method: 'PUT',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' },
       body: text,
+    })
+    if (!r.ok) throw new Error(`set ${path} → ${r.status}`)
+    return { synced: true }
+  }
+  async function setBlob(path, blob, options = {}) {
+    if (ms && typeof ms.setBlob === 'function') return ms.setBlob(path, blob, options)
+    const contentType = options.contentType || (blob && blob.type) || 'application/octet-stream'
+    const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': contentType },
+      body: blob,
     })
     if (!r.ok) throw new Error(`set ${path} → ${r.status}`)
     return { synced: true }
@@ -129,7 +175,7 @@ function makeStorage(appId, token) {
     }
     return 0
   }
-  return { get, getBlob, setText, setJSON, remove, pendingCount, hasRuntime }
+  return { get, getBlob, setText, setBlob, setJSON, remove, pendingCount, hasRuntime }
 }
 
 // ----------------------------------------------------------------------
@@ -992,14 +1038,7 @@ function readFileCache(appId) {
     const raw = localStorage.getItem(fileCacheKey(appId))
     if (!raw) return null
     const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== 'object') return null
-    const index = Array.isArray(parsed.index)
-      ? parsed.index.filter((p) => typeof p === 'string')
-      : []
-    const contents = (parsed.contents && typeof parsed.contents === 'object')
-      ? parsed.contents : {}
-    const lastPath = typeof parsed.lastPath === 'string' ? parsed.lastPath : null
-    return { index, contents, lastPath }
+    return normalizeFileCacheSnapshot(parsed)
   } catch {
     return null
   }
@@ -1008,11 +1047,12 @@ function readFileCache(appId) {
 function writeFileCache(appId, index, contents, lastPath) {
   if (typeof localStorage === 'undefined') return
   try {
+    const safeIndex = cleanIndexPaths(index)
     // Trim contents to the index — orphaned bodies (deleted files)
     // get GC'd here; only string bodies are kept (binary previews
     // fetch from the server on demand).
     const trimmed = {}
-    const indexSet = new Set(index)
+    const indexSet = new Set(safeIndex)
     const entries = Object.entries(contents)
       .filter(([p, v]) => indexSet.has(p) && typeof v === 'string')
       .slice(-FILE_CONTENT_CACHE_LIMIT)
@@ -1020,7 +1060,7 @@ function writeFileCache(appId, index, contents, lastPath) {
     localStorage.setItem(
       fileCacheKey(appId),
       JSON.stringify({
-        index,
+        index: safeIndex,
         contents: trimmed,
         // lastPath persists across reloads so an offline reload
         // reopens the file the user was last editing rather than
@@ -1388,8 +1428,7 @@ export default function App({ appId, token }) {
       const idx = await storage.get('files-index.json')
       if (Array.isArray(idx)) {
         // De-dup + sort for stable rendering.
-        const cleaned = [...new Set(idx.filter((p) => typeof p === 'string' && p.startsWith('files/')))]
-        cleaned.sort()
+        const cleaned = cleanIndexPaths(idx)
         setFiles(cleaned)
         // The list now reflects the server — UI writes to the index are
         // safe (they'll extend/trim a known-good list, not clobber it).
@@ -1522,7 +1561,7 @@ export default function App({ appId, token }) {
   // Set a .tex as the main document (from the drawer context menu).
   // Persists immediately so Build + reload agree on the target.
   const handleSetMain = useCallback(async (path) => {
-    if (!path || !path.endsWith('.tex')) return
+    if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return
     setMainPath(path)
     try {
       await storage.setJSON('main.json', { path })
@@ -1679,10 +1718,7 @@ export default function App({ appId, token }) {
     )
     if (!name) return
     const clean = name.replace(/^\/+/, '').trim()
-    if (!clean) return
-    // Reject characters the storage backend rejects (matches its
-    // _SAFE_RE on the server: [\w.\-/]+ — strict but reasonable).
-    if (!/^[\w.\-/]+$/.test(clean)) {
+    if (!isSafeRelPath(clean)) {
       await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
       return
     }
@@ -1724,8 +1760,7 @@ export default function App({ appId, token }) {
     )
     if (!name) return
     const clean = name.replace(/^\/+/, '').replace(/\/+$/, '').trim()
-    if (!clean) return
-    if (!/^[\w.\-/]+$/.test(clean)) {
+    if (!isSafeRelPath(clean)) {
       await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
       return
     }
@@ -1743,6 +1778,10 @@ export default function App({ appId, token }) {
 
   const handleDeleteFile = useCallback(async (path) => {
     if (!(await ensureIndexWritable())) return
+    if (!isSafeStoragePath(path)) {
+      await modal.alert('That file path is not valid.', { title: 'Invalid path' })
+      return
+    }
     const ok = await modal.confirm(
       `Delete “${path}”? This cannot be undone.`,
       { title: 'Delete file', danger: true },
@@ -1795,7 +1834,7 @@ export default function App({ appId, token }) {
       const rel = ((asFolder && f.webkitRelativePath) || f.name || '')
         .replace(/^\/+/, '')
         .trim()
-      if (!rel || !NAME_RE.test(rel)) {
+      if (!isSafeRelPath(rel)) {
         failed.push(f.name || rel || '(unnamed)')
         continue
       }
@@ -1813,12 +1852,7 @@ export default function App({ appId, token }) {
           // Non-text: PUT the raw blob. We deliberately don't cache the body
           // (binary previews fetch on demand) — same policy as the existing
           // image/pdf path.
-          const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
-            method: 'PUT',
-            headers: { Authorization: `Bearer ${token}` },
-            body: f,
-          })
-          if (!r.ok) throw new Error(`PUT ${path} → ${r.status}`)
+          await storage.setBlob(path, f, { contentType: f.type || 'application/octet-stream' })
         }
         added.push(path)
       } catch (e) {
@@ -1842,7 +1876,7 @@ export default function App({ appId, token }) {
         { title: 'Some uploads failed' },
       )
     }
-  }, [appId, token, storage, modal, refreshPending, ensureIndexWritable])
+  }, [storage, modal, refreshPending, ensureIndexWritable])
 
   // ---- Move / rename (drag-to-move + context-menu rename) ----------------
   // Both go through POST /storage/apps/{id}/move {from, to}. The index is a
@@ -1852,7 +1886,7 @@ export default function App({ appId, token }) {
   const movePath = useCallback(async (from, to) => {
     if (from === to) return
     if (!(await ensureIndexWritable())) return
-    if (!NAME_RE.test(to.replace(/^files\//, ''))) {
+    if (!isSafeStoragePath(from) || !isSafeStoragePath(to)) {
       await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
       return
     }
@@ -1942,6 +1976,10 @@ export default function App({ appId, token }) {
   // ---- Folder delete (recursive) -----------------------------------------
   const handleDeleteFolder = useCallback(async (folderPath) => {
     if (!(await ensureIndexWritable())) return
+    if (!isSafeStoragePath(folderPath)) {
+      await modal.alert('That folder path is not valid.', { title: 'Invalid path' })
+      return
+    }
     const ok = await modal.confirm(
       `Delete the folder “${folderPath}” and everything inside it? This cannot be undone.`,
       { title: 'Delete folder', danger: true },
@@ -2016,7 +2054,7 @@ export default function App({ appId, token }) {
   const onBuildDone = useCallback(async (doc, pdfPath) => {
     // Show the freshly-built PDF if it's the main doc we just compiled.
     if (doc === mainPathRef.current) setViewMode('pdf')
-    if (!pdfPath || !indexLoaded) return
+    if (!pdfPath || !indexLoaded || !isSafeStoragePath(pdfPath)) return
     // The build can finish up to 120s after it started, so `files` captured
     // in this callback's closure may be stale (a chat turn or upload added an
     // entry meanwhile). Read the freshest list from the ref, merge the new
@@ -2827,7 +2865,7 @@ const CSS = `
    state. Hidden in the steady state (online + 0 pending) so it
    doesn't clutter the preview pane with a persistent "Saved" sticker;
    only appears when there's something to say. Same shape as the
-   countries + gym apps so the platform feels coherent. */
+   atlas + gym apps so the platform feels coherent. */
 .sync-pill {
   position: absolute;
   right: 12px;
