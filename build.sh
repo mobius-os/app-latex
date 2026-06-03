@@ -9,13 +9,18 @@ STORAGE_DIR="/data/apps/${APP_ID}"
 mkdir -p "$STORAGE_DIR/build" "$STORAGE_DIR/tectonic-cache"
 TARGET="$(cat "$STORAGE_DIR/build/target.txt" 2>/dev/null || echo "")"
 write_status() {  # $1=status $2=pdf(or empty) $3=log
-  python3 - "$1" "$2" "$3" "$STORAGE_DIR/build/status.json" <<'PY'
+  # Echo the target this verdict was built FROM ($TARGET, set below). target.txt
+  # + status.json are a single shared pair per app, so the app-side poller uses
+  # this to ignore a verdict produced by a concurrent build of a DIFFERENT doc
+  # (another tab/device) instead of mapping its PDF onto the wrong source.
+  python3 - "$1" "$2" "$3" "$TARGET" "$STORAGE_DIR/build/status.json" <<'PY'
 import json, sys, datetime
-status, pdf, log, out = sys.argv[1:5]
+status, pdf, log, target, out = sys.argv[1:6]
 json.dump({
   "status": status,
   "pdf": pdf or None,
   "log": log,
+  "target": target or None,
   "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }, open(out, "w"))
 PY

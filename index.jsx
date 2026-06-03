@@ -557,9 +557,12 @@ function ImagePreview({ storage, path }) {
 
 // PDF preview — same auth dance as images. iframe with the blob URL
 // gives us the browser's native PDF viewer.
-function PdfPreview({ storage, path }) {
+function PdfPreview({ storage, path, version }) {
   const [url, setUrl] = useState(null)
   const [err, setErr] = useState(null)
+  // `version` (the build token) is in the deps so a rebuild that produces the
+  // SAME deterministic path still refetches the fresh bytes; without it the
+  // effect wouldn't re-run and the iframe would keep showing the prior compile.
   useEffect(() => {
     let live = true
     let revoke = null
@@ -579,7 +582,7 @@ function PdfPreview({ storage, path }) {
       live = false
       if (revoke) URL.revokeObjectURL(revoke)
     }
-  }, [storage, path])
+  }, [storage, path, version])
   if (err) return <div className="preview-note">{err}</div>
   if (!url) return <div className="preview-note">Loading PDF…</div>
   return <iframe className="pdf-preview" src={url} title={path} />
@@ -905,18 +908,23 @@ function FileNavPanel({
         >
           Upload folder
         </button>
-        {/* Hidden file/folder pickers; reset value after each pick so the same
-            file can be re-uploaded (a change event won't fire for an
-            unchanged value). */}
+        {/* Hidden file/folder pickers. Materialise the FileList into a real
+            array SYNCHRONOUSLY before resetting input.value: onUpload is async
+            (it awaits before reading the list), and `e.target.value = ''`
+            empties the live FileList the input still owns — so capturing the
+            reference and resetting first would hand the uploader an
+            already-emptied list and silently upload nothing. The reset still
+            runs (so re-picking the same file fires a change event); it just
+            runs after we've copied the entries out. */}
         <input
           ref={fileInputRef}
           type="file"
           multiple
           style={{ display: 'none' }}
           onChange={(e) => {
-            const fl = e.target.files
-            onUpload(fl, { asFolder: false })
+            const fl = Array.from(e.target.files || [])
             e.target.value = ''
+            onUpload(fl, { asFolder: false })
           }}
         />
         <input
@@ -927,9 +935,9 @@ function FileNavPanel({
           directory=""
           style={{ display: 'none' }}
           onChange={(e) => {
-            const fl = e.target.files
-            onUpload(fl, { asFolder: true })
+            const fl = Array.from(e.target.files || [])
             e.target.value = ''
+            onUpload(fl, { asFolder: true })
           }}
         />
       </div>
@@ -1040,6 +1048,13 @@ function ChatPanel({
   // with a placeholder.
   const [chatId, setChatId] = useState(null)
   const [error, setError] = useState(null)
+  // Keep the latest onFilesMaybeChanged in a ref so the mount effect below
+  // does NOT depend on it. That callback's identity changes on every file
+  // selection (it closes over selectedPath); if it were a mount-effect dep,
+  // selecting a file would tear down + remount the chat iframe — destroying a
+  // streaming turn mid-flight. The turn-done handler reads the ref instead.
+  const onFilesRef = useRef(onFilesMaybeChanged)
+  useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
 
   // Resolve a real chat id before mounting the embed: read chat_id.json, and
   // if absent create one ourselves and persist it. A create failure surfaces
@@ -1111,7 +1126,7 @@ function ChatPanel({
             storage.setJSON('chat_id.json', { id: next }).catch(() => {})
           }
         })
-        .on('turn-done', () => { onFilesMaybeChanged() })
+        .on('turn-done', () => { if (onFilesRef.current) onFilesRef.current() })
         .on('error', ({ error: chatError }) => {
           setError(chatError || 'Embedded chat reported an error.')
         })
@@ -1123,7 +1138,7 @@ function ChatPanel({
       disposed = true
       if (handle) handle.destroy()
     }
-  }, [appId, chatId, storage, onFilesMaybeChanged])
+  }, [appId, chatId, storage])
 
   return (
     <section className="chat-panel">
@@ -1425,9 +1440,18 @@ function useBuild({ appId, token, storage, online }) {
   const [buildDoc, setBuildDoc] = useState(null)
   // Map of source .tex path → its built .pdf path, so the viewer can show a
   // PDF tab only for documents that have actually been compiled this session.
+  // doc path → { pdf, ver }. `ver` is a monotonic per-build token (see
+  // finishDone) so the viewer refetches even when the compiled path is
+  // unchanged across rebuilds.
   const [pdfByDoc, setPdfByDoc] = useState({})
   const pollRef = useRef(null)
   const deadlineRef = useRef(0)
+  // Monotonic build counter — sources the `ver` token in pdfByDoc.
+  const buildSeqRef = useRef(0)
+  // Synchronous in-flight guard. buildStatus lags a render, so it can't gate
+  // a rapid double-click on the dirty-file path (build() is deferred behind an
+  // async save); this ref flips before any await and is the real guard.
+  const buildingRef = useRef(false)
 
   const clearPoll = useCallback(() => {
     if (pollRef.current) {
@@ -1441,15 +1465,23 @@ function useBuild({ appId, token, storage, online }) {
 
   const finishDone = useCallback((doc, pdf) => {
     clearPoll()
+    buildingRef.current = false
     setBuildStatus('done')
     setBuildLog('')
     if (doc && pdf) {
-      setPdfByDoc((prev) => (prev[doc] === pdf ? prev : { ...prev, [doc]: pdf }))
+      // Stamp a fresh token on every successful build. The compiled path is
+      // deterministic per doc (files/x.tex always → files/x.pdf), so a rebuild
+      // yields the identical string; storing the path alone made finishDone a
+      // no-op (prev[doc] === pdf) and the viewer kept the FIRST build's blob.
+      // The token gives each build a new value identity so PdfPreview refetches.
+      const ver = (buildSeqRef.current += 1)
+      setPdfByDoc((prev) => ({ ...prev, [doc]: { pdf, ver } }))
     }
   }, [clearPoll])
 
   const finishError = useCallback((log) => {
     clearPoll()
+    buildingRef.current = false
     setBuildStatus('error')
     setBuildLog(log || 'Build failed.')
   }, [clearPoll])
@@ -1471,6 +1503,16 @@ function useBuild({ appId, token, storage, online }) {
       status = null
     }
     if (status && typeof status === 'object' && status.status) {
+      // The verdict echoes the target it was built FROM. build/target.txt +
+      // build/status.json are one shared pair per app, so a build kicked from
+      // another tab/device for a DIFFERENT doc can land its verdict here.
+      // If it isn't the doc we're waiting on, ignore it and keep polling for
+      // ours — otherwise we'd map a sibling's PDF onto this doc. (Verdicts
+      // predating the `target` field have none and are accepted as before.)
+      if (status.target && status.target !== doc) {
+        pollRef.current = setTimeout(() => poll(doc, onDone), BUILD_POLL_MS)
+        return
+      }
       if (status.status === 'done') {
         finishDone(doc, status.pdf)
         if (typeof onDone === 'function' && status.pdf) onDone(doc, status.pdf)
@@ -1486,12 +1528,17 @@ function useBuild({ appId, token, storage, online }) {
   // Kick a build for `doc` (a "files/<name>.tex" path). onDone fires once the
   // PDF is ready. Guards against concurrent builds + offline.
   const build = useCallback(async (doc, onDone) => {
-    if (buildStatus === 'building') return
+    // Re-entry guard (synchronous, before any await) — see buildingRef. Two
+    // near-simultaneous build() calls (rapid double-click on a dirty .tex, whose
+    // build is deferred behind an async save while buildStatus is still 'idle')
+    // would otherwise both write target.txt and both POST run-job.
+    if (buildingRef.current) return
     if (!doc || !doc.endsWith('.tex')) return
     if (!online) {
       finishError('You are offline. Building needs a connection — reconnect and try again.')
       return
     }
+    buildingRef.current = true
     clearPoll()
     setBuildDoc(doc)
     setBuildStatus('building')
@@ -1525,7 +1572,7 @@ function useBuild({ appId, token, storage, online }) {
     } catch (e) {
       finishError((e && e.message) ? e.message : 'Build failed to start.')
     }
-  }, [appId, token, storage, online, buildStatus, clearPoll, finishError, poll])
+  }, [appId, token, storage, online, clearPoll, finishError, poll])
 
   return {
     buildStatus, buildLog, buildDoc, pdfByDoc, build,
@@ -1537,6 +1584,33 @@ function useBuild({ appId, token, storage, online }) {
         const next = { ...prev }
         delete next[doc]
         return next
+      })
+    }, []),
+    // Re-key the map across a move/rename. A folder rename re-parents every
+    // child AND the move route relocates the compiled .pdf files with them, so
+    // both the doc KEY and the stored .pdf path run through the same prefix
+    // rewrite — otherwise the viewer loses the just-built PDF for files inside
+    // the renamed folder (the old key no longer matches the selection).
+    rewriteDocs: useCallback((rewrite) => {
+      setPdfByDoc((prev) => {
+        const next = {}
+        for (const [doc, entry] of Object.entries(prev)) {
+          next[rewrite(doc)] = { ...entry, pdf: rewrite(entry.pdf) }
+        }
+        return next
+      })
+    }, []),
+    // Drop every mapping under a deleted folder (entries are keyed by their
+    // source .tex, which lives inside the folder).
+    forgetUnder: useCallback((prefix) => {
+      setPdfByDoc((prev) => {
+        let changed = false
+        const next = {}
+        for (const [doc, entry] of Object.entries(prev)) {
+          if (doc === prefix || doc.startsWith(`${prefix}/`)) { changed = true; continue }
+          next[doc] = entry
+        }
+        return changed ? next : prev
       })
     }, []),
   }
@@ -1858,13 +1932,17 @@ export default function App({ appId, token }) {
       return
     }
     const path = `files/${clean}`
-    if (files.includes(path)) {
+    // Derive the new index from the freshest list (filesRef), not the
+    // render-time `files` closure: a chat turn or build can have committed an
+    // entry since this callback was created, and a whole-array PUT from the
+    // stale closure would silently drop it. Same pattern in every index writer.
+    if (filesRef.current.includes(path)) {
       await modal.alert(`“${path}” already exists.`, { title: 'Name taken' })
       return
     }
     try {
       await storage.setText(path, '')
-      const next = [...files, path].sort()
+      const next = [...filesRef.current, path].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       // Seed the cache with the empty body so a subsequent offline
@@ -1877,7 +1955,7 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [files, storage, modal, closeNav, refreshPending, ensureIndexWritable])
+  }, [storage, modal, closeNav, refreshPending, ensureIndexWritable])
 
   const handleCreateFolder = useCallback(async () => {
     if (!(await ensureIndexWritable())) return
@@ -1899,14 +1977,14 @@ export default function App({ appId, token }) {
     const path = `files/${clean}/.keep`
     try {
       await storage.setText(path, '')
-      const next = [...files, path].sort()
+      const next = [...filesRef.current, path].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create folder' })
     }
-  }, [files, storage, modal, refreshPending, ensureIndexWritable])
+  }, [storage, modal, refreshPending, ensureIndexWritable])
 
   const handleDeleteFile = useCallback(async (path) => {
     if (!(await ensureIndexWritable())) return
@@ -1917,7 +1995,7 @@ export default function App({ appId, token }) {
     if (!ok) return
     try {
       await storage.remove(path)
-      const next = files.filter((p) => p !== path)
+      const next = filesRef.current.filter((p) => p !== path)
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       // Drop the cached body so a future offline reload doesn't
@@ -1940,7 +2018,7 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete' })
     }
-  }, [files, selectedPath, storage, modal, refreshPending, ensureIndexWritable, build])
+  }, [selectedPath, storage, modal, refreshPending, ensureIndexWritable, build])
 
   // ---- Upload (files + whole folders) ------------------------------------
   // The browser hands us a FileList; each entry has either a plain `name`
@@ -1993,7 +2071,7 @@ export default function App({ appId, token }) {
       }
     }
     if (added.length) {
-      const next = [...new Set([...files, ...added])].sort()
+      const next = [...new Set([...filesRef.current, ...added])].sort()
       try {
         await storage.setJSON('files-index.json', next)
         setFiles(next)
@@ -2009,7 +2087,7 @@ export default function App({ appId, token }) {
         { title: 'Some uploads failed' },
       )
     }
-  }, [appId, token, files, storage, modal, refreshPending, ensureIndexWritable])
+  }, [appId, token, storage, modal, refreshPending, ensureIndexWritable])
 
   // ---- Move / rename (drag-to-move + context-menu rename) ----------------
   // Both go through POST /storage/apps/{id}/move {from, to}. The index is a
@@ -2051,7 +2129,7 @@ export default function App({ appId, token }) {
         if (p.startsWith(`${from}/`)) return to + p.slice(from.length)
         return p
       }
-      const next = [...new Set(files.map(rewrite))].sort()
+      const next = [...new Set(filesRef.current.map(rewrite))].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       // Carry the cached body + selection + pdf mapping across the rename.
@@ -2061,12 +2139,16 @@ export default function App({ appId, token }) {
         return out
       })
       setSelectedPath((cur) => (cur ? rewrite(cur) : cur))
-      build.forgetDoc(from)
+      // Re-key the built-PDF map through the SAME rewrite so a folder rename
+      // keeps the compiled PDFs for files inside it (the move route relocated
+      // them with the folder). forgetDoc(from) only dropped an exact-key match,
+      // so a folder rename (keys are children, not `from`) silently lost them.
+      build.rewriteDocs(rewrite)
       refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Move failed' })
     }
-  }, [appId, token, files, storage, modal, refreshPending, ensureIndexWritable, build])
+  }, [appId, token, storage, modal, refreshPending, ensureIndexWritable, build])
 
   // Rename = move to a sibling path with a new leaf. We prompt for the new
   // leaf name and keep the same parent dir.
@@ -2081,6 +2163,14 @@ export default function App({ appId, token }) {
     if (!nextLeaf) return
     const clean = nextLeaf.replace(/^\/+/, '').replace(/\/+$/, '').trim()
     if (!clean || clean === leaf) return
+    // Rename is an in-place LEAF change, not a move. An embedded slash would
+    // re-parent the item (or a whole folder subtree) into a different
+    // directory — surprising from a "New name" prompt. Re-parenting is the
+    // job of explicit drag-to-move; reject slashes here.
+    if (clean.includes('/')) {
+      await modal.alert('A name can’t contain “/”. Drag the item to move it.', { title: 'Invalid name' })
+      return
+    }
     const to = parent ? `${parent}/${clean}` : clean
     await movePath(path, to)
   }, [modal, movePath])
@@ -2108,7 +2198,7 @@ export default function App({ appId, token }) {
       }
       // Drop every index entry under the folder, plus the cache + selection.
       const under = (p) => p === folderPath || p.startsWith(`${folderPath}/`)
-      const next = files.filter((p) => !under(p))
+      const next = filesRef.current.filter((p) => !under(p))
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       setFileCache((prev) => {
@@ -2120,17 +2210,21 @@ export default function App({ appId, token }) {
         if (cur && under(cur)) return next.find((p) => !p.endsWith('/.keep')) || null
         return cur
       })
+      // Drop the built-PDF mappings for the .tex files inside the deleted
+      // folder (forgetDoc only matched a single exact key).
+      build.forgetUnder(folderPath)
       refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Delete failed' })
     }
-  }, [appId, token, files, storage, modal, refreshPending, ensureIndexWritable])
+  }, [appId, token, storage, modal, refreshPending, ensureIndexWritable, build])
 
   const selectedExt = selectedPath ? selectedPath.split('.').pop().toLowerCase() : ''
   const selectedIsBinary = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(selectedExt)
   const canEditSelected = !!selectedPath && !selectedIsBinary && !fileLoading && !fileError
   const selectedIsTex = selectedExt === 'tex'
-  // The PDF compiled from the selected .tex this session, if any. The viewer's
+  // The PDF compiled from the selected .tex this session, if any: a
+  // { pdf, ver } record (ver is the build token, see useBuild). The viewer's
   // PDF tab is gated on this so a doc with no build can't show a blank iframe.
   const pdfForSelected = (selectedPath && build.pdfByDoc[selectedPath]) || null
 
@@ -2283,7 +2377,13 @@ export default function App({ appId, token }) {
         )
       }
       if (pdfForSelected) {
-        return <PdfPreview storage={storage} path={pdfForSelected} />
+        return (
+          <PdfPreview
+            storage={storage}
+            path={pdfForSelected.pdf}
+            version={pdfForSelected.ver}
+          />
+        )
       }
       // viewMode flipped to pdf but no build yet — fall through to source.
     }
