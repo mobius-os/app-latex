@@ -193,6 +193,14 @@ function renderMath(katex, target, source, displayMode) {
 function tokenizeTex(src) {
   const out = []
   let i = 0
+  // Math starts at `$`/`$$` OR the LaTeX delimiters `\[` (display) / `\(`
+  // (inline). Modern LaTeX prefers \[...\] and \(...\) over $$...$$, so the
+  // preview honors all of them — otherwise a canonical document (like the
+  // welcome file) would show its display equations as raw source. A lone
+  // backslash (\textbf, \frac, …) is NOT a math start.
+  const mathStart = (k) =>
+    src[k] === '$'
+    || (src[k] === '\\' && (src[k + 1] === '[' || src[k + 1] === '('))
   while (i < src.length) {
     if (src[i] === '$' && src[i + 1] === '$') {
       const end = src.indexOf('$$', i + 2)
@@ -201,6 +209,22 @@ function tokenizeTex(src) {
         break
       }
       out.push({ kind: 'displayMath', value: src.slice(i + 2, end) })
+      i = end + 2
+    } else if (src[i] === '\\' && src[i + 1] === '[') {
+      const end = src.indexOf('\\]', i + 2)
+      if (end === -1) {
+        out.push({ kind: 'text', value: src.slice(i) })
+        break
+      }
+      out.push({ kind: 'displayMath', value: src.slice(i + 2, end) })
+      i = end + 2
+    } else if (src[i] === '\\' && src[i + 1] === '(') {
+      const end = src.indexOf('\\)', i + 2)
+      if (end === -1) {
+        out.push({ kind: 'text', value: src.slice(i) })
+        break
+      }
+      out.push({ kind: 'inlineMath', value: src.slice(i + 2, end) })
       i = end + 2
     } else if (src[i] === '$') {
       const end = src.indexOf('$', i + 1)
@@ -213,7 +237,7 @@ function tokenizeTex(src) {
     } else {
       // Accumulate plain text until the next math marker.
       let j = i
-      while (j < src.length && src[j] !== '$') j++
+      while (j < src.length && !mathStart(j)) j++
       out.push({ kind: 'text', value: src.slice(i, j) })
       i = j
     }
@@ -224,18 +248,17 @@ function tokenizeTex(src) {
 // Per-line markup pass. Runs on text segments only — math is rendered
 // separately so this never sees backslashes inside math mode.
 function renderTexInline(text) {
-  // \textbf{...} → <b>, \emph{...} → <i>. Done as regex passes; nested
-  // commands aren't handled (rare in practice and out of scope).
-  let html = escapeHtml(text)
+  // \"o → ö etc. FIRST, on the raw text — escapeHtml turns the " in \"o into
+  // &quot;, which would stop the \" pattern from ever matching (so M\"obius
+  // would render the escape literally). A small common set; not exhaustive.
+  const umlaut = { a: 'ä', e: 'ë', i: 'ï', o: 'ö', u: 'ü', A: 'Ä', E: 'Ë', I: 'Ï', O: 'Ö', U: 'Ü' }
+  let s = text.replace(/\\"([aeiouAEIOU])/g, (_, ch) => umlaut[ch] || ch)
+  // Then escape, then re-allow a fixed markup whitelist. escapeHtml leaves
+  // \, {, } and the accented chars untouched, so \textbf{…}/\emph{…} match.
+  let html = escapeHtml(s)
   html = html.replace(/\\textbf\{([^}]*)\}/g, '<b>$1</b>')
   html = html.replace(/\\emph\{([^}]*)\}/g, '<i>$1</i>')
   html = html.replace(/\\textit\{([^}]*)\}/g, '<i>$1</i>')
-  // \"o → ö etc. — a small set of common LaTeX umlauts so the welcome
-  // file's "M\"obius" renders correctly. Not exhaustive.
-  html = html.replace(/\\"([aeiouAEIOU])/g, (_, ch) => {
-    const map = { a: 'ä', e: 'ë', i: 'ï', o: 'ö', u: 'ü', A: 'Ä', E: 'Ë', I: 'Ï', O: 'Ö', U: 'Ü' }
-    return map[ch] || ch
-  })
   return html
 }
 
@@ -424,10 +447,14 @@ function TexTextBlock({ katex, segments }) {
   return (
     <>
       {out.map((b) => {
-        if (b.kind === 'h1') return <h1 className="tex-h1" key={b.key}>{b.text}</h1>
-        if (b.kind === 'h2') return <h2 className="tex-h2" key={b.key}>{b.text}</h2>
-        if (b.kind === 'h3') return <h3 className="tex-h3" key={b.key}>{b.text}</h3>
-        if (b.kind === 'h4') return <h4 className="tex-h4" key={b.key}>{b.text}</h4>
+        // Heading text is LaTeX too (\"o umlauts, \textbf, …). Run it through
+        // the same inline pass paragraphs use, sanitized, so a title like
+        // \title{... M\"obius} renders "Möbius" rather than the raw escape.
+        const hHtml = (t) => ({ __html: safeHtml(renderTexInline(t)) })
+        if (b.kind === 'h1') return <h1 className="tex-h1" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
+        if (b.kind === 'h2') return <h2 className="tex-h2" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
+        if (b.kind === 'h3') return <h3 className="tex-h3" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
+        if (b.kind === 'h4') return <h4 className="tex-h4" key={b.key} dangerouslySetInnerHTML={hHtml(b.text)} />
         return <TexParagraph katex={katex} segments={b.segments} key={b.key} />
       })}
     </>
