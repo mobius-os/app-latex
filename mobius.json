@@ -1,8 +1,8 @@
 {
   "id": "latex",
   "name": "LaTeX",
-  "version": "1.2.0",
-  "description": "Math-first LaTeX editor. Describe what you want in prose; an AI sub-agent writes and edits the .tex files for you while you preview the math live.",
+  "version": "2.0.0",
+  "description": "Overleaf-style LaTeX editor: a VSCode-like file drawer, a real tectonic PDF build, and an embedded agent that writes your .tex for you.",
   "author": "mobius-os",
   "license": "MIT",
   "homepage": "https://github.com/mobius-os/app-latex",
@@ -29,5 +29,9 @@
       "katex",
       "dompurify"
     ]
+  },
+  "schedule": {
+    "job": "build.sh",
+    "default": "0 0 1 1 *"
   }
 }

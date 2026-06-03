@@ -29,6 +29,11 @@ function safeHtml(raw) {
   return DOMPurify.sanitize(raw, SANITIZE_CONFIG)
 }
 
+// Allowed characters for any storage path the UI writes — mirrors the
+// server's `_SAFE_RE` (`[\w.\-/]+`) so a create/upload/move never 4xx's on a
+// stray character. Used by the new-file, upload, and move/rename paths.
+const NAME_RE = /^[\w.\-/]+$/
+
 // ----------------------------------------------------------------------
 // LaTeX editor mini-app for Möbius.
 //
@@ -631,8 +636,101 @@ function isFilePath(path, index) {
   return index.includes(path)
 }
 
-function FileNode({ node, selectedPath, onSelect, depth }) {
+// In-app context menu. Native context menus / window.prompt are unavailable
+// in the mini-app sandbox (no allow-modals), and a native right-click menu
+// would also offer "back/reload/inspect" that make no sense here. So we render
+// our own absolutely-positioned menu at the cursor. It closes on any outside
+// pointer-down, on Escape, and on scroll (a stale menu floating over moved
+// content is worse than no menu). Positioned within `.latex-root` (which is
+// `position: relative`), so coordinates are page-relative and clamped to the
+// viewport so the menu can't open off-screen near an edge.
+function ContextMenu({ x, y, items, onClose }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    const onDown = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) onClose()
+    }
+    const onKey = (e) => { if (e.key === 'Escape') onClose() }
+    // capture: true so we see the press before it lands on a tree row.
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('scroll', onClose, true)
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('scroll', onClose, true)
+    }
+  }, [onClose])
+  // Clamp so the menu stays on screen (rough width/height estimate; the menu
+  // is small and fixed-content, so a static clamp is enough).
+  const left = Math.min(x, (typeof window !== 'undefined' ? window.innerWidth : 9999) - 180)
+  const top = Math.min(y, (typeof window !== 'undefined' ? window.innerHeight : 9999) - (items.length * 44 + 8))
+  return (
+    <div
+      ref={ref}
+      className="ctx-menu"
+      style={{ left: `${Math.max(4, left)}px`, top: `${Math.max(4, top)}px` }}
+      role="menu"
+    >
+      {items.map((it) => (
+        <button
+          key={it.label}
+          type="button"
+          role="menuitem"
+          className={`ctx-item ${it.danger ? 'ctx-item--danger' : ''}`}
+          onClick={() => { onClose(); it.onSelect() }}
+        >
+          {it.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// A long-press hook for touch: fires `onLongPress(clientX, clientY)` after
+// LONG_PRESS_MS of a stationary touch, cancelling if the finger moves past a
+// small slop or lifts early. This gives mobile users the same affordance
+// right-click gives desktop. Structural timer (legitimate per the task).
+const LONG_PRESS_MS = 500
+const LONG_PRESS_SLOP = 10
+function useLongPress(onLongPress) {
+  const timerRef = useRef(null)
+  const startRef = useRef(null)
+  const clear = useCallback(() => {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
+    startRef.current = null
+  }, [])
+  useEffect(() => clear, [clear])
+  const onTouchStart = useCallback((e) => {
+    const t = e.touches && e.touches[0]
+    if (!t) return
+    startRef.current = { x: t.clientX, y: t.clientY }
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null
+      if (startRef.current) onLongPress(startRef.current.x, startRef.current.y)
+    }, LONG_PRESS_MS)
+  }, [onLongPress])
+  const onTouchMove = useCallback((e) => {
+    const t = e.touches && e.touches[0]
+    if (!t || !startRef.current) return
+    if (Math.abs(t.clientX - startRef.current.x) > LONG_PRESS_SLOP
+      || Math.abs(t.clientY - startRef.current.y) > LONG_PRESS_SLOP) {
+      clear()
+    }
+  }, [clear])
+  return { onTouchStart, onTouchMove, onTouchEnd: clear, onTouchCancel: clear }
+}
+
+function FileNode({
+  node, selectedPath, onSelect, depth,
+  onContextMenu, onMoveInto,
+}) {
   const [expanded, setExpanded] = useState(true)
+  const [dropActive, setDropActive] = useState(false)
+  const isFolder = !(node.children.size === 0 && node.isFile)
+  const longPress = useLongPress((cx, cy) => {
+    onContextMenu({ x: cx, y: cy, path: node.path, isFolder })
+  })
   if (node.children.size === 0 && node.isFile) {
     const selected = node.path === selectedPath
     return (
@@ -641,6 +739,18 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
         className={`tree-file ${selected ? 'tree-file--selected' : ''}`}
         style={{ paddingLeft: `${10 + depth * 16}px` }}
         onClick={() => onSelect(node.path)}
+        // Draggable so a file can be dropped onto a folder (or the root) to
+        // move it. dataTransfer carries the source path.
+        draggable
+        onDragStart={(e) => {
+          e.dataTransfer.setData('text/mobius-path', node.path)
+          e.dataTransfer.effectAllowed = 'move'
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          onContextMenu({ x: e.clientX, y: e.clientY, path: node.path, isFolder: false })
+        }}
+        {...longPress}
       >
         <span className="tree-icon">{fileIcon(node.name)}</span>
         <span className="tree-name">{node.name}</span>
@@ -664,10 +774,33 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
       if (af !== bf) return af ? -1 : 1
       return a.name.localeCompare(b.name)
     })
-  // Root folder (depth -1) renders just its children, no row of its own.
+  // Move the dragged file INTO this folder (or the root): keep its leaf name,
+  // re-parent it under `destDir`. destDir is "" for the root, else the
+  // folder's own path ("files/sub").
+  const dropMove = (e, destDir) => {
+    e.preventDefault()
+    setDropActive(false)
+    const from = e.dataTransfer.getData('text/mobius-path')
+    if (!from) return
+    const leaf = from.split('/').pop()
+    // Root drops land back under files/ (the storage tree root for this app);
+    // folder drops land under the folder. Either way the new path is
+    // <dest>/<leaf>.
+    const base = destDir || 'files'
+    onMoveInto(from, `${base}/${leaf}`)
+  }
+
+  // Root folder (depth -1) renders just its children, no row of its own — but
+  // the whole tree container is itself a drop target so a file can be moved
+  // back out to the top level. The drop handler lives on the wrapper.
   if (depth < 0) {
     return (
-      <>
+      <div
+        className={`tree-root ${dropActive ? 'tree-drop-active' : ''}`}
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropActive(true) }}
+        onDragLeave={() => setDropActive(false)}
+        onDrop={(e) => dropMove(e, '')}
+      >
         {sortedChildren.map((c) => (
           <FileNode
             key={c.path}
@@ -675,18 +808,29 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
             selectedPath={selectedPath}
             onSelect={onSelect}
             depth={0}
+            onContextMenu={onContextMenu}
+            onMoveInto={onMoveInto}
           />
         ))}
-      </>
+      </div>
     )
   }
   return (
     <>
       <button
         type="button"
-        className="tree-folder"
+        className={`tree-folder ${dropActive ? 'tree-drop-active' : ''}`}
         style={{ paddingLeft: `${10 + depth * 16}px` }}
         onClick={() => setExpanded((e) => !e)}
+        // Folders are drop targets for moves.
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropActive(true) }}
+        onDragLeave={() => setDropActive(false)}
+        onDrop={(e) => dropMove(e, node.path)}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          onContextMenu({ x: e.clientX, y: e.clientY, path: node.path, isFolder: true })
+        }}
+        {...longPress}
       >
         <span className="tree-icon">{expanded ? '▾' : '▸'}</span>
         <span className="tree-name">{node.name}/</span>
@@ -698,6 +842,8 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
           selectedPath={selectedPath}
           onSelect={onSelect}
           depth={depth + 1}
+          onContextMenu={onContextMenu}
+          onMoveInto={onMoveInto}
         />
       ))}
     </>
@@ -711,10 +857,31 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
 // rather than a tap that pops an explanatory modal.
 function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
-  onCreateFile, onCreateFolder, onDeleteFile,
+  onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
+  onUpload, onMove, onRename,
 }) {
   const root = useMemo(() => buildTree(files), [files])
+  // Hidden inputs the Upload buttons click programmatically. Two separate
+  // inputs because `webkitdirectory` and a plain multi-file picker can't share
+  // one element — the directory flag turns the whole picker into folder mode.
+  const fileInputRef = useRef(null)
+  const folderInputRef = useRef(null)
+  // The open context menu: {x, y, path, isFolder} or null.
+  const [ctx, setCtx] = useState(null)
+  const closeCtx = useCallback(() => setCtx(null), [])
+  // Close the menu when the drawer closes so it can't outlive its anchor.
+  useEffect(() => { if (!open) setCtx(null) }, [open])
   if (!open) return null
+
+  const ctxItems = ctx ? [
+    { label: 'Rename', onSelect: () => onRename(ctx.path) },
+    {
+      label: 'Delete',
+      danger: true,
+      onSelect: () => (ctx.isFolder ? onDeleteFolder(ctx.path) : onDeleteFile(ctx.path)),
+    },
+  ] : []
+
   return (
     <section className="file-nav-panel" aria-label="File tree">
       <div className="nav-panel-head">
@@ -724,17 +891,58 @@ function FileNavPanel({
       <div className="nav-panel-actions">
         <button className="nav-panel-btn" onClick={onCreateFile} disabled={!canMutate}>+ New file</button>
         <button className="nav-panel-btn" onClick={onCreateFolder} disabled={!canMutate}>+ New folder</button>
+        <button
+          className="nav-panel-btn"
+          onClick={() => fileInputRef.current && fileInputRef.current.click()}
+          disabled={!canMutate}
+        >
+          Upload
+        </button>
+        <button
+          className="nav-panel-btn"
+          onClick={() => folderInputRef.current && folderInputRef.current.click()}
+          disabled={!canMutate}
+        >
+          Upload folder
+        </button>
+        {/* Hidden file/folder pickers; reset value after each pick so the same
+            file can be re-uploaded (a change event won't fire for an
+            unchanged value). */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            const fl = e.target.files
+            onUpload(fl, { asFolder: false })
+            e.target.value = ''
+          }}
+        />
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          webkitdirectory=""
+          directory=""
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            const fl = e.target.files
+            onUpload(fl, { asFolder: true })
+            e.target.value = ''
+          }}
+        />
       </div>
       {!canMutate && (
         <div className="nav-panel-syncing" role="status">
-          Loading your files... add and delete are available once they sync.
+          Loading your files... add, upload, and delete are available once they sync.
         </div>
       )}
       <div className="nav-panel-tree">
         {files.length === 0 ? (
           canMutate ? (
             <div className="nav-panel-empty">
-              No files yet. Tap "+ New file" or ask the agent to make one.
+              No files yet. Tap "+ New file", Upload, or ask the agent to make one.
             </div>
           ) : null
         ) : (
@@ -743,6 +951,8 @@ function FileNavPanel({
             selectedPath={selectedPath}
             onSelect={(p) => { onSelect(p); onClose() }}
             depth={-1}
+            onContextMenu={setCtx}
+            onMoveInto={onMove}
           />
         )}
       </div>
@@ -756,6 +966,9 @@ function FileNavPanel({
             Delete "{selectedPath}"
           </button>
         </div>
+      )}
+      {ctx && (
+        <ContextMenu x={ctx.x} y={ctx.y} items={ctxItems} onClose={closeCtx} />
       )}
     </section>
   )
@@ -793,30 +1006,75 @@ function bootstrapPrompt(appId) {
   ].join('\n')
 }
 
+// Create a real chat the embed can bind to. The old code fell back to a
+// hard-coded id ('latex-chat') that is truthy but not a UUID, so
+// window.mobius.chat treated it as "use this existing chat" and pointed the
+// embed iframe at /shell/embed/chat?chatId=latex-chat — a chat that never
+// exists → 404 → the permanent "no conversation yet" empty state. Instead we
+// mint a genuine chat ourselves via the app-token endpoint
+// (POST /api/app-chats, the same Bearer token makeStorage holds) and mount the
+// embed with that real id. The chat is app-attributed, so it stays out of the
+// owner's drawer history but the embed can still stream it.
+async function createAppChat(appId, token) {
+  const r = await fetch('/api/app-chats', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ title: 'LaTeX editor' }),
+  })
+  if (!r.ok) throw new Error(`create chat → ${r.status}`)
+  const data = await r.json()
+  if (!data || !data.id) throw new Error('create chat returned no id')
+  return String(data.id)
+}
+
 function ChatPanel({
-  appId, storage,
+  appId, token, storage,
   onFilesMaybeChanged,
 }) {
   const mountRef = useRef(null)
-  const fallbackChatIdRef = useRef('latex-chat')
+  // null until resolved; once set it is always a REAL chat id (a persisted
+  // one from chat_id.json or a freshly-created one). We never mount the embed
+  // with a placeholder.
   const [chatId, setChatId] = useState(null)
   const [error, setError] = useState(null)
 
+  // Resolve a real chat id before mounting the embed: read chat_id.json, and
+  // if absent create one ourselves and persist it. A create failure surfaces
+  // the chat-error rather than silently mounting an empty embed.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
         const saved = await storage.get('chat_id.json')
         if (cancelled) return
-        if (saved && saved.id) setChatId(String(saved.id))
-        else setChatId(fallbackChatIdRef.current)
+        if (saved && saved.id) {
+          setChatId(String(saved.id))
+          return
+        }
       } catch (e) {
-        // Runtime chat can create a fresh chat if no persisted id exists.
-        if (!cancelled) setChatId(fallbackChatIdRef.current)
+        // Read failure (e.g. offline) — fall through to create below; if
+        // that also fails the catch surfaces the error.
+      }
+      try {
+        const id = await createAppChat(appId, token)
+        if (cancelled) return
+        setChatId(id)
+        storage.setJSON('chat_id.json', { id }).catch(() => {})
+      } catch (e) {
+        if (!cancelled) {
+          setError(
+            (e && e.message)
+              ? `Could not start the agent chat (${e.message}).`
+              : 'Could not start the agent chat.',
+          )
+        }
       }
     })()
     return () => { cancelled = true }
-  }, [storage])
+  }, [appId, token, storage])
 
   useEffect(() => {
     const mount = mountRef.current
@@ -831,7 +1089,9 @@ function ChatPanel({
 
     window.mobius.chat({
       mount,
-      chatId: chatId === 'latex-chat' ? undefined : chatId,
+      // Always the real id — never a placeholder or undefined, so the embed
+      // binds to a chat that actually exists.
+      chatId,
       title: 'LaTeX editor',
       systemPrompt: bootstrapPrompt(appId),
     }).then((nextHandle) => {
@@ -842,9 +1102,14 @@ function ChatPanel({
       handle = nextHandle
       handle
         .on('ready', ({ chatId: resolved }) => {
+          // The runtime may hand back its own canonical id; reconcile +
+          // persist so a reload re-binds the same conversation.
           if (!resolved) return
-          setChatId(String(resolved))
-          storage.setJSON('chat_id.json', { id: String(resolved) }).catch(() => {})
+          const next = String(resolved)
+          if (next !== chatId) {
+            setChatId(next)
+            storage.setJSON('chat_id.json', { id: next }).catch(() => {})
+          }
         })
         .on('turn-done', () => { onFilesMaybeChanged() })
         .on('error', ({ error: chatError }) => {
@@ -1129,6 +1394,155 @@ function SyncPill({ online, pending, hasRuntime }) {
 }
 
 // ----------------------------------------------------------------------
+// Build controller. Owns the source→PDF compile state machine and the
+// poll loop. The actual compile runs server-side (tectonic via build.sh,
+// triggered by run-job); the app's job is to set the target, kick the run,
+// then poll build/status.json until the script writes a verdict.
+//
+// State machine:
+//   idle → building → done   (status.json says {status:'done', pdf,...})
+//                   → error  (status.json says {status:'error', log} OR
+//                             run-job refused OR the 120s cap elapsed)
+//
+// status.json 404s the entire time the build is running (the script only
+// writes it at the end), so a 404 during polling is "still building", not
+// a failure. We cap at BUILD_TIMEOUT_MS so a wedged/never-finishing build
+// doesn't poll forever. Exactly one poll timer exists at a time: starting
+// a build clears any prior timer first, and unmount clears it too — there
+// are never concurrent builds (the Build button is disabled while
+// building, and `build()` early-returns if already building).
+// ----------------------------------------------------------------------
+const BUILD_POLL_MS = 2000
+const BUILD_TIMEOUT_MS = 120000
+
+function useBuild({ appId, token, storage, online }) {
+  const [buildStatus, setBuildStatus] = useState('idle') // idle|building|done|error
+  const [buildLog, setBuildLog] = useState('')
+  // Which .tex the current/last build is FOR. The hook tracks one build at a
+  // time; this lets the viewer scope "Building…" / "Build failed" to the doc
+  // that's actually compiling, so switching to a different doc mid-build
+  // doesn't mislabel it.
+  const [buildDoc, setBuildDoc] = useState(null)
+  // Map of source .tex path → its built .pdf path, so the viewer can show a
+  // PDF tab only for documents that have actually been compiled this session.
+  const [pdfByDoc, setPdfByDoc] = useState({})
+  const pollRef = useRef(null)
+  const deadlineRef = useRef(0)
+
+  const clearPoll = useCallback(() => {
+    if (pollRef.current) {
+      clearTimeout(pollRef.current)
+      pollRef.current = null
+    }
+  }, [])
+
+  // Clear the timer on unmount so a poll can't fire into a dead component.
+  useEffect(() => clearPoll, [clearPoll])
+
+  const finishDone = useCallback((doc, pdf) => {
+    clearPoll()
+    setBuildStatus('done')
+    setBuildLog('')
+    if (doc && pdf) {
+      setPdfByDoc((prev) => (prev[doc] === pdf ? prev : { ...prev, [doc]: pdf }))
+    }
+  }, [clearPoll])
+
+  const finishError = useCallback((log) => {
+    clearPoll()
+    setBuildStatus('error')
+    setBuildLog(log || 'Build failed.')
+  }, [clearPoll])
+
+  // One poll tick: read build/status.json. 404/null → still building (or the
+  // cap elapsed → error). A verdict object → done/error. onDone is called
+  // with the built pdf path so the caller can flip the viewer + register it.
+  const poll = useCallback(async (doc, onDone) => {
+    if (Date.now() > deadlineRef.current) {
+      finishError('Build timed out (over 2 minutes). The first build downloads '
+        + 'LaTeX packages and can be slow — try again, or check the .tex compiles.')
+      return
+    }
+    let status = null
+    try {
+      status = await storage.get('build/status.json')
+    } catch (e) {
+      // Transient read failure — keep polling; the deadline still bounds us.
+      status = null
+    }
+    if (status && typeof status === 'object' && status.status) {
+      if (status.status === 'done') {
+        finishDone(doc, status.pdf)
+        if (typeof onDone === 'function' && status.pdf) onDone(doc, status.pdf)
+        return
+      }
+      finishError(status.log || 'Build failed.')
+      return
+    }
+    // Not ready yet (404 → null). Schedule the next tick.
+    pollRef.current = setTimeout(() => poll(doc, onDone), BUILD_POLL_MS)
+  }, [storage, finishDone, finishError])
+
+  // Kick a build for `doc` (a "files/<name>.tex" path). onDone fires once the
+  // PDF is ready. Guards against concurrent builds + offline.
+  const build = useCallback(async (doc, onDone) => {
+    if (buildStatus === 'building') return
+    if (!doc || !doc.endsWith('.tex')) return
+    if (!online) {
+      finishError('You are offline. Building needs a connection — reconnect and try again.')
+      return
+    }
+    clearPoll()
+    setBuildDoc(doc)
+    setBuildStatus('building')
+    setBuildLog('')
+    try {
+      // 0. Clear any verdict from a PRIOR build. The script only writes
+      // status.json when tectonic finishes, so between run-job and that
+      // write the OLD status.json still exists — the first poll would read
+      // last build's done/error and finish instantly with stale results.
+      // Removing it first means a poll sees 404 (still building) until the
+      // new run lands a fresh verdict. A 404 on the remove is fine.
+      await storage.remove('build/status.json')
+      // 1. Tell the build script which file to compile.
+      await storage.setText('build/target.txt', doc)
+      // 2. Kick the server-side job. 202 = accepted; anything else is fatal.
+      const r = await fetch(`/api/apps/${appId}/run-job`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (r.status !== 202) {
+        let detail = ''
+        try { detail = (await r.json()).detail || '' } catch { /* non-JSON body */ }
+        finishError(
+          `Could not start the build (server returned ${r.status}${detail ? `: ${detail}` : ''}).`,
+        )
+        return
+      }
+      // 3. Poll status.json until the script writes its verdict.
+      deadlineRef.current = Date.now() + BUILD_TIMEOUT_MS
+      pollRef.current = setTimeout(() => poll(doc, onDone), BUILD_POLL_MS)
+    } catch (e) {
+      finishError((e && e.message) ? e.message : 'Build failed to start.')
+    }
+  }, [appId, token, storage, online, buildStatus, clearPoll, finishError, poll])
+
+  return {
+    buildStatus, buildLog, buildDoc, pdfByDoc, build,
+    // Surfaced so the App can drop a doc's PDF mapping when the file is
+    // deleted/renamed (the pdf path itself is just another tree entry).
+    forgetDoc: useCallback((doc) => {
+      setPdfByDoc((prev) => {
+        if (!(doc in prev)) return prev
+        const next = { ...prev }
+        delete next[doc]
+        return next
+      })
+    }, []),
+  }
+}
+
+// ----------------------------------------------------------------------
 // Top-level app.
 // ----------------------------------------------------------------------
 export default function App({ appId, token }) {
@@ -1142,6 +1556,10 @@ export default function App({ appId, token }) {
   // this with the canonical state when online.
   const cached = useMemo(() => readFileCache(appId), [appId])
   const [files, setFiles] = useState(() => cached?.index || [])
+  // Mirror of `files` for reads inside long-lived async callbacks (the build
+  // poll can resolve up to 120s after it captured its closure). Kept in sync
+  // below so the closure-stale snapshot never drives an index write.
+  const filesRef = useRef(files)
   const [fileCache, setFileCache] = useState(() => cached?.contents || {})
   // True once `files` reflects the server's index this session — either
   // refreshFiles read it back or seeded it online. Until then `files` is
@@ -1166,6 +1584,11 @@ export default function App({ appId, token }) {
   // on every storage write (handled inline at each call site below)
   // and on a 10s background poll.
   const [pending, setPending] = useState(0)
+  // Preview viewer mode for the selected source file. 'source' shows the
+  // KaTeX/markdown render; 'pdf' shows the compiled PDF. The PDF tab is only
+  // reachable once the current .tex has a build mapped (see pdfByDoc below).
+  const [viewMode, setViewMode] = useState('source')
+  const build = useBuild({ appId, token, storage, online })
 
   // Persist the file-cache snapshot whenever the index, contents, or
   // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
@@ -1175,6 +1598,13 @@ export default function App({ appId, token }) {
   useEffect(() => {
     writeFileCache(appId, files, fileCache, selectedPath)
   }, [appId, files, fileCache, selectedPath])
+
+  // Keep the ref in lock-step with `files` so async callbacks read the latest.
+  useEffect(() => { filesRef.current = files }, [files])
+  // Same for selectedPath — the build callback (resolves up to 120s later)
+  // must check the CURRENT selection before auto-flipping the viewer.
+  const selectedPathRef = useRef(selectedPath)
+  useEffect(() => { selectedPathRef.current = selectedPath }, [selectedPath])
 
   const refreshPending = useCallback(async () => {
     try {
@@ -1498,6 +1928,7 @@ export default function App({ appId, token }) {
         delete ncache[path]
         return ncache
       })
+      build.forgetDoc(path)
       if (selectedPath === path) {
         // Prefer a real file over a `.keep` placeholder for the
         // post-delete selection — landing on .keep would show a
@@ -1509,11 +1940,233 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete' })
     }
-  }, [files, selectedPath, storage, modal, refreshPending, ensureIndexWritable])
+  }, [files, selectedPath, storage, modal, refreshPending, ensureIndexWritable, build])
+
+  // ---- Upload (files + whole folders) ------------------------------------
+  // The browser hands us a FileList; each entry has either a plain `name`
+  // (file picker) or a `webkitRelativePath` like "thesis/ch1/intro.tex"
+  // (folder picker). We PUT each under files/<that path> — the storage PUT
+  // creates parent dirs — then update files-index.json ONCE (merge + sort)
+  // after all writes land, rather than per-file, so a 50-file folder upload
+  // doesn't queue 50 index writes that race each other.
+  const uploadFiles = useCallback(async (fileList, { asFolder } = {}) => {
+    if (!(await ensureIndexWritable())) return
+    const items = Array.from(fileList || [])
+    if (items.length === 0) return
+    const added = []
+    const failed = []
+    for (const f of items) {
+      // Folder picker preserves the relative path; file picker gives just a
+      // name. Normalise leading slashes and validate against the server's
+      // own _SAFE_RE so a PUT can't 4xx on a stray character.
+      const rel = ((asFolder && f.webkitRelativePath) || f.name || '')
+        .replace(/^\/+/, '')
+        .trim()
+      if (!rel || !NAME_RE.test(rel)) {
+        failed.push(f.name || rel || '(unnamed)')
+        continue
+      }
+      const path = `files/${rel}`
+      try {
+        // Read as text when it looks textual, else as a data-bearing blob.
+        // The storage PUT helper sends text/plain; binary round-trips fine
+        // as the raw bytes (images/PDFs the user drags in).
+        const isText = /\.(tex|md|txt|bib|cls|sty|json|csv|log|markdown)$/i.test(rel)
+        if (isText) {
+          const text = await f.text()
+          await storage.setText(path, text)
+          setFileCache((prev) => ({ ...prev, [path]: text }))
+        } else {
+          // Non-text: PUT the raw blob. We deliberately don't cache the body
+          // (binary previews fetch on demand) — same policy as the existing
+          // image/pdf path.
+          const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
+            method: 'PUT',
+            headers: { Authorization: `Bearer ${token}` },
+            body: f,
+          })
+          if (!r.ok) throw new Error(`PUT ${path} → ${r.status}`)
+        }
+        added.push(path)
+      } catch (e) {
+        failed.push(rel)
+      }
+    }
+    if (added.length) {
+      const next = [...new Set([...files, ...added])].sort()
+      try {
+        await storage.setJSON('files-index.json', next)
+        setFiles(next)
+      } catch (e) {
+        await modal.alert(e.message || String(e), { title: 'Upload saved but index update failed' })
+      }
+      refreshPending()
+    }
+    if (failed.length) {
+      await modal.alert(
+        `Couldn't upload ${failed.length} item(s): ${failed.slice(0, 6).join(', ')}`
+          + (failed.length > 6 ? '…' : ''),
+        { title: 'Some uploads failed' },
+      )
+    }
+  }, [appId, token, files, storage, modal, refreshPending, ensureIndexWritable])
+
+  // ---- Move / rename (drag-to-move + context-menu rename) ----------------
+  // Both go through POST /storage/apps/{id}/move {from, to}. The index is a
+  // flat list of FILE paths; a move of a file replaces its one entry, a move
+  // of a folder replaces every entry whose path is under it. We re-derive the
+  // index by string-prefix rewrite, then persist once.
+  const movePath = useCallback(async (from, to) => {
+    if (from === to) return
+    if (!(await ensureIndexWritable())) return
+    if (!NAME_RE.test(to.replace(/^files\//, ''))) {
+      await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
+      return
+    }
+    // Reject a no-op or a move of a folder into itself/its own subtree.
+    if (to === from || to.startsWith(`${from}/`)) {
+      await modal.alert('Cannot move an item into itself.', { title: 'Invalid move' })
+      return
+    }
+    try {
+      const r = await fetch(`/api/storage/apps/${appId}/move`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to }),
+      })
+      if (!r.ok) {
+        let detail = ''
+        try { detail = (await r.json()).detail || '' } catch { /* non-JSON */ }
+        if (r.status === 409) {
+          await modal.alert('Something already exists at the destination.', { title: 'Move failed' })
+        } else {
+          await modal.alert(`Move failed (${r.status}${detail ? `: ${detail}` : ''}).`, { title: 'Move failed' })
+        }
+        return
+      }
+      // Rewrite every index entry under `from` (covers both a single file and
+      // a whole folder subtree) to its new prefix.
+      const rewrite = (p) => {
+        if (p === from) return to
+        if (p.startsWith(`${from}/`)) return to + p.slice(from.length)
+        return p
+      }
+      const next = [...new Set(files.map(rewrite))].sort()
+      await storage.setJSON('files-index.json', next)
+      setFiles(next)
+      // Carry the cached body + selection + pdf mapping across the rename.
+      setFileCache((prev) => {
+        const out = {}
+        for (const [p, v] of Object.entries(prev)) out[rewrite(p)] = v
+        return out
+      })
+      setSelectedPath((cur) => (cur ? rewrite(cur) : cur))
+      build.forgetDoc(from)
+      refreshPending()
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Move failed' })
+    }
+  }, [appId, token, files, storage, modal, refreshPending, ensureIndexWritable, build])
+
+  // Rename = move to a sibling path with a new leaf. We prompt for the new
+  // leaf name and keep the same parent dir.
+  const handleRename = useCallback(async (path) => {
+    const parts = path.split('/')
+    const leaf = parts[parts.length - 1]
+    const parent = parts.slice(0, -1).join('/')
+    const nextLeaf = await modal.prompt(
+      'New name',
+      { title: 'Rename', placeholder: leaf, defaultValue: leaf },
+    )
+    if (!nextLeaf) return
+    const clean = nextLeaf.replace(/^\/+/, '').replace(/\/+$/, '').trim()
+    if (!clean || clean === leaf) return
+    const to = parent ? `${parent}/${clean}` : clean
+    await movePath(path, to)
+  }, [modal, movePath])
+
+  // ---- Folder delete (recursive) -----------------------------------------
+  const handleDeleteFolder = useCallback(async (folderPath) => {
+    if (!(await ensureIndexWritable())) return
+    const ok = await modal.confirm(
+      `Delete the folder “${folderPath}” and everything inside it? This cannot be undone.`,
+      { title: 'Delete folder', danger: true },
+    )
+    if (!ok) return
+    // folderPath is "files/<sub...>"; the recursive route wants the path
+    // relative to the app root, which is exactly that string.
+    try {
+      const r = await fetch(`/api/storage/apps/${appId}/folder/${folderPath}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!r.ok && r.status !== 404) {
+        let detail = ''
+        try { detail = (await r.json()).detail || '' } catch { /* non-JSON */ }
+        await modal.alert(`Could not delete folder (${r.status}${detail ? `: ${detail}` : ''}).`, { title: 'Delete failed' })
+        return
+      }
+      // Drop every index entry under the folder, plus the cache + selection.
+      const under = (p) => p === folderPath || p.startsWith(`${folderPath}/`)
+      const next = files.filter((p) => !under(p))
+      await storage.setJSON('files-index.json', next)
+      setFiles(next)
+      setFileCache((prev) => {
+        const out = {}
+        for (const [p, v] of Object.entries(prev)) if (!under(p)) out[p] = v
+        return out
+      })
+      setSelectedPath((cur) => {
+        if (cur && under(cur)) return next.find((p) => !p.endsWith('/.keep')) || null
+        return cur
+      })
+      refreshPending()
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Delete failed' })
+    }
+  }, [appId, token, files, storage, modal, refreshPending, ensureIndexWritable])
 
   const selectedExt = selectedPath ? selectedPath.split('.').pop().toLowerCase() : ''
   const selectedIsBinary = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(selectedExt)
   const canEditSelected = !!selectedPath && !selectedIsBinary && !fileLoading && !fileError
+  const selectedIsTex = selectedExt === 'tex'
+  // The PDF compiled from the selected .tex this session, if any. The viewer's
+  // PDF tab is gated on this so a doc with no build can't show a blank iframe.
+  const pdfForSelected = (selectedPath && build.pdfByDoc[selectedPath]) || null
+
+  // Reset the viewer to source whenever the user switches files — a per-doc
+  // PDF tab shouldn't carry over to a different (maybe-never-built) document.
+  // Selecting a .pdf directly is handled by renderPreview (it just shows the
+  // PDF); this only governs the source/pdf TAB state for .tex/.md docs.
+  useEffect(() => {
+    setViewMode('source')
+  }, [selectedPath])
+
+  // When a build finishes, flip the selected doc's viewer to PDF and make the
+  // new .pdf visible in the tree by adding it to files-index.json if missing.
+  // Only writes the index when it's safe to (indexLoaded) — same gate as every
+  // other UI index write, so an unconfirmed list never clobbers the server's.
+  const onBuildDone = useCallback(async (doc, pdfPath) => {
+    // Only yank the viewer to PDF if the user is still on the doc we built —
+    // a build can finish after they've navigated elsewhere.
+    if (doc === selectedPathRef.current) setViewMode('pdf')
+    if (!pdfPath || !indexLoaded) return
+    // The build can finish up to 120s after it started, so `files` captured
+    // in this callback's closure may be stale (a chat turn or upload added an
+    // entry meanwhile). Read the freshest list from the ref, merge the new
+    // PDF, and persist once.
+    const cur = filesRef.current
+    if (cur.includes(pdfPath)) return
+    const next = [...cur, pdfPath].sort()
+    try {
+      await storage.setJSON('files-index.json', next)
+      setFiles(next)
+      refreshPending()
+    } catch (e) {
+      // Non-fatal: the PDF still renders from its known path; it just won't
+      // appear as a tree entry until the next index refresh.
+    }
+  }, [indexLoaded, storage, refreshPending])
 
   const handleEditorChange = useCallback((value) => {
     setFileContent(value)
@@ -1538,6 +2191,21 @@ export default function App({ appId, token }) {
       setFileSaving(false)
     }
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
+
+  const handleBuild = useCallback(() => {
+    if (!selectedIsTex || !selectedPath) return
+    if (build.buildStatus === 'building') return
+    // Save unsaved edits first so the compile sees what's on screen, then
+    // kick the build. handleSaveFile resolves once the write lands (or fails
+    // silently into fileError); we build either way so a flaky save doesn't
+    // strand the button.
+    const kick = () => build.build(selectedPath, onBuildDone)
+    if (fileDirty && !fileSaving) {
+      handleSaveFile().then(kick, kick)
+    } else {
+      kick()
+    }
+  }, [selectedIsTex, selectedPath, fileDirty, fileSaving, build, onBuildDone, handleSaveFile])
 
   function renderEditor() {
     if (!selectedPath) {
@@ -1586,8 +2254,38 @@ export default function App({ appId, token }) {
     if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
       return <ImagePreview storage={storage} path={selectedPath} />
     }
+    // A .pdf selected directly in the tree just shows the PDF — no tabs,
+    // no build state; it's a static document, not a compile target.
     if (ext === 'pdf') {
       return <PdfPreview storage={storage} path={selectedPath} />
+    }
+    // For .tex docs, the viewer toggles between the live source render and
+    // the compiled PDF. The PDF view also has to surface the build's own
+    // states (running / failed) since a build is a per-doc async operation.
+    if (ext === 'tex' && viewMode === 'pdf') {
+      // Building / error states only apply to the doc that's actually
+      // compiling (build is single-flight in the hook).
+      const isBuildingThis = build.buildStatus === 'building' && build.buildDoc === selectedPath
+      const isErrorThis = build.buildStatus === 'error' && build.buildDoc === selectedPath
+      if (isBuildingThis) {
+        return (
+          <div className="preview-note build-note">
+            Building… (first build downloads packages, ~30–60s)
+          </div>
+        )
+      }
+      if (isErrorThis) {
+        return (
+          <div className="build-error">
+            <div className="build-error-title">Build failed</div>
+            <pre className="build-log">{build.buildLog}</pre>
+          </div>
+        )
+      }
+      if (pdfForSelected) {
+        return <PdfPreview storage={storage} path={pdfForSelected} />
+      }
+      // viewMode flipped to pdf but no build yet — fall through to source.
     }
     if (fileLoading) return <div className="preview-note">Loading…</div>
     if (fileError) return <div className="preview-note">{fileError}</div>
@@ -1618,11 +2316,21 @@ export default function App({ appId, token }) {
         <div className="top-actions">
           <button className="toolbar-btn" onClick={handleCreateFile} disabled={!indexLoaded}>New</button>
           <button
-            className="toolbar-btn toolbar-btn--primary"
+            className="toolbar-btn"
             onClick={handleSaveFile}
             disabled={!canEditSelected || !fileDirty || fileSaving}
           >
             {fileSaving ? 'Saving' : fileDirty ? 'Save' : 'Saved'}
+          </button>
+          <button
+            className="toolbar-btn toolbar-btn--primary"
+            onClick={handleBuild}
+            disabled={!selectedIsTex || build.buildStatus === 'building'}
+            title={selectedIsTex
+              ? 'Compile this .tex to PDF'
+              : 'Select a .tex file to build'}
+          >
+            {build.buildStatus === 'building' ? 'Building…' : 'Build'}
           </button>
           <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
         </div>
@@ -1637,6 +2345,10 @@ export default function App({ appId, token }) {
         onCreateFile={handleCreateFile}
         onCreateFolder={handleCreateFolder}
         onDeleteFile={handleDeleteFile}
+        onDeleteFolder={handleDeleteFolder}
+        onUpload={uploadFiles}
+        onMove={movePath}
+        onRename={handleRename}
       />
       <main className="workspace">
         <section className="editor-pane">
@@ -1647,12 +2359,45 @@ export default function App({ appId, token }) {
         </section>
         <section className="preview-pane">
           <div className="pane-head">
-            <span>Preview</span>
+            {selectedIsTex ? (
+              <div className="view-tabs" role="tablist" aria-label="Preview mode">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={viewMode === 'source'}
+                  className={`view-tab ${viewMode === 'source' ? 'view-tab--active' : ''}`}
+                  onClick={() => setViewMode('source')}
+                >
+                  Source
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={viewMode === 'pdf'}
+                  className={`view-tab ${viewMode === 'pdf' ? 'view-tab--active' : ''}`}
+                  onClick={() => setViewMode('pdf')}
+                  // PDF tab opens once the doc has a build mapped, or while a
+                  // build for THIS doc is in flight (so the user can watch
+                  // progress / see the failure log).
+                  disabled={!pdfForSelected
+                    && !(build.buildStatus !== 'idle' && build.buildDoc === selectedPath)}
+                  title={(!pdfForSelected
+                    && !(build.buildStatus !== 'idle' && build.buildDoc === selectedPath))
+                    ? 'Build this document to see its PDF'
+                    : 'View the compiled PDF'}
+                >
+                  PDF
+                </button>
+              </div>
+            ) : (
+              <span>Preview</span>
+            )}
           </div>
           <div className="pane-body preview-body">{renderPreview()}</div>
         </section>
         <ChatPanel
           appId={appId}
+          token={token}
           storage={storage}
           onFilesMaybeChanged={onFilesMaybeChanged}
         />
@@ -1782,6 +2527,7 @@ const CSS = `
 }
 .nav-panel-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
 }
@@ -1919,6 +2665,62 @@ const CSS = `
   font-size: 13px;
   padding: 16px 0;
   text-align: center;
+}
+.build-note {
+  padding: 24px 16px;
+  line-height: 1.55;
+}
+
+/* ---- Source/PDF viewer tabs ---- */
+.view-tabs {
+  display: inline-flex;
+  gap: 4px;
+}
+.view-tab {
+  min-height: 28px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--muted);
+  font: 700 11px/1 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.view-tab--active {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text);
+}
+.view-tab:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---- build failure ---- */
+.build-error {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.build-error-title {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 14px;
+}
+.build-log {
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 /* Subtle accent-tinted strip sitting at the top of the .tex preview
    when KaTeX failed to load (offline / flaky link). Loud enough to
@@ -2147,6 +2949,47 @@ const CSS = `
   background: var(--accent);
   color: #fff;
 }
+.tree-file[draggable="true"] { cursor: grab; }
+/* Drop-target highlight while a drag hovers a folder or the root. */
+.tree-drop-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.tree-root {
+  min-height: 40px;
+}
+
+/* In-app context menu (right-click / long-press). Positioned within the
+   relative .latex-root; sits above the drawer + modal layers. */
+.ctx-menu {
+  position: absolute;
+  z-index: 60;
+  min-width: 160px;
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 12px;
+  text-align: left;
+  border: none;
+  border-radius: 7px;
+  background: none;
+  color: var(--text);
+  font: 500 14px/1.2 var(--font);
+  cursor: pointer;
+}
+.ctx-item:active { background: var(--surface2, var(--surface)); }
+.ctx-item--danger { color: var(--accent); }
 .tree-icon {
   display: inline-flex;
   align-items: center;
