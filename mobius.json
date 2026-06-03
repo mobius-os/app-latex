@@ -1,7 +1,7 @@
 {
   "id": "latex",
   "name": "LaTeX",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Math-first LaTeX editor. Describe what you want in prose; an AI sub-agent writes and edits the .tex files for you while you preview the math live.",
   "author": "mobius-os",
   "license": "MIT",

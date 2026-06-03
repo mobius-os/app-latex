@@ -138,7 +138,6 @@ function makeStorage(appId, token) {
 // so editing and reading prose keep working while preview math is
 // degraded. A later retry (next online open) gets a fresh attempt.
 // ----------------------------------------------------------------------
-const KATEX_LOAD_TIMEOUT_MS = 5000
 let _katexPromise = null
 function loadKatex() {
   if (_katexPromise) return _katexPromise
@@ -151,11 +150,7 @@ function loadKatex() {
     link.href = 'https://esm.sh/katex@0.16/dist/katex.min.css'
     document.head.appendChild(link)
   }
-  const importPromise = import('https://esm.sh/katex@0.16?bundle')
-  const timeoutPromise = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error('katex-load-timeout')), KATEX_LOAD_TIMEOUT_MS)
-  })
-  _katexPromise = Promise.race([importPromise, timeoutPromise]).catch((err) => {
+  _katexPromise = import('https://esm.sh/katex@0.16?bundle').catch((err) => {
     // Reset so a later retry (back online) can try again.
     _katexPromise = null
     throw err
@@ -714,96 +709,63 @@ function FileNode({ node, selectedPath, onSelect, depth }) {
 // the user can't queue an index write derived from an unconfirmed list —
 // the handler refuses too, but greying the buttons is the honest surface
 // rather than a tap that pops an explanatory modal.
-function FileDrawer({
+function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile,
 }) {
   const root = useMemo(() => buildTree(files), [files])
+  if (!open) return null
   return (
-    <>
-      <div
-        className={`drawer-scrim ${open ? 'drawer-scrim--open' : ''}`}
-        onClick={onClose}
-      />
-      <aside className={`file-drawer ${open ? 'file-drawer--open' : ''}`}>
-        <div className="drawer-head">
-          <span className="drawer-title">Files</span>
-          <button className="drawer-close" onClick={onClose} aria-label="Close">×</button>
+    <section className="file-nav-panel" aria-label="File tree">
+      <div className="nav-panel-head">
+        <span className="nav-panel-title">Files</span>
+        <button className="nav-panel-close" onClick={onClose} aria-label="Close file tree">Close</button>
+      </div>
+      <div className="nav-panel-actions">
+        <button className="nav-panel-btn" onClick={onCreateFile} disabled={!canMutate}>+ New file</button>
+        <button className="nav-panel-btn" onClick={onCreateFolder} disabled={!canMutate}>+ New folder</button>
+      </div>
+      {!canMutate && (
+        <div className="nav-panel-syncing" role="status">
+          Loading your files... add and delete are available once they sync.
         </div>
-        <div className="drawer-actions">
-          <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>+ New file</button>
-          <button className="drawer-btn" onClick={onCreateFolder} disabled={!canMutate}>+ New folder</button>
-        </div>
-        {!canMutate && (
-          <div className="drawer-syncing" role="status">
-            Loading your files… add and delete are available once they sync.
-          </div>
+      )}
+      <div className="nav-panel-tree">
+        {files.length === 0 ? (
+          canMutate ? (
+            <div className="nav-panel-empty">
+              No files yet. Tap "+ New file" or ask the agent to make one.
+            </div>
+          ) : null
+        ) : (
+          <FileNode
+            node={root}
+            selectedPath={selectedPath}
+            onSelect={(p) => { onSelect(p); onClose() }}
+            depth={-1}
+          />
         )}
-        <div className="drawer-tree">
-          {files.length === 0 ? (
-            // While the index is still syncing the syncing note above
-            // already explains the empty tree; don't also tell the user
-            // to tap a button we've disabled.
-            canMutate ? (
-              <div className="drawer-empty">
-                No files yet. Tap “+ New file” or ask the agent to make one.
-              </div>
-            ) : null
-          ) : (
-            <FileNode
-              node={root}
-              selectedPath={selectedPath}
-              onSelect={(p) => { onSelect(p); onClose() }}
-              depth={-1}
-            />
-          )}
+      </div>
+      {selectedPath && (
+        <div className="nav-panel-foot">
+          <button
+            className="nav-panel-btn nav-panel-btn--danger"
+            onClick={() => onDeleteFile(selectedPath)}
+            disabled={!canMutate}
+          >
+            Delete "{selectedPath}"
+          </button>
         </div>
-        {selectedPath && (
-          <div className="drawer-foot">
-            <button
-              className="drawer-btn drawer-btn--danger"
-              onClick={() => onDeleteFile(selectedPath)}
-              disabled={!canMutate}
-            >
-              Delete “{selectedPath}”
-            </button>
-          </div>
-        )}
-      </aside>
-    </>
+      )}
+    </section>
   )
 }
 
 // ----------------------------------------------------------------------
-// Chat panel. We POST a user message to /api/chats/<chat_id>/messages,
-// then poll /api/chats/<chat_id> every second until the chat reports
-// `running: false`. We do not consume the SSE stream — the streaming
-// endpoint emits ~12 different event types (text, tool_start,
-// tool_input, tool_end, question, ...) that we'd otherwise have to
-// re-implement the shell's interpretation of. Polling the persisted
-// chat history is good enough for an embedded panel: we render the
-// last assistant message's text blocks as one flowing reply, which
-// matches the spec ("after editing, summarise the change in one
-// sentence").
+// Embedded shell chat. The runtime mounts the real ChatView into an
+// iframe, so this app does not duplicate SSE handling, composer state,
+// attachments, provider controls, queueing, or polling.
 // ----------------------------------------------------------------------
-
-// System-prompt-style first user message. We send this as a hidden
-// first turn on chat creation so the sub-agent knows it's working in
-// /data/apps/<id>/files/. The chat-creation API doesn't take a
-// system_prompt override (see chats.py:create_chat — it inherits the
-// shell's default skill), so an opening "here's the contract" user
-// message is the practical lever.
-//
-// The brief is sent with hidden:true so the main Möbius shell (where
-// the same chat may be opened from the drawer) renders it as nothing —
-// see frontend/ChatView.jsx, which skips m.hidden. The backend only
-// stamps the hidden flag onto user messages, not assistant turns, so
-// any assistant reply to the brief WOULD show up in the shell as a
-// stray bubble. We therefore tell the agent NOT to acknowledge the
-// brief: it stays silent until the user's first real message, so there
-// is no assistant turn to leak. The app never awaits an acknowledgement
-// either — createChat() fires the brief and returns; the user's message
-// queues behind it — so dropping the confirmation costs us nothing.
 function bootstrapPrompt(appId) {
   return [
     `You are the LaTeX-editor sub-agent for Möbius app id ${appId}.`,
@@ -831,349 +793,80 @@ function bootstrapPrompt(appId) {
   ].join('\n')
 }
 
-// Strip the hidden setup brief from a loaded message list so the app's
-// own chat panel never shows it. Only the brief (a hidden user turn) is
-// dropped — the agent is told not to acknowledge it, so there is no
-// assistant turn to strip. Scanning from the front (rather than a
-// hardcoded slice) stays correct if the API returns the list with the
-// brief already filtered, or not yet present mid-bootstrap.
-function dropBootstrap(msgs) {
-  if (!msgs || msgs.length === 0) return msgs || []
-  let i = 0
-  if (msgs[i] && msgs[i].role === 'user' && msgs[i].hidden) i += 1
-  return msgs.slice(i)
-}
-
-// One assistant turn's plain text — concatenate text blocks, ignoring
-// tool calls / thinking / questions. Good enough for a "summary"
-// surface.
-function assistantPlainText(message) {
-  if (!message || message.role !== 'assistant') return ''
-  if (typeof message.content === 'string') return message.content
-  const blocks = message.blocks || []
-  return blocks
-    .filter((b) => b.type === 'text' && b.content)
-    .map((b) => b.content)
-    .join('\n')
-}
-
-// localStorage key for the chat composer draft. Per-app so two app
-// installs don't trample each other; same shape as the news report
-// read-cache (which uses localStorage rather than the outbox-backed
-// storage shim so we don't queue keystrokes into the sync queue).
-function draftKey(appId) {
-  return `latex:${appId}:chat-draft:v1`
-}
-
 function ChatPanel({
-  appId, token, storage, online,
+  appId, storage,
   onFilesMaybeChanged,
 }) {
+  const mountRef = useRef(null)
+  const fallbackChatIdRef = useRef('latex-chat')
   const [chatId, setChatId] = useState(null)
-  const [bootstrapping, setBootstrapping] = useState(true)
-  const [messages, setMessages] = useState([])  // [{role, content|blocks}]
-  // Draft is persisted to localStorage so flipping offline (and the
-  // subsequent re-mount many shells do on visibility change) doesn't
-  // eat what the user was typing. localStorage rather than the
-  // outbox-backed storage shim: keystrokes shouldn't enqueue server
-  // writes, and the draft is single-user, single-device by nature.
-  const [draft, setDraft] = useState(() => {
-    if (typeof localStorage === 'undefined') return ''
-    try { return localStorage.getItem(draftKey(appId)) || '' } catch { return '' }
-  })
-  const [sending, setSending] = useState(false)
-  const [streaming, setStreaming] = useState(false)
   const [error, setError] = useState(null)
-  const scrollerRef = useRef(null)
-  const pollRef = useRef(null)
-  const filesPollRef = useRef(null)
 
-  // Persist the draft on every change. The set call is synchronous so
-  // there's no race with a quick send; the storage write is bounded
-  // (~140KB max in practice, well under the 5MB quota).
-  useEffect(() => {
-    if (typeof localStorage === 'undefined') return
-    try {
-      if (draft) localStorage.setItem(draftKey(appId), draft)
-      else localStorage.removeItem(draftKey(appId))
-    } catch {
-      // Quota / disabled — keep going. The in-memory draft survives
-      // this session even if persistence fails.
-    }
-  }, [appId, draft])
-
-  // Discover or create the chat id. We persist {id: "uuid"} to
-  // chat_id.json so subsequent app loads land in the same conversation.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
       try {
         const saved = await storage.get('chat_id.json')
         if (cancelled) return
-        if (saved && saved.id) {
-          setChatId(saved.id)
-          // Hydrate history.
-          await loadHistory(saved.id)
-          setBootstrapping(false)
-          return
-        }
+        if (saved && saved.id) setChatId(String(saved.id))
+        else setChatId(fallbackChatIdRef.current)
       } catch (e) {
-        // Fall through and create fresh.
+        // Runtime chat can create a fresh chat if no persisted id exists.
+        if (!cancelled) setChatId(fallbackChatIdRef.current)
       }
-      setBootstrapping(false)
     })()
     return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appId, token])
+  }, [storage])
 
-  // Load past messages for an existing chat.
-  async function loadHistory(id) {
-    try {
-      const r = await fetch(`/api/chats/${id}?limit=200`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (!r.ok) return
-      const data = await r.json()
-      // Hide the bootstrap turn (first user + assistant) from the UI.
-      // The bootstrap prompt is implementation detail.
-      const msgs = dropBootstrap(data.messages || [])
-      setMessages(msgs)
-    } catch (e) {
-      // Quietly ignore — the chat might have been deleted; user can
-      // start fresh by sending a message.
-    }
-  }
-
-  // Create a new chat and prime it with the system-style instructions.
-  // Returns the new chat id or null on failure.
-  async function createChat() {
-    try {
-      const r = await fetch('/api/chats', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'LaTeX editor' }),
-      })
-      if (!r.ok) return null
-      const data = await r.json()
-      // Persist immediately so a refresh during the bootstrap turn
-      // doesn't orphan the chat.
-      await storage.setJSON('chat_id.json', { id: data.id })
-      // Send the bootstrap prompt as a hidden first user message so
-      // the sub-agent knows where to write files. We don't await its
-      // completion — the user's own message follows in the same call
-      // path and queues behind the bootstrap turn.
-      await fetch(`/api/chats/${data.id}/messages`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        // hidden:true so the main Möbius shell (drawer → this chat)
-        // doesn't render the contract as a user turn. The brief tells
-        // the agent not to reply, so there's no assistant turn to leak
-        // into the shell either — see comment on bootstrapPrompt().
-        body: JSON.stringify({ content: bootstrapPrompt(appId), hidden: true }),
-      })
-      return data.id
-    } catch (e) {
-      setError(`Could not create chat: ${e.message || e}`)
-      return null
-    }
-  }
-
-  // Poll loop: every 2s while we expect activity, fetch the chat and
-  // refresh the message list. Stops when `running: false` AND the
-  // last message is an assistant turn (i.e. the agent has spoken).
-  // 2s (was 1s) is responsive enough for an embedded panel — the
-  // surface only renders the final assistant message anyway, so we
-  // don't need sub-second turn-of-bubble updates. Costs us roughly
-  // half the GETs per build. The SSE stream would be cheaper still,
-  // but its 12-event-type protocol would require us to re-implement
-  // the shell's interpretation of tool_start/tool_end/question/...
-  // and that's out of scope for the polish pass.
-  function startPolling(id) {
-    if (pollRef.current) clearInterval(pollRef.current)
-    setStreaming(true)
-    let consecutiveIdle = 0
-    pollRef.current = setInterval(async () => {
-      try {
-        const r = await fetch(`/api/chats/${id}?limit=200`, {
-          headers: { Authorization: `Bearer ${token}` },
-        })
-        if (!r.ok) return
-        const data = await r.json()
-        const msgs = dropBootstrap(data.messages || [])
-        setMessages(msgs)
-        if (!data.running) {
-          consecutiveIdle += 1
-          // Two consecutive idle ticks before we consider it really
-          // done — guards against the brief gap between turns when
-          // the queue promotes the next pending message.
-          if (consecutiveIdle >= 2) {
-            clearInterval(pollRef.current)
-            pollRef.current = null
-            setStreaming(false)
-            // One last file-list refresh so a delete the agent did at
-            // turn-end is reflected immediately, not 3s later.
-            onFilesMaybeChanged()
-          }
-        } else {
-          consecutiveIdle = 0
-        }
-      } catch (e) {
-        // Network blip — keep polling. The next tick will retry.
-      }
-    }, 2000)
-  }
-
-  // Separate, slower poll for the file index while a turn is active.
-  // The chat detail tells us what the agent SAID; this tells us what
-  // it DID. 5s cadence — the agent's edit-then-summarise turn takes
-  // tens of seconds, so a 5s lag on the tree refresh is invisible
-  // and a final post-turn refresh (in startPolling) catches the
-  // last write within ~2s of the agent finishing.
   useEffect(() => {
-    if (!streaming) {
-      if (filesPollRef.current) {
-        clearInterval(filesPollRef.current)
-        filesPollRef.current = null
-      }
-      return
+    const mount = mountRef.current
+    if (!chatId) return undefined
+    if (!mount || !window.mobius || typeof window.mobius.chat !== 'function') {
+      setError('Embedded chat is not available in this shell.')
+      return undefined
     }
-    filesPollRef.current = setInterval(() => {
-      onFilesMaybeChanged()
-    }, 5000)
-    return () => {
-      if (filesPollRef.current) clearInterval(filesPollRef.current)
-      filesPollRef.current = null
-    }
-  }, [streaming, onFilesMaybeChanged])
-
-  // Cleanup on unmount.
-  useEffect(() => () => {
-    if (pollRef.current) clearInterval(pollRef.current)
-    if (filesPollRef.current) clearInterval(filesPollRef.current)
-  }, [])
-
-  // Auto-scroll the thread when new content arrives.
-  useEffect(() => {
-    if (!scrollerRef.current) return
-    scrollerRef.current.scrollTop = scrollerRef.current.scrollHeight
-  }, [messages, sending, streaming])
-
-  const handleSend = useCallback(async () => {
-    const text = draft.trim()
-    if (!text || sending || !online) return
+    let disposed = false
+    let handle = null
     setError(null)
-    setSending(true)
-    try {
-      let id = chatId
-      if (!id) {
-        id = await createChat()
-        if (!id) {
-          setSending(false)
-          return
-        }
-        setChatId(id)
-      }
-      // Optimistic append so the user sees their message immediately.
-      setMessages((prev) => [...prev, { role: 'user', content: text }])
-      setDraft('')
-      const r = await fetch(`/api/chats/${id}/messages`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text, hidden: false }),
-      })
-      if (!r.ok && r.status !== 202) {
-        setError(`Send failed (HTTP ${r.status}).`)
-      } else {
-        startPolling(id)
-      }
-    } catch (e) {
-      setError(e.message || 'Send failed.')
-    } finally {
-      setSending(false)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft, sending, online, chatId, token, appId])
 
-  const onKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
+    window.mobius.chat({
+      mount,
+      chatId: chatId === 'latex-chat' ? undefined : chatId,
+      title: 'LaTeX editor',
+      systemPrompt: bootstrapPrompt(appId),
+    }).then((nextHandle) => {
+      if (disposed) {
+        nextHandle.destroy()
+        return
+      }
+      handle = nextHandle
+      handle
+        .on('ready', ({ chatId: resolved }) => {
+          if (!resolved) return
+          setChatId(String(resolved))
+          storage.setJSON('chat_id.json', { id: String(resolved) }).catch(() => {})
+        })
+        .on('turn-done', () => { onFilesMaybeChanged() })
+        .on('error', ({ error: chatError }) => {
+          setError(chatError || 'Embedded chat reported an error.')
+        })
+    }).catch((e) => {
+      if (!disposed) setError(e.message || 'Could not mount embedded chat.')
+    })
+
+    return () => {
+      disposed = true
+      if (handle) handle.destroy()
     }
-  }
+  }, [appId, chatId, storage, onFilesMaybeChanged])
 
   return (
     <section className="chat-panel">
-      <div className="chat-scroll" ref={scrollerRef}>
-        {bootstrapping ? (
-          <div className="chat-note">Loading…</div>
-        ) : messages.length === 0 ? (
-          <div className="chat-note">
-            <b>Describe what you want to write.</b> The agent will create
-            <code> .tex </code> files in the file tree on the left. Try:
-            <ul>
-              <li>“Make a one-page CV for a software engineer”</li>
-              <li>“Add a section on the chain rule with two worked examples”</li>
-              <li>“Convert welcome.tex into a math cheat sheet”</li>
-            </ul>
-          </div>
-        ) : (
-          messages.map((m, i) => {
-            if (m.role === 'user') {
-              const txt = typeof m.content === 'string' ? m.content : ''
-              return (
-                <div className="chat-msg chat-msg--user" key={i}>
-                  <div className="chat-bubble">{txt}</div>
-                </div>
-              )
-            }
-            const txt = assistantPlainText(m)
-            if (!txt) return null
-            return (
-              <div className="chat-msg chat-msg--agent" key={i}>
-                <div className="chat-bubble">{txt}</div>
-              </div>
-            )
-          })
-        )}
-        {streaming && (
-          <div className="chat-msg chat-msg--agent">
-            <div className="chat-bubble chat-bubble--typing">
-              <span className="dot" /><span className="dot" /><span className="dot" />
-            </div>
-          </div>
-        )}
-        {error && <div className="chat-error">{error}</div>}
+      <div className="pane-head">
+        <span>Agent chat</span>
       </div>
-      <div className="chat-composer">
-        {!online && (
-          <div className="chat-offline" role="status" aria-live="polite">
-            Offline — replies resume when you reconnect. Your draft is saved.
-          </div>
-        )}
-        <div className="chat-input-row">
-          {/* The textarea stays enabled while offline so the user can
-              keep drafting; only Send is gated. The brief: drafts
-              should NOT be lost on an offline transition, so making
-              the input read-only would be the wrong shape. */}
-          <textarea
-            className="chat-input"
-            placeholder={online ? 'Describe your document…' : 'Type your message — sends when online'}
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={onKeyDown}
-            disabled={sending}
-            rows={2}
-          />
-          <button
-            className="chat-send"
-            onClick={handleSend}
-            disabled={!online || sending || !draft.trim()}
-            title={!online ? 'Reconnect to send' : undefined}
-          >
-            {sending ? '…' : 'Send'}
-          </button>
-        </div>
-      </div>
+      {error && <div className="chat-error">{error}</div>}
+      <div className="chat-embed" ref={mountRef} />
     </section>
   )
 }
@@ -1459,7 +1152,7 @@ export default function App({ appId, token }) {
   // reconnect (last-write-wins per path) and destroys files. Gating the
   // write — not just guarding after — makes that bad state unreachable.
   const [indexLoaded, setIndexLoaded] = useState(false)
-  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [navOpen, setNavOpen] = useState(false)
   // Restore the file the user was viewing last session so an offline
   // reload opens straight into their work-in-progress (assuming we
   // have its body cached — handled by the cache-first load below).
@@ -1467,6 +1160,8 @@ export default function App({ appId, token }) {
   const [fileContent, setFileContent] = useState('')
   const [fileLoading, setFileLoading] = useState(false)
   const [fileError, setFileError] = useState(null)
+  const [fileDirty, setFileDirty] = useState(false)
+  const [fileSaving, setFileSaving] = useState(false)
   // Outbox depth — surfaced by the SyncPill in the header. Refreshed
   // on every storage write (handled inline at each call site below)
   // and on a 10s background poll.
@@ -1503,58 +1198,8 @@ export default function App({ appId, token }) {
     refreshPending()
   }, [online, refreshPending])
 
-  // moebius:nav-back integration — when the drawer is open and the
-  // user swipes back / presses the device back button, the shell hands
-  // us the back-press. We close the drawer instead of dismissing the
-  // whole app. openDrawer / closeDrawer keep our state in lock-step
-  // with the shell's back-sentinel via the moebius:nav-push / nav-pop
-  // protocol (same shape prod's klix-filter and our app-store use).
-  useEffect(() => {
-    function onMessage(event) {
-      if (event.origin !== window.location.origin) return
-      if (event.data?.type === 'moebius:nav-back') {
-        setDrawerOpen(false)
-      }
-    }
-    window.addEventListener('message', onMessage)
-    return () => window.removeEventListener('message', onMessage)
-  }, [])
-
-  const openDrawer = useCallback(async () => {
-    const requestId = `np-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    try {
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          window.removeEventListener('message', onAck)
-          reject(new Error('nav-push timeout'))
-        }, 5000)
-        function onAck(event) {
-          if (event.origin !== window.location.origin) return
-          if (event.data?.requestId !== requestId) return
-          if (event.data.type === 'moebius:nav-push-ack') {
-            clearTimeout(timer); window.removeEventListener('message', onAck); resolve()
-          } else if (event.data.type === 'moebius:nav-push-rejected') {
-            clearTimeout(timer); window.removeEventListener('message', onAck); reject()
-          }
-        }
-        window.addEventListener('message', onAck)
-        window.parent.postMessage(
-          { type: 'moebius:nav-push', label: 'latex-files', requestId },
-          window.location.origin,
-        )
-      })
-    } catch {
-      // Older shell — open without the sentinel.
-    }
-    setDrawerOpen(true)
-  }, [])
-
-  const closeDrawer = useCallback(() => {
-    window.parent.postMessage(
-      { type: 'moebius:nav-pop' }, window.location.origin,
-    )
-    setDrawerOpen(false)
-  }, [])
+  const toggleNav = useCallback(() => setNavOpen((open) => !open), [])
+  const closeNav = useCallback(() => setNavOpen(false), [])
 
   // Pull the canonical file list out of files-index.json. Falls back
   // to ["files/welcome.tex"] when the index doesn't exist (older
@@ -1643,6 +1288,7 @@ export default function App({ appId, token }) {
       setFileContent('')
       setFileError(null)
       setFileLoading(false)
+      setFileDirty(false)
       return
     }
     const ext = selectedPath.split('.').pop().toLowerCase()
@@ -1650,6 +1296,7 @@ export default function App({ appId, token }) {
       setFileContent('')
       setFileLoading(false)
       setFileError(null)
+      setFileDirty(false)
       return
     }
     // Cache hit — paint synchronously. No background refetch: agent
@@ -1659,6 +1306,7 @@ export default function App({ appId, token }) {
       setFileContent(cachedBody)
       setFileError(null)
       setFileLoading(false)
+      setFileDirty(false)
       return
     }
     // Cache miss. Offline → show a friendly note rather than the
@@ -1668,6 +1316,7 @@ export default function App({ appId, token }) {
       setFileContent('')
       setFileError('Not available offline. Open this file once online to cache it.')
       setFileLoading(false)
+      setFileDirty(false)
       return
     }
     let cancelled = false
@@ -1680,6 +1329,7 @@ export default function App({ appId, token }) {
         // on the server (404). Drop any stale cache entry too.
         setFileError('File not found — was it deleted?')
         setFileContent('')
+        setFileDirty(false)
       } else {
         const body = typeof data === 'string'
           ? data
@@ -1688,6 +1338,7 @@ export default function App({ appId, token }) {
           : JSON.stringify(data, null, 2)
         setFileContent(body)
         setFileError(null)
+        setFileDirty(false)
         // Memoise for instant re-select + offline-reload survival.
         setFileCache((prev) => (prev[selectedPath] === body ? prev : { ...prev, [selectedPath]: body }))
       }
@@ -1696,6 +1347,7 @@ export default function App({ appId, token }) {
       if (!cancelled) {
         setFileError(e.message || 'Could not load file.')
         setFileLoading(false)
+        setFileDirty(false)
       }
     })
     return () => { cancelled = true }
@@ -1710,9 +1362,9 @@ export default function App({ appId, token }) {
   // (the agent in another chat, a sibling tool) show up. Also runs
   // a one-shot refresh whenever the user opens the drawer.
   useEffect(() => {
-    if (!drawerOpen) return
+    if (!navOpen) return
     refreshFiles()
-  }, [drawerOpen, refreshFiles])
+  }, [navOpen, refreshFiles])
 
   // After-turn refresh + re-fetch of selected file. The chat panel
   // pings this via onFilesMaybeChanged. Refetched contents land in
@@ -1725,9 +1377,11 @@ export default function App({ appId, token }) {
         const data = await storage.get(selectedPath)
         if (typeof data === 'string') {
           setFileContent(data)
+          setFileDirty(false)
           setFileCache((prev) => (prev[selectedPath] === data ? prev : { ...prev, [selectedPath]: data }))
         } else if (data == null) {
           setFileContent('')
+          setFileDirty(false)
           setFileCache((prev) => {
             if (!(selectedPath in prev)) return prev
             const next = { ...prev }
@@ -1788,12 +1442,12 @@ export default function App({ appId, token }) {
       // just created.
       setFileCache((prev) => ({ ...prev, [path]: '' }))
       setSelectedPath(path)
-      closeDrawer()
+      closeNav()
       refreshPending()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [files, storage, modal, closeDrawer, refreshPending, ensureIndexWritable])
+  }, [files, storage, modal, closeNav, refreshPending, ensureIndexWritable])
 
   const handleCreateFolder = useCallback(async () => {
     if (!(await ensureIndexWritable())) return
@@ -1857,6 +1511,64 @@ export default function App({ appId, token }) {
     }
   }, [files, selectedPath, storage, modal, refreshPending, ensureIndexWritable])
 
+  const selectedExt = selectedPath ? selectedPath.split('.').pop().toLowerCase() : ''
+  const selectedIsBinary = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(selectedExt)
+  const canEditSelected = !!selectedPath && !selectedIsBinary && !fileLoading && !fileError
+
+  const handleEditorChange = useCallback((value) => {
+    setFileContent(value)
+    setFileDirty(true)
+    if (selectedPath) {
+      setFileCache((prev) => ({ ...prev, [selectedPath]: value }))
+    }
+  }, [selectedPath])
+
+  const handleSaveFile = useCallback(async () => {
+    if (!selectedPath || selectedIsBinary || fileSaving) return
+    setFileSaving(true)
+    setFileError(null)
+    try {
+      await storage.setText(selectedPath, fileContent)
+      setFileDirty(false)
+      setFileCache((prev) => ({ ...prev, [selectedPath]: fileContent }))
+      refreshPending()
+    } catch (e) {
+      setFileError(e.message || 'Could not save file.')
+    } finally {
+      setFileSaving(false)
+    }
+  }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
+
+  function renderEditor() {
+    if (!selectedPath) {
+      return (
+        <div className="editor-empty">
+          <div className="editor-empty-title">No source selected</div>
+          <div className="editor-empty-body">Open the file tree or create a new file.</div>
+        </div>
+      )
+    }
+    if (selectedIsBinary) {
+      return (
+        <div className="editor-empty">
+          <div className="editor-empty-title">Binary preview</div>
+          <div className="editor-empty-body">{selectedPath}</div>
+        </div>
+      )
+    }
+    if (fileLoading) return <div className="preview-note">Loading source...</div>
+    if (fileError) return <div className="preview-note">{fileError}</div>
+    return (
+      <textarea
+        className="source-editor"
+        value={fileContent}
+        onChange={(e) => handleEditorChange(e.target.value)}
+        spellCheck={false}
+        aria-label={`Source for ${selectedPath}`}
+      />
+    )
+  }
+
   // Choose the preview renderer based on the file extension.
   function renderPreview() {
     if (!selectedPath) {
@@ -1870,7 +1582,7 @@ export default function App({ appId, token }) {
         </div>
       )
     }
-    const ext = selectedPath.split('.').pop().toLowerCase()
+    const ext = selectedExt
     if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) {
       return <ImagePreview storage={storage} path={selectedPath} />
     }
@@ -1890,29 +1602,34 @@ export default function App({ appId, token }) {
       <style>{CSS}</style>
       <header className="top-bar">
         <button
-          className="drawer-toggle"
-          onClick={openDrawer}
-          aria-label="Open file tree"
+          className="nav-toggle"
+          onClick={toggleNav}
+          aria-label={navOpen ? 'Close file tree' : 'Open file tree'}
+          aria-expanded={navOpen}
         >
           ☰
         </button>
         <div className="top-title">
+          <span className="app-title">LaTeX</span>
           {selectedPath
             ? <span className="top-path">{selectedPath}</span>
             : <span className="top-path top-path--muted">No file selected</span>}
         </div>
+        <div className="top-actions">
+          <button className="toolbar-btn" onClick={handleCreateFile} disabled={!indexLoaded}>New</button>
+          <button
+            className="toolbar-btn toolbar-btn--primary"
+            onClick={handleSaveFile}
+            disabled={!canEditSelected || !fileDirty || fileSaving}
+          >
+            {fileSaving ? 'Saving' : fileDirty ? 'Save' : 'Saved'}
+          </button>
+          <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
+        </div>
       </header>
-      <main className="preview-pane">{renderPreview()}</main>
-      <ChatPanel
-        appId={appId}
-        token={token}
-        storage={storage}
-        online={online}
-        onFilesMaybeChanged={onFilesMaybeChanged}
-      />
-      <FileDrawer
-        open={drawerOpen}
-        onClose={closeDrawer}
+      <FileNavPanel
+        open={navOpen}
+        onClose={closeNav}
         files={files}
         selectedPath={selectedPath}
         onSelect={setSelectedPath}
@@ -1921,7 +1638,25 @@ export default function App({ appId, token }) {
         onCreateFolder={handleCreateFolder}
         onDeleteFile={handleDeleteFile}
       />
-      <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
+      <main className="workspace">
+        <section className="editor-pane">
+          <div className="pane-head">
+            <span>Source</span>
+          </div>
+          <div className="pane-body">{renderEditor()}</div>
+        </section>
+        <section className="preview-pane">
+          <div className="pane-head">
+            <span>Preview</span>
+          </div>
+          <div className="pane-body preview-body">{renderPreview()}</div>
+        </section>
+        <ChatPanel
+          appId={appId}
+          storage={storage}
+          onFilesMaybeChanged={onFilesMaybeChanged}
+        />
+      </main>
       {modal.node}
     </div>
   )
@@ -1940,22 +1675,23 @@ const CSS = `
   flex-direction: column;
   height: 100%;
   width: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font);
+  background: var(--bg, #111614);
+  color: var(--text, #eef7f1);
+  font-family: var(--font, Inter, ui-sans-serif, system-ui, sans-serif);
   overflow: hidden;
 }
 
 .top-bar {
   flex: 0 0 auto;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
-  padding: 10px 14px;
+  padding: 8px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
-.drawer-toggle {
+.nav-toggle {
   flex: 0 0 auto;
   width: 44px;
   height: 44px;
@@ -1969,27 +1705,200 @@ const CSS = `
   align-items: center;
   justify-content: center;
 }
-.drawer-toggle:active { background: var(--surface2, var(--surface)); }
+.nav-toggle:active { background: var(--surface2); }
 .top-title {
-  flex: 1 1 auto;
+  min-width: 0;
+  text-align: center;
   font-size: 14px;
   font-weight: 600;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+.app-title {
+  display: block;
+  font-size: 15px;
+  color: var(--text);
+}
 .top-path { font-family: var(--font); }
 .top-path--muted { color: var(--muted); font-weight: 400; }
+.top-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+.toolbar-btn {
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: 600 13px/1 var(--font);
+  cursor: pointer;
+}
+.toolbar-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #062016;
+}
+.toolbar-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.file-nav-panel {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: start;
+  width: 100%;
+  max-height: 34vh;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-sizing: border-box;
+}
+.nav-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+}
+.nav-panel-title { font-size: 14px; font-weight: 700; }
+.nav-panel-close {
+  min-height: 36px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: 600 12px/1 var(--font);
+  cursor: pointer;
+}
+.nav-panel-actions {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.nav-panel-btn {
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: 600 13px/1.2 var(--font);
+  cursor: pointer;
+}
+.nav-panel-btn--danger { color: var(--accent); border-color: var(--accent); }
+.nav-panel-btn:disabled { opacity: 0.45; cursor: default; }
+.nav-panel-syncing,
+.nav-panel-empty {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.nav-panel-tree {
+  grid-column: 1 / -1;
+  min-height: 0;
+  max-height: 22vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 4px 0;
+}
+.nav-panel-foot {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr) minmax(300px, 0.9fr);
+  background: var(--bg);
+}
+.editor-pane,
+.preview-pane,
+.chat-panel {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.editor-pane,
+.preview-pane {
+  border-right: 1px solid var(--border);
+}
+.pane-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  font: 700 12px/1 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
 
 /* ---- preview pane ---- */
 .preview-pane {
-  flex: 0 0 40%;
-  min-height: 0;
+  overflow: hidden;
+}
+.preview-body {
+  padding: 18px 18px 24px;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 18px 18px 24px;
+}
+.source-editor {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 300px;
+  padding: 16px;
+  box-sizing: border-box;
+  resize: none;
+  border: 0;
+  outline: none;
   background: var(--bg);
-  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.source-editor:focus {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.editor-empty {
+  display: flex;
+  height: 100%;
+  min-height: 240px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  color: var(--muted);
+  text-align: center;
+}
+.editor-empty-title {
+  color: var(--text);
+  font-weight: 700;
 }
 
 .preview-empty {
@@ -2527,5 +2436,84 @@ const CSS = `
 }
 .sync-pill--offline .sync-pill-dot {
   background: var(--accent);
+}
+
+/* ---- final layout overrides ---- */
+.chat-panel {
+  flex: initial;
+  min-height: 300px;
+  overflow: hidden;
+  background: var(--surface);
+  border-top: 0;
+  border-left: 1px solid var(--border);
+}
+.chat-embed {
+  flex: 1 1 auto;
+  min-height: 300px;
+  overflow: auto;
+  background: var(--bg);
+}
+.chat-error {
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text);
+}
+.top-actions .sync-pill {
+  position: static;
+  right: auto;
+  bottom: auto;
+  z-index: auto;
+  box-shadow: none;
+  white-space: nowrap;
+}
+
+@media (max-width: 980px) {
+  .workspace {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+  .editor-pane,
+  .preview-pane,
+  .chat-panel {
+    min-height: 340px;
+    border-right: 0;
+    border-left: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .chat-panel,
+  .chat-embed {
+    min-height: 360px;
+  }
+  .file-nav-panel {
+    grid-template-columns: 1fr;
+    max-height: 42vh;
+  }
+  .nav-panel-actions {
+    flex-wrap: wrap;
+  }
+  .nav-panel-tree {
+    max-height: 24vh;
+  }
+}
+
+@media (max-width: 620px) {
+  .top-bar {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .top-actions {
+    grid-column: 1 / -1;
+    width: 100%;
+    justify-content: stretch;
+  }
+  .toolbar-btn {
+    flex: 1 1 0;
+  }
+  .top-actions .sync-pill {
+    margin-left: auto;
+  }
 }
 `
