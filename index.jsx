@@ -432,6 +432,9 @@ function FileNode({
         type="button"
         className={`tree-file ${selected ? 'tree-file--selected' : ''}`}
         style={{ paddingLeft: `${10 + depth * 16}px` }}
+        role="treeitem"
+        aria-level={depth + 1}
+        aria-selected={selected}
         onClick={() => onSelect(node.path)}
         // Draggable so a file can be dropped onto a folder (or the root) to
         // move it. dataTransfer carries the source path.
@@ -517,7 +520,19 @@ function FileNode({
         type="button"
         className={`tree-folder ${dropActive ? 'tree-drop-active' : ''}`}
         style={{ paddingLeft: `${10 + depth * 16}px` }}
+        role="treeitem"
+        aria-level={depth + 1}
+        aria-expanded={expanded}
         onClick={() => setExpanded((e) => !e)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowRight' && !expanded) {
+            e.preventDefault()
+            setExpanded(true)
+          } else if (e.key === 'ArrowLeft' && expanded) {
+            e.preventDefault()
+            setExpanded(false)
+          }
+        }}
         // Folders are drop targets for moves.
         onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropActive(true) }}
         onDragLeave={() => setDropActive(false)}
@@ -603,7 +618,10 @@ function FileNavPanel({
         aria-hidden={!open}
       >
         <div className="drawer-head">
-          <span className="drawer-title">Files</span>
+          <div>
+            <span className="drawer-title">Files</span>
+            <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
+          </div>
           <button className="drawer-close" onClick={onClose} aria-label="Close file tree">×</button>
         </div>
         <div className="drawer-actions">
@@ -654,7 +672,7 @@ function FileNavPanel({
             Loading your files… add, upload, and delete unlock once they sync.
           </div>
         )}
-        <div className="drawer-tree">
+        <div className="drawer-tree" role="tree" aria-label="Project files">
           {files.length === 0 ? (
             canMutate ? (
               <div className="drawer-empty">
@@ -694,10 +712,14 @@ function bootstrapPrompt(appId) {
     '',
     `Your working directory is /data/apps/${appId}/files/. Edit .tex files`,
     'there using the Edit and Write tools. The user describes documents in',
-    'prose; you translate that to LaTeX. Keep the user’s intent; do not',
-    'invent sections they did not ask for. After editing, summarise the',
-    'change in ONE short sentence — the embedded chat panel renders only',
-    'the last assistant message.',
+    'prose; you translate that to LaTeX. Your default action is to modify',
+    'the project files, not to solve the task only in chat. If the user asks',
+    'for a derivation, proof, rewrite, section, table, bibliography, or figure',
+    'that belongs in the document, write it into the current/main .tex file',
+    'unless they explicitly ask for a chat-only explanation. Keep the user’s',
+    'intent; do not invent sections they did not ask for. After editing,',
+    'summarise the change in ONE short sentence — the embedded chat panel',
+    'renders only the last assistant message.',
     '',
     `After creating or deleting a file, append/remove its path (relative to`,
     `/data/apps/${appId}/files/, e.g. "files/chapter1.tex") in the JSON`,
@@ -2569,7 +2591,14 @@ const CSS = `
   padding: 12px 14px;
   border-bottom: 1px solid var(--border);
 }
-.drawer-title { font-size: 16px; font-weight: 700; }
+	.drawer-title { display: block; font-size: 16px; font-weight: 700; }
+	.drawer-count {
+	  display: block;
+	  margin-top: 2px;
+	  color: var(--muted);
+	  font-size: 11px;
+	  font-weight: 600;
+	}
 .drawer-close {
   width: 44px;
   height: 44px;
@@ -2622,7 +2651,7 @@ const CSS = `
   color: var(--muted);
   line-height: 1.5;
 }
-.tree-file, .tree-folder {
+	.tree-file, .tree-folder {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2635,15 +2664,25 @@ const CSS = `
   color: var(--text);
   cursor: pointer;
   font-size: 14px;
-  font-family: var(--font);
-}
+	  font-family: var(--font);
+	  outline: none;
+	}
+	.tree-file:hover, .tree-folder:hover {
+	  background: color-mix(in srgb, var(--accent) 8%, transparent);
+	}
+	.tree-file:focus-visible, .tree-folder:focus-visible {
+	  box-shadow: inset 3px 0 0 var(--accent);
+	  background: color-mix(in srgb, var(--accent) 10%, transparent);
+	}
 .tree-file:active, .tree-folder:active {
   background: var(--surface2, var(--bg));
 }
-.tree-file--selected {
-  background: var(--accent);
-  color: #fff;
-}
+	.tree-file--selected {
+	  background: color-mix(in srgb, var(--accent) 22%, var(--surface));
+	  color: var(--text);
+	  box-shadow: inset 3px 0 0 var(--accent);
+	}
+	.tree-file--selected .tree-icon { color: var(--accent); }
 .tree-main-badge {
   margin-left: auto;
   flex: 0 0 auto;
@@ -2656,11 +2695,11 @@ const CSS = `
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
 }
-.tree-file--selected .tree-main-badge {
-  color: #fff;
-  background: rgba(255, 255, 255, 0.22);
-  border-color: rgba(255, 255, 255, 0.4);
-}
+	.tree-file--selected .tree-main-badge {
+	  color: var(--accent);
+	  background: color-mix(in srgb, var(--accent) 18%, transparent);
+	  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+	}
 .tree-file[draggable="true"] { cursor: grab; }
 /* Drop-target highlight while a drag hovers a folder or the root. */
 .tree-drop-active {
