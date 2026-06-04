@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdir, rm } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { execFile } from 'node:child_process'
@@ -65,4 +66,21 @@ test('path guards accept only safe paths inside files/', async () => {
   assert.deepEqual(snapshot.index, ['files/a.tex', 'files/z.tex'])
   assert.deepEqual(snapshot.contents, { 'files/a.tex': 'a', 'files/z.tex': 'z' })
   assert.equal(snapshot.lastPath, null)
+})
+
+test('file tree keeps an accessible composite keyboard contract', () => {
+  const source = readFileSync(join(root, '..', 'index.jsx'), 'utf8')
+
+  assert.match(source, /role="tree"/)
+  assert.match(source, /role="treeitem"/)
+  assert.match(source, /role="group"/)
+  assert.match(source, /tabIndex=\{0\}/)
+  assert.match(source, /tabIndex=\{-1\}/)
+  assert.match(source, /data-tree-path=/)
+  assert.match(source, /data-parent-path=/)
+  assert.match(source, /focusSelectedOrFirst/)
+  assert.match(source, /returnFocusRef/)
+  for (const key of ['ArrowDown', 'ArrowUp', 'Home', 'End', 'ArrowRight', 'ArrowLeft']) {
+    assert.match(source, new RegExp(`event\\.key === '${key}'|e\\.key === '${key}'`))
+  }
 })

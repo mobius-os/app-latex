@@ -416,7 +416,7 @@ function useLongPress(onLongPress) {
 
 function FileNode({
   node, selectedPath, onSelect, depth,
-  onContextMenu, onMoveInto, mainPath,
+  onContextMenu, onMoveInto, mainPath, parentPath = '',
 }) {
   const [expanded, setExpanded] = useState(true)
   const [dropActive, setDropActive] = useState(false)
@@ -435,6 +435,10 @@ function FileNode({
         role="treeitem"
         aria-level={depth + 1}
         aria-selected={selected}
+        tabIndex={-1}
+        data-tree-path={node.path}
+        data-parent-path={parentPath}
+        data-tree-kind="file"
         onClick={() => onSelect(node.path)}
         // Draggable so a file can be dropped onto a folder (or the root) to
         // move it. dataTransfer carries the source path.
@@ -509,6 +513,7 @@ function FileNode({
             onContextMenu={onContextMenu}
             onMoveInto={onMoveInto}
             mainPath={mainPath}
+            parentPath=""
           />
         ))}
       </div>
@@ -523,6 +528,10 @@ function FileNode({
         role="treeitem"
         aria-level={depth + 1}
         aria-expanded={expanded}
+        tabIndex={-1}
+        data-tree-path={node.path}
+        data-parent-path={parentPath}
+        data-tree-kind="folder"
         onClick={() => setExpanded((e) => !e)}
         onKeyDown={(e) => {
           if (e.key === 'ArrowRight' && !expanded) {
@@ -546,18 +555,23 @@ function FileNode({
         <span className="tree-icon">{expanded ? '▾' : '▸'}</span>
         <span className="tree-name">{node.name}/</span>
       </button>
-      {expanded && sortedChildren.map((c) => (
-        <FileNode
-          key={c.path}
-          node={c}
-          selectedPath={selectedPath}
-          onSelect={onSelect}
-          depth={depth + 1}
-          onContextMenu={onContextMenu}
-          onMoveInto={onMoveInto}
-          mainPath={mainPath}
-        />
-      ))}
+      {expanded && (
+        <div role="group" className="tree-group">
+          {sortedChildren.map((c) => (
+            <FileNode
+              key={c.path}
+              node={c}
+              selectedPath={selectedPath}
+              onSelect={onSelect}
+              depth={depth + 1}
+              onContextMenu={onContextMenu}
+              onMoveInto={onMoveInto}
+              mainPath={mainPath}
+              parentPath={node.path}
+            />
+          ))}
+        </div>
+      )}
     </>
   )
 }
@@ -576,9 +590,11 @@ function FileNode({
 function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
-  onUpload, onMove, onRename, mainPath, onSetMain,
+  onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
 }) {
   const root = useMemo(() => buildTree(files), [files])
+  const treeRef = useRef(null)
+  const prevOpenRef = useRef(open)
   // Hidden inputs the Upload buttons click programmatically. Two separate
   // inputs because `webkitdirectory` and a plain multi-file picker can't share
   // one element — the directory flag turns the whole picker into folder mode.
@@ -589,6 +605,83 @@ function FileNavPanel({
   const closeCtx = useCallback(() => setCtx(null), [])
   // Close the menu when the drawer closes so it can't outlive its anchor.
   useEffect(() => { if (!open) setCtx(null) }, [open])
+
+  const treeItems = useCallback(() => {
+    if (!treeRef.current) return []
+    return Array.from(treeRef.current.querySelectorAll('[role="treeitem"]'))
+  }, [])
+
+  const focusTreeItem = useCallback((item) => {
+    if (item && typeof item.focus === 'function') item.focus()
+  }, [])
+
+  const focusSelectedOrFirst = useCallback(() => {
+    const items = treeItems()
+    if (items.length === 0) return
+    const selected = selectedPath
+      ? items.find((item) => item.getAttribute('data-tree-path') === selectedPath)
+      : null
+    focusTreeItem(selected || items[0])
+  }, [focusTreeItem, selectedPath, treeItems])
+
+  useEffect(() => {
+    const wasOpen = prevOpenRef.current
+    prevOpenRef.current = open
+    if (open && !wasOpen) {
+      const raf = requestAnimationFrame(focusSelectedOrFirst)
+      return () => cancelAnimationFrame(raf)
+    }
+    if (!open && wasOpen) {
+      returnFocusRef?.current?.focus?.()
+    }
+  }, [focusSelectedOrFirst, open, returnFocusRef])
+
+  const handleTreeFocus = useCallback((event) => {
+    if (event.target === treeRef.current) focusSelectedOrFirst()
+  }, [focusSelectedOrFirst])
+
+  const handleTreeKeyDown = useCallback((event) => {
+    if (event.defaultPrevented) return
+    const current = event.target.closest?.('[role="treeitem"]')
+    if (!current || !treeRef.current?.contains(current)) return
+    const items = treeItems()
+    const index = items.indexOf(current)
+    if (index < 0) return
+
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      focusTreeItem(items[Math.min(index + 1, items.length - 1)])
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      focusTreeItem(items[Math.max(index - 1, 0)])
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      focusTreeItem(items[0])
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      focusTreeItem(items[items.length - 1])
+    } else if (event.key === 'ArrowRight') {
+      if (current.getAttribute('aria-expanded') === 'true') {
+        const level = Number(current.getAttribute('aria-level') || '0')
+        const child = items.slice(index + 1).find((item) => (
+          Number(item.getAttribute('aria-level') || '0') > level
+        ))
+        if (child) {
+          event.preventDefault()
+          focusTreeItem(child)
+        }
+      }
+    } else if (event.key === 'ArrowLeft') {
+      const parentPath = current.getAttribute('data-parent-path')
+      if (parentPath) {
+        const parent = items.find((item) => item.getAttribute('data-tree-path') === parentPath)
+        if (parent) {
+          event.preventDefault()
+          focusTreeItem(parent)
+        }
+      }
+    }
+  }, [focusTreeItem, treeItems])
 
   // Context actions. A .tex file additionally offers "Set as main
   // document" (unless it already is the main) so the user can pick which
@@ -672,7 +765,15 @@ function FileNavPanel({
             Loading your files… add, upload, and delete unlock once they sync.
           </div>
         )}
-        <div className="drawer-tree" role="tree" aria-label="Project files">
+        <div
+          ref={treeRef}
+          className="drawer-tree"
+          role="tree"
+          aria-label="Project files"
+          tabIndex={0}
+          onFocus={handleTreeFocus}
+          onKeyDown={handleTreeKeyDown}
+        >
           {files.length === 0 ? (
             canMutate ? (
               <div className="drawer-empty">
@@ -1370,6 +1471,7 @@ export default function App({ appId, token }) {
   // write — not just guarding after — makes that bad state unreachable.
   const [indexLoaded, setIndexLoaded] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
+  const navToggleRef = useRef(null)
   // Restore the file the user was viewing last session so an offline
   // reload opens straight into their work-in-progress (assuming we
   // have its body cached — handled by the cache-first load below).
@@ -2226,6 +2328,7 @@ export default function App({ appId, token }) {
       <style>{CSS}</style>
       <header className="top-bar">
         <button
+          ref={navToggleRef}
           className="nav-toggle"
           onClick={toggleNav}
           aria-label={navOpen ? 'Close file drawer' : 'Open file drawer'}
@@ -2293,6 +2396,7 @@ export default function App({ appId, token }) {
           onRename={handleRename}
           mainPath={mainPath}
           onSetMain={handleSetMain}
+          returnFocusRef={navToggleRef}
         />
         <main className="content">{renderMain()}</main>
         <ChatPanel
@@ -2709,6 +2813,9 @@ const CSS = `
 }
 .tree-root {
   min-height: 40px;
+}
+.tree-group {
+  display: block;
 }
 
 /* In-app context menu (right-click / long-press). position: fixed so its
