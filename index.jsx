@@ -29,6 +29,22 @@ export function isSafeStoragePath(path) {
     && isSafeRelPath(path.slice('files/'.length))
 }
 
+const BINARY_FILE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'])
+
+function extensionFor(path) {
+  return String(path || '').split('.').pop().toLowerCase()
+}
+
+function isBinaryProjectPath(path) {
+  return BINARY_FILE_EXTS.has(extensionFor(path))
+}
+
+function isTextProjectPath(path) {
+  return isSafeStoragePath(path)
+    && !path.endsWith('/.keep')
+    && !isBinaryProjectPath(path)
+}
+
 export function pdfPathForTexDoc(path) {
   if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return null
   return `${path.slice(0, -'.tex'.length)}.pdf`
@@ -130,6 +146,21 @@ function makeStorage(appId, token) {
     if (ct.includes('application/json')) return r.json()
     return r.text()
   }
+  async function getFresh(path) {
+    // Direct server read. The runtime getter is cache-first for offline
+    // work, which is exactly what we want during normal editing, but a
+    // server-side agent can update the same file behind that mirror. This
+    // path asks the backend for the canonical bytes so the editor and the
+    // file on disk converge while online.
+    const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (r.status === 404) return null
+    if (!r.ok) throw new Error(`get ${path} → ${r.status}`)
+    const ct = r.headers.get('content-type') || ''
+    if (ct.includes('application/json')) return r.json()
+    return r.text()
+  }
   async function getBlob(path) {
     if (ms && typeof ms.getBlob === 'function') return ms.getBlob(path)
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
@@ -189,7 +220,17 @@ function makeStorage(appId, token) {
     }
     return 0
   }
-  return { get, getBlob, setText, setBlob, setJSON, remove, pendingCount, hasRuntime }
+  function subscribeText(path, cb) {
+    if (ms && typeof ms.subscribeText === 'function') return ms.subscribeText(path, cb)
+    return () => {}
+  }
+  return {
+    get, getFresh, getBlob,
+    setText, setBlob, setJSON, remove,
+    subscribeText,
+    pendingCount,
+    hasRuntime,
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -1330,6 +1371,9 @@ function SyncPill({ online, pending, hasRuntime }) {
 // ----------------------------------------------------------------------
 const BUILD_POLL_MS = 2000
 const BUILD_TIMEOUT_MS = 120000
+const SOURCE_AUTOSAVE_MS = 700
+const SOURCE_SYNC_MS = 3500
+const PROJECT_SYNC_MS = 5000
 
 function useBuild({ appId, token, storage, online }) {
   const [buildStatus, setBuildStatus] = useState('idle') // idle|building|done|error
@@ -1566,6 +1610,12 @@ export default function App({ appId, token }) {
   const [fileError, setFileError] = useState(null)
   const [fileDirty, setFileDirty] = useState(false)
   const [fileSaving, setFileSaving] = useState(false)
+  const fileContentRef = useRef(fileContent)
+  const fileDirtyRef = useRef(fileDirty)
+  const fileSavingRef = useRef(fileSaving)
+  useEffect(() => { fileContentRef.current = fileContent }, [fileContent])
+  useEffect(() => { fileDirtyRef.current = fileDirty }, [fileDirty])
+  useEffect(() => { fileSavingRef.current = fileSaving }, [fileSaving])
   // Outbox depth — surfaced by the SyncPill in the header. Refreshed
   // on every storage write (handled inline at each call site below)
   // and on a 10s background poll.
@@ -1585,6 +1635,7 @@ export default function App({ appId, token }) {
   const mainPathRef = useRef(null)
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
   const build = useBuild({ appId, token, storage, online })
+  const seenBuildStatusRef = useRef('')
 
   useEffect(() => {
     if (typeof localStorage === 'undefined') return
@@ -1711,10 +1762,11 @@ export default function App({ appId, token }) {
   // the tree.
   const refreshFiles = useCallback(async () => {
     try {
-      const idx = await storage.get('files-index.json')
+      const idx = await (online ? storage.getFresh('files-index.json') : storage.get('files-index.json'))
       if (Array.isArray(idx)) {
         // De-dup + sort for stable rendering.
         const cleaned = cleanIndexPaths(idx)
+        filesRef.current = cleaned
         setFiles(cleaned)
         // The list now reflects the server — UI writes to the index are
         // safe (they'll extend/trim a known-good list, not clobber it).
@@ -1743,9 +1795,10 @@ export default function App({ appId, token }) {
         // re-seed when online; offline we'd just queue a write that
         // collides with whatever lands first when we reconnect.
         if (!online) return
-        const probe = await storage.get('files/welcome.tex')
+        const probe = await (online ? storage.getFresh('files/welcome.tex') : storage.get('files/welcome.tex'))
         const seed = probe ? ['files/welcome.tex'] : []
         await storage.setJSON('files-index.json', seed)
+        filesRef.current = seed
         setFiles(seed)
         // We just wrote the index to the server online, so `files` is
         // now authoritative — UI writes are safe from here.
@@ -1769,7 +1822,9 @@ export default function App({ appId, token }) {
   // happen to live inside folders.
   useEffect(() => {
     if (!selectedPath && files.length > 0) {
-      const firstReal = files.find((p) => !p.endsWith('/.keep'))
+      const firstReal = files.find((p) => p.endsWith('.tex'))
+        || files.find((p) => isTextProjectPath(p))
+        || files.find((p) => !p.endsWith('/.keep'))
       if (firstReal) setSelectedPath(firstReal)
     }
   }, [files, selectedPath])
@@ -1801,7 +1856,7 @@ export default function App({ appId, token }) {
     ;(async () => {
       let stored = null
       try {
-        const m = await storage.get('main.json')
+        const m = await (online ? storage.getFresh('main.json') : storage.get('main.json'))
         if (m && typeof m === 'object' && typeof m.path === 'string') stored = m.path
       } catch { /* offline / transient — fall through to default */ }
       if (cancelled) return
@@ -1856,7 +1911,7 @@ export default function App({ appId, token }) {
     ;(async () => {
       let pdfPath = null
       try {
-        const status = await storage.get('build/status.json')
+        const status = await (online ? storage.getFresh('build/status.json') : storage.get('build/status.json'))
         if (cancelled) return
         pdfPath = pdfFromBuildStatusForDoc(status, mainPath)
       } catch {
@@ -1892,7 +1947,72 @@ export default function App({ appId, token }) {
     build.buildStatus,
     build.pdfByDoc,
     build.rememberPdf,
+    online,
   ])
+
+  const syncProjectFromStorage = useCallback(async () => {
+    if (!online) return
+    await refreshFiles()
+    const list = filesRef.current
+
+    try {
+      const stored = await storage.getFresh('main.json')
+      if (stored && typeof stored === 'object' && typeof stored.path === 'string') {
+        if (stored.path !== mainPathRef.current && list.includes(stored.path)) {
+          setMainPath(stored.path)
+        }
+      }
+    } catch {
+      // Best-effort convergence; the next loop/focus retries.
+    }
+
+    try {
+      const status = await storage.getFresh('build/status.json')
+      const doc = (status && typeof status.target === 'string')
+        ? status.target
+        : mainPathRef.current
+      const pdf = pdfFromBuildStatusForDoc(status, doc)
+      if (doc && pdf) {
+        const buildKey = `${doc}|${pdf}|${status?.built_at || status?.log || ''}`
+        if (seenBuildStatusRef.current !== buildKey) {
+          seenBuildStatusRef.current = buildKey
+          build.rememberPdf(doc, pdf)
+        }
+        if (indexLoaded && !filesRef.current.includes(pdf)) {
+          const next = cleanIndexPaths([...filesRef.current, pdf])
+          filesRef.current = next
+          await storage.setJSON('files-index.json', next)
+          setFiles(next)
+          refreshPending()
+        }
+      }
+    } catch {
+      // Best-effort; a missing status file just means no successful build yet.
+    }
+  }, [
+    online,
+    refreshFiles,
+    storage,
+    build.rememberPdf,
+    indexLoaded,
+    refreshPending,
+  ])
+
+  useEffect(() => {
+    if (!online) return undefined
+    syncProjectFromStorage()
+    const interval = setInterval(syncProjectFromStorage, PROJECT_SYNC_MS)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') syncProjectFromStorage()
+    }
+    window.addEventListener('focus', syncProjectFromStorage)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('focus', syncProjectFromStorage)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [online, syncProjectFromStorage])
 
   // Set a .tex as the main document (from the drawer context menu).
   // Persists immediately so Build + reload agree on the target.
@@ -1907,13 +2027,12 @@ export default function App({ appId, token }) {
     }
   }, [storage, refreshPending, modal])
 
-  // Load the selected file's content. Cache-first: if the body lives
-  // in fileCache we paint it from state without fetching. Selection
-  // alone doesn't trigger a re-fetch — agent edits propagate via
-  // `onFilesMaybeChanged` after every chat turn, which is the only
-  // place a server-side change can come from in this app. That keeps
-  // file switching instant (no flicker) and means offline reselect
-  // never blanks a file the user just had open.
+  // Load the selected file's content. Cache-first for first paint, then
+  // stale-while-revalidate while online: the editor starts from the
+  // local mirror/localStorage snapshot, subscribes to runtime revalidation
+  // updates, and periodically asks storage to revalidate the active path.
+  // Direct user edits autosave below, so the editor buffer and storage file
+  // converge from both directions without a page reload.
   //
   // For binary previews (images, PDF) the dedicated component does
   // its own blob fetch; we just clear textual state and let it render.
@@ -1925,66 +2044,104 @@ export default function App({ appId, token }) {
       setFileDirty(false)
       return
     }
-    const ext = selectedPath.split('.').pop().toLowerCase()
-    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(ext)) {
+    if (isBinaryProjectPath(selectedPath)) {
       setFileContent('')
       setFileLoading(false)
       setFileError(null)
       setFileDirty(false)
       return
     }
-    // Cache hit — paint synchronously. No background refetch: agent
-    // edits land via onFilesMaybeChanged, the only other writer.
+    let cancelled = false
+    const path = selectedPath
+
+    const applyBody = (body) => {
+      if (cancelled || selectedPathRef.current !== path) return
+      // The user is actively editing this file. Keep their draft; the
+      // debounced autosave below owns the next write to storage.
+      if (fileDirtyRef.current || fileSavingRef.current) return
+      setFileContent(body)
+      setFileError(null)
+      setFileDirty(false)
+      setFileCache((prev) => (prev[path] === body ? prev : { ...prev, [path]: body }))
+    }
+
+    const applyMissing = () => {
+      if (cancelled || selectedPathRef.current !== path) return
+      if (fileDirtyRef.current || fileSavingRef.current) return
+      setFileContent('')
+      setFileError('File not found — was it deleted?')
+      setFileDirty(false)
+      setFileCache((prev) => {
+        if (!(path in prev)) return prev
+        const next = { ...prev }
+        delete next[path]
+        return next
+      })
+    }
+
+    const unsubscribe = storage.subscribeText(path, (body) => {
+      if (typeof body === 'string') applyBody(body)
+      else if (body == null) applyMissing()
+    })
+
+    // Cache hit — paint synchronously, then revalidate while online.
     const cachedBody = fileCache[selectedPath]
+    let painted = typeof cachedBody === 'string'
     if (typeof cachedBody === 'string') {
       setFileContent(cachedBody)
       setFileError(null)
       setFileLoading(false)
       setFileDirty(false)
-      return
     }
+
     // Cache miss. Offline → show a friendly note rather than the
     // "File not found" misnomer the old code used when storage.get
     // returned null offline. Online → fetch + memoise.
-    if (!online) {
+    if (!online && typeof cachedBody !== 'string') {
       setFileContent('')
       setFileError('Not available offline. Open this file once online to cache it.')
       setFileLoading(false)
       setFileDirty(false)
-      return
     }
-    let cancelled = false
-    setFileLoading(true)
-    setFileError(null)
-    storage.get(selectedPath).then((data) => {
-      if (cancelled) return
-      if (data == null) {
-        // Online + null body means the file genuinely doesn't exist
-        // on the server (404). Drop any stale cache entry too.
-        setFileError('File not found — was it deleted?')
-        setFileContent('')
-        setFileDirty(false)
-      } else {
-        const body = typeof data === 'string'
-          ? data
-          // JSON came back as an object — stringify so the preview
-          // shows something legible.
-          : JSON.stringify(data, null, 2)
-        setFileContent(body)
-        setFileError(null)
-        setFileDirty(false)
-        // Memoise for instant re-select + offline-reload survival.
-        setFileCache((prev) => (prev[selectedPath] === body ? prev : { ...prev, [selectedPath]: body }))
-      }
-      setFileLoading(false)
-    }).catch((e) => {
-      if (!cancelled) {
-        setFileError(e.message || 'Could not load file.')
+
+    const readLatest = () => {
+      if (!online) return
+      if (fileDirtyRef.current || fileSavingRef.current) return
+      if (!painted) setFileLoading(true)
+      setFileError(null)
+      storage.get(path).then((data) => {
+        if (cancelled) return
+        if (data == null) applyMissing()
+        else if (typeof data === 'string') applyBody(data)
+        else applyBody(JSON.stringify(data, null, 2))
+        painted = true
         setFileLoading(false)
-        setFileDirty(false)
-      }
-    })
-    return () => { cancelled = true }
+      }).catch((e) => {
+        if (!cancelled) {
+          setFileError(e.message || 'Could not load file.')
+          setFileLoading(false)
+          setFileDirty(false)
+        }
+      })
+    }
+
+    readLatest()
+    const interval = online
+      ? setInterval(() => { readLatest() }, SOURCE_SYNC_MS)
+      : null
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') readLatest()
+    }
+    window.addEventListener('focus', readLatest)
+    document.addEventListener('visibilitychange', onVisible)
+
+    return () => {
+      cancelled = true
+      if (interval) clearInterval(interval)
+      window.removeEventListener('focus', readLatest)
+      document.removeEventListener('visibilitychange', onVisible)
+      unsubscribe()
+    }
     // fileCache is intentionally omitted: we read it inside the
     // effect, but reacting to its mutations would refire on every
     // memoise and double-fetch. Selection + connectivity are the
@@ -2001,33 +2158,19 @@ export default function App({ appId, token }) {
   }, [navOpen, refreshFiles])
 
   // After-turn refresh + re-fetch of selected file. The chat panel
-  // pings this via onFilesMaybeChanged. Refetched contents land in
-  // both `fileContent` (what's painted now) and `fileCache` (what an
-  // offline reload paints) so the agent's edits survive a refresh.
+  // pings this via onFilesMaybeChanged. The app no longer relies on
+  // this event for correctness (the source pane and project metadata
+  // sync independently while online), but it is a useful immediate nudge
+  // after a known server-side edit.
   const onFilesMaybeChanged = useCallback(async () => {
-    await refreshFiles()
-    if (selectedPath && online) {
-      try {
-        const data = await storage.get(selectedPath)
-        if (typeof data === 'string') {
-          setFileContent(data)
-          setFileDirty(false)
-          setFileCache((prev) => (prev[selectedPath] === data ? prev : { ...prev, [selectedPath]: data }))
-        } else if (data == null) {
-          setFileContent('')
-          setFileDirty(false)
-          setFileCache((prev) => {
-            if (!(selectedPath in prev)) return prev
-            const next = { ...prev }
-            delete next[selectedPath]
-            return next
-          })
-        }
-      } catch (e) {
-        // Silent — selectedPath useEffect will retry on next select.
-      }
+    await syncProjectFromStorage()
+    const path = selectedPathRef.current
+    if (path && online && isTextProjectPath(path)) {
+      // Cache-first read schedules the runtime's online revalidation; the
+      // selected-file subscription applies the fresh value when it arrives.
+      storage.get(path).catch(() => {})
     }
-  }, [refreshFiles, selectedPath, storage, online])
+  }, [syncProjectFromStorage, storage, online])
 
   // Gate every UI write to files-index.json. Until we've confirmed the
   // index against the server (indexLoaded), `files` may be a stale or
@@ -2357,8 +2500,8 @@ export default function App({ appId, token }) {
     }
   }, [appId, token, storage, modal, refreshPending, ensureIndexWritable, build])
 
-  const selectedExt = selectedPath ? selectedPath.split('.').pop().toLowerCase() : ''
-  const selectedIsBinary = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'pdf'].includes(selectedExt)
+  const selectedExt = selectedPath ? extensionFor(selectedPath) : ''
+  const selectedIsBinary = selectedPath ? isBinaryProjectPath(selectedPath) : false
   const canEditSelected = !!selectedPath && !selectedIsBinary && !fileLoading && !fileError
   const selectedIsTex = selectedExt === 'tex'
   // Whether there is a compilable main document. The [Source | PDF] toggle
@@ -2415,6 +2558,36 @@ export default function App({ appId, token }) {
       setFileCache((prev) => ({ ...prev, [selectedPath]: value }))
     }
   }, [selectedPath])
+
+  useEffect(() => {
+    if (!selectedPath || selectedIsBinary || !fileDirty) return undefined
+    const path = selectedPath
+    const body = fileContent
+    const timer = setTimeout(() => {
+      if (selectedPathRef.current !== path) return
+      setFileSaving(true)
+      storage.setText(path, body).then(() => {
+        if (selectedPathRef.current !== path) return
+        setFileCache((prev) => ({ ...prev, [path]: body }))
+        if (fileContentRef.current === body) setFileDirty(false)
+        refreshPending()
+      }).catch((e) => {
+        if (selectedPathRef.current === path) {
+          setFileError(e.message || 'Could not save file.')
+        }
+      }).finally(() => {
+        if (selectedPathRef.current === path) setFileSaving(false)
+      })
+    }, SOURCE_AUTOSAVE_MS)
+    return () => clearTimeout(timer)
+  }, [
+    selectedPath,
+    selectedIsBinary,
+    fileDirty,
+    fileContent,
+    storage,
+    refreshPending,
+  ])
 
   const handleSaveFile = useCallback(async () => {
     if (!selectedPath || selectedIsBinary || fileSaving) return
