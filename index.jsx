@@ -29,6 +29,20 @@ export function isSafeStoragePath(path) {
     && isSafeRelPath(path.slice('files/'.length))
 }
 
+export function pdfPathForTexDoc(path) {
+  if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return null
+  return `${path.slice(0, -'.tex'.length)}.pdf`
+}
+
+export function pdfFromBuildStatusForDoc(status, doc) {
+  if (!status || typeof status !== 'object') return null
+  if (status.status !== 'done') return null
+  if (!isSafeStoragePath(doc) || !doc.endsWith('.tex')) return null
+  if (status.target && status.target !== doc) return null
+  if (!isSafeStoragePath(status.pdf) || !status.pdf.endsWith('.pdf')) return null
+  return status.pdf
+}
+
 function cleanIndexPaths(paths) {
   return [...new Set((paths || []).filter(isSafeStoragePath))].sort()
 }
@@ -455,7 +469,7 @@ function FileNode({
       >
         <span className="tree-icon">{fileIcon(node.name)}</span>
         <span className="tree-name">{node.name}</span>
-        {isMain && <span className="tree-main-badge" title="Build compiles this file">main</span>}
+        {isMain && <span className="tree-main-badge" title="Build compiles this file">target</span>}
       </button>
     )
   }
@@ -715,7 +729,6 @@ function FileNavPanel({
             <span className="drawer-title">Files</span>
             <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
           </div>
-          <button className="drawer-close" onClick={onClose} aria-label="Close file tree">×</button>
         </div>
         <div className="drawer-actions">
           <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>New file</button>
@@ -840,6 +853,14 @@ function bootstrapPrompt(appId) {
     'to point at it (and keep its value to an existing .tex). The user can',
     'also set it from the file drawer.',
     '',
+    'To build manually after edits: write the main document path (for',
+    `example "files/welcome.tex") to /data/apps/${appId}/build/target.txt,`,
+    `then call: curl -sS -X POST -H "Authorization: Bearer $AGENT_TOKEN"`,
+    `"$API_BASE_URL/api/apps/${appId}/run-job". Poll or read`,
+    `/data/apps/${appId}/build/status.json for {"status":"done","pdf":...}`,
+    'or {"status":"error","log":...}. Report build errors briefly and fix',
+    'the .tex when the error is actionable.',
+    '',
     'This is a silent setup brief — do NOT reply to it. Wait for the',
     'user’s first message and act on that.',
   ].join('\n')
@@ -854,19 +875,32 @@ function bootstrapPrompt(appId) {
 // (POST /api/app-chats, the same Bearer token makeStorage holds) and mount the
 // embed with that real id. The chat is app-attributed, so it stays out of the
 // owner's drawer history but the embed can still stream it.
-async function createAppChat(appId, token) {
+async function createAppChat(appId, token, systemPrompt) {
   const r = await fetch('/api/app-chats', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ title: 'LaTeX editor' }),
+    body: JSON.stringify({ title: 'LaTeX editor', system_prompt: systemPrompt }),
   })
   if (!r.ok) throw new Error(`create chat → ${r.status}`)
   const data = await r.json()
   if (!data || !data.id) throw new Error('create chat returned no id')
   return String(data.id)
+}
+
+async function updateAppChatPrompt(chatId, token, systemPrompt) {
+  if (!chatId) return
+  const r = await fetch(`/api/app-chats/${encodeURIComponent(chatId)}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ system_prompt: systemPrompt }),
+  })
+  if (!r.ok) throw new Error(`update chat prompt → ${r.status}`)
 }
 
 function ChatPanel({
@@ -886,6 +920,7 @@ function ChatPanel({
   // streaming turn mid-flight. The turn-done handler reads the ref instead.
   const onFilesRef = useRef(onFilesMaybeChanged)
   useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
+  const systemPrompt = useMemo(() => bootstrapPrompt(appId), [appId])
 
   // Resolve a real chat id before mounting the embed: read chat_id.json, and
   // if absent create one ourselves and persist it. A create failure surfaces
@@ -897,7 +932,9 @@ function ChatPanel({
         const saved = await storage.get('chat_id.json')
         if (cancelled) return
         if (saved && saved.id) {
-          setChatId(String(saved.id))
+          const id = String(saved.id)
+          updateAppChatPrompt(id, token, systemPrompt).catch(() => {})
+          setChatId(id)
           return
         }
       } catch (e) {
@@ -905,7 +942,7 @@ function ChatPanel({
         // that also fails the catch surfaces the error.
       }
       try {
-        const id = await createAppChat(appId, token)
+        const id = await createAppChat(appId, token, systemPrompt)
         if (cancelled) return
         setChatId(id)
         storage.setJSON('chat_id.json', { id }).catch(() => {})
@@ -920,7 +957,7 @@ function ChatPanel({
       }
     })()
     return () => { cancelled = true }
-  }, [appId, token, storage])
+  }, [appId, token, storage, systemPrompt])
 
   useEffect(() => {
     const mount = mountRef.current
@@ -939,7 +976,7 @@ function ChatPanel({
       // binds to a chat that actually exists.
       chatId,
       title: 'LaTeX editor',
-      systemPrompt: bootstrapPrompt(appId),
+      systemPrompt,
     }).then((nextHandle) => {
       if (disposed) {
         nextHandle.destroy()
@@ -969,7 +1006,7 @@ function ChatPanel({
       disposed = true
       if (handle) handle.destroy()
     }
-  }, [appId, chatId, storage])
+  }, [appId, chatId, storage, systemPrompt])
 
   return (
     <section className="chat-panel">
@@ -1020,41 +1057,67 @@ function useOnline() {
 // ----------------------------------------------------------------------
 function useModal() {
   const [state, setState] = useState(null)
+  const navRef = useRef(null)
+  const resolveRef = useRef(null)
   // state shape:
   //   { kind: 'alert'|'confirm'|'prompt',
   //     title, body, placeholder, defaultValue, danger, resolve }
 
-  const close = useCallback(() => setState(null), [])
+  const finish = useCallback((value, fromShell = false) => {
+    if (!fromShell) {
+      try { navRef.current?.close?.() } catch {}
+    }
+    navRef.current = null
+    setState(null)
+    const resolve = resolveRef.current
+    resolveRef.current = null
+    if (resolve) resolve(value)
+  }, [])
 
-  const alert = useCallback((body, opts = {}) => new Promise((resolve) => {
-    setState({
-      kind: 'alert',
-      title: opts.title || 'Heads up',
-      body,
-      resolve: () => { close(); resolve(undefined) },
-    })
-  }), [close])
+  const openModal = useCallback((factory, backValue) => new Promise((resolve) => {
+    if (resolveRef.current) finish(backValue)
+    resolveRef.current = resolve
+    const show = () => setState(factory((value) => finish(value)))
+    if (window.mobius?.nav?.open) {
+      const handle = window.mobius.nav.open('latex-modal', () => finish(backValue, true))
+      navRef.current = handle
+      Promise.resolve(handle.ready).finally(() => {
+        if (navRef.current === handle) show()
+      })
+    } else {
+      show()
+    }
+  }), [finish])
 
-  const confirm = useCallback((body, opts = {}) => new Promise((resolve) => {
-    setState({
-      kind: 'confirm',
-      title: opts.title || 'Confirm',
-      body,
-      danger: !!opts.danger,
-      resolve: (ok) => { close(); resolve(!!ok) },
-    })
-  }), [close])
+  const alert = useCallback((body, opts = {}) => openModal((resolve) => ({
+    kind: 'alert',
+    title: opts.title || 'Heads up',
+    body,
+    resolve: () => resolve(undefined),
+  }), undefined), [openModal])
 
-  const prompt = useCallback((body, opts = {}) => new Promise((resolve) => {
-    setState({
-      kind: 'prompt',
-      title: opts.title || 'Enter a value',
-      body,
-      placeholder: opts.placeholder || '',
-      defaultValue: opts.defaultValue || '',
-      resolve: (val) => { close(); resolve(val) },
-    })
-  }), [close])
+  const confirm = useCallback((body, opts = {}) => openModal((resolve) => ({
+    kind: 'confirm',
+    title: opts.title || 'Confirm',
+    body,
+    danger: !!opts.danger,
+    resolve: (ok) => resolve(!!ok),
+  }), false), [openModal])
+
+  const prompt = useCallback((body, opts = {}) => openModal((resolve) => ({
+    kind: 'prompt',
+    title: opts.title || 'Enter a value',
+    body,
+    placeholder: opts.placeholder || '',
+    defaultValue: opts.defaultValue || '',
+    resolve,
+  }), null), [openModal])
+
+  useEffect(() => () => {
+    try { navRef.current?.close?.() } catch {}
+    navRef.current = null
+    resolveRef.current = null
+  }, [])
 
   const node = state ? (
     <ModalView state={state} />
@@ -1150,9 +1213,21 @@ function ModalView({ state }) {
 // ----------------------------------------------------------------------
 const FILE_CONTENT_CACHE_LIMIT = 20
 const FILE_CACHE_VERSION = 1
+const CHAT_HEIGHT_CACHE_VERSION = 1
 
 function fileCacheKey(appId) {
   return `latex:${appId}:files-cache:v${FILE_CACHE_VERSION}`
+}
+
+function chatHeightKey(appId) {
+  return `latex:${appId}:chat-height:v${CHAT_HEIGHT_CACHE_VERSION}`
+}
+
+function readChatHeight(appId) {
+  if (typeof localStorage === 'undefined') return 36
+  const raw = Number(localStorage.getItem(chatHeightKey(appId)))
+  if (!Number.isFinite(raw)) return 36
+  return Math.min(68, Math.max(24, raw))
 }
 
 function readFileCache(appId) {
@@ -1265,7 +1340,8 @@ function useBuild({ appId, token, storage, online }) {
   // doesn't mislabel it.
   const [buildDoc, setBuildDoc] = useState(null)
   // Map of source .tex path → its built .pdf path, so the viewer can show a
-  // PDF tab only for documents that have actually been compiled this session.
+  // PDF tab only for documents that have actually been compiled or restored
+  // from a previous successful build.
   // doc path → { pdf, ver }. `ver` is a monotonic per-build token (see
   // finishDone) so the viewer refetches even when the compiled path is
   // unchanged across rebuilds.
@@ -1400,8 +1476,15 @@ function useBuild({ appId, token, storage, online }) {
     }
   }, [appId, token, storage, online, clearPoll, finishError, poll])
 
+  const rememberPdf = useCallback((doc, pdf) => {
+    if (buildingRef.current) return
+    if (!doc || !pdf) return
+    setBuildDoc(doc)
+    finishDone(doc, pdf)
+  }, [finishDone])
+
   return {
-    buildStatus, buildLog, buildDoc, pdfByDoc, build,
+    buildStatus, buildLog, buildDoc, pdfByDoc, build, rememberPdf,
     // Surfaced so the App can drop a doc's PDF mapping when the file is
     // deleted/renamed (the pdf path itself is just another tree entry).
     forgetDoc: useCallback((doc) => {
@@ -1449,6 +1532,7 @@ export default function App({ appId, token }) {
   const storage = useMemo(() => makeStorage(appId, token), [appId, token])
   const online = useOnline()
   const modal = useModal()
+  const bodyRef = useRef(null)
   // Hydrate files + recent contents from the localStorage snapshot
   // synchronously on first render so an offline reload has SOMETHING
   // to paint before any storage.get() resolves (or returns null
@@ -1471,6 +1555,7 @@ export default function App({ appId, token }) {
   // write — not just guarding after — makes that bad state unreachable.
   const [indexLoaded, setIndexLoaded] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
+  const navHandleRef = useRef(null)
   const navToggleRef = useRef(null)
   // Restore the file the user was viewing last session so an offline
   // reload opens straight into their work-in-progress (assuming we
@@ -1485,6 +1570,7 @@ export default function App({ appId, token }) {
   // on every storage write (handled inline at each call site below)
   // and on a 10s background poll.
   const [pending, setPending] = useState(0)
+  const [chatHeight, setChatHeight] = useState(() => readChatHeight(appId))
   // Viewer mode, toggled by the [Source | PDF] segmented control in the
   // top bar. 'source' shows the editable textarea for the open file;
   // 'pdf' shows the MAIN document's compiled PDF (Overleaf-style — Build
@@ -1499,6 +1585,55 @@ export default function App({ appId, token }) {
   const mainPathRef = useRef(null)
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
   const build = useBuild({ appId, token, storage, online })
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return
+    try { localStorage.setItem(chatHeightKey(appId), String(chatHeight)) } catch {}
+  }, [appId, chatHeight])
+
+  const resizeChatBy = useCallback((deltaPct) => {
+    setChatHeight((value) => Math.min(68, Math.max(24, value + deltaPct)))
+  }, [])
+
+  const beginChatResize = useCallback((event) => {
+    event.preventDefault()
+    const body = bodyRef.current
+    const panel = body?.querySelector?.('.chat-panel')
+    if (!body || !panel) return
+    const total = body.getBoundingClientRect().height
+    if (!total) return
+    const startY = event.clientY
+    const startHeight = panel.getBoundingClientRect().height
+    const minPx = Math.min(220, total * 0.24)
+    const maxPx = Math.max(minPx, total - 180)
+
+    const onMove = (moveEvent) => {
+      const nextPx = Math.min(maxPx, Math.max(minPx, startHeight + startY - moveEvent.clientY))
+      setChatHeight(Math.min(68, Math.max(24, (nextPx / total) * 100)))
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp, { once: true })
+  }, [])
+
+  const handleResizeKey = useCallback((event) => {
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      resizeChatBy(4)
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      resizeChatBy(-4)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setChatHeight(24)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setChatHeight(68)
+    }
+  }, [resizeChatBy])
 
   // Persist the file-cache snapshot whenever the index, contents, or
   // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
@@ -1538,8 +1673,35 @@ export default function App({ appId, token }) {
     refreshPending()
   }, [online, refreshPending])
 
-  const toggleNav = useCallback(() => setNavOpen((open) => !open), [])
-  const closeNav = useCallback(() => setNavOpen(false), [])
+  const closeNav = useCallback(() => {
+    try { navHandleRef.current?.close?.() } catch {}
+    navHandleRef.current = null
+    setNavOpen(false)
+  }, [])
+
+  const openNav = useCallback(async () => {
+    if (navOpen) return
+    if (window.mobius?.nav?.open) {
+      const handle = window.mobius.nav.open('latex-drawer', () => {
+        navHandleRef.current = null
+        setNavOpen(false)
+      })
+      navHandleRef.current = handle
+      await handle.ready?.catch(() => false)
+      if (navHandleRef.current !== handle) return
+    }
+    setNavOpen(true)
+  }, [navOpen])
+
+  const toggleNav = useCallback(() => {
+    if (navOpen) closeNav()
+    else openNav()
+  }, [closeNav, navOpen, openNav])
+
+  useEffect(() => () => {
+    try { navHandleRef.current?.close?.() } catch {}
+    navHandleRef.current = null
+  }, [])
 
   // Pull the canonical file list out of files-index.json. Falls back
   // to ["files/welcome.tex"] when the index doesn't exist (older
@@ -1681,6 +1843,56 @@ export default function App({ appId, token }) {
       if (fallback && online) storage.setJSON('main.json', { path: fallback }).catch(() => {})
     }
   }, [files, mainPath, mainReady, online, storage, defaultMain])
+
+  // Restore the previous successful build on app entry. A compiled PDF is
+  // durable storage, but pdfByDoc is React state and starts empty on every
+  // mount; without this hydration the PDF tab says "No PDF yet" until the user
+  // rebuilds. Prefer the last build verdict, then fall back to the deterministic
+  // files/<stem>.pdf path if it is indexed or directly readable.
+  useEffect(() => {
+    if (!mainReady || !indexLoaded || !mainPath) return undefined
+    if (build.buildStatus === 'building' || build.pdfByDoc[mainPath]) return undefined
+    let cancelled = false
+    ;(async () => {
+      let pdfPath = null
+      try {
+        const status = await storage.get('build/status.json')
+        if (cancelled) return
+        pdfPath = pdfFromBuildStatusForDoc(status, mainPath)
+      } catch {
+        // Fall through to probing the deterministic PDF path.
+      }
+
+      if (!pdfPath) {
+        const candidate = pdfPathForTexDoc(mainPath)
+        if (candidate) {
+          if (filesRef.current.includes(candidate)) {
+            pdfPath = candidate
+          } else {
+            try {
+              const blob = await storage.getBlob(candidate)
+              if (cancelled) return
+              if (blob) pdfPath = candidate
+            } catch {
+              // Missing or wrong-kind PDF: leave the view in "No PDF yet".
+            }
+          }
+        }
+      }
+
+      if (!cancelled && pdfPath) build.rememberPdf(mainPath, pdfPath)
+    })()
+    return () => { cancelled = true }
+  }, [
+    mainReady,
+    indexLoaded,
+    mainPath,
+    files,
+    storage,
+    build.buildStatus,
+    build.pdfByDoc,
+    build.rememberPdf,
+  ])
 
   // Set a .tex as the main document (from the drawer context menu).
   // Persists immediately so Build + reload agree on the target.
@@ -2340,7 +2552,7 @@ export default function App({ appId, token }) {
           {openName
             ? <span className="top-path" title={selectedPath}>{openName}</span>
             : <span className="top-path top-path--muted">No file open</span>}
-          {selectedIsMain && <span className="top-main-badge" title="Build compiles this file">main</span>}
+          {selectedIsMain && <span className="top-main-badge" title="Build compiles this file">Build target</span>}
         </div>
         <div className="top-actions">
           {showTexControls && (
@@ -2379,7 +2591,11 @@ export default function App({ appId, token }) {
         </div>
       </header>
 
-      <div className="body">
+      <div
+        ref={bodyRef}
+        className="body"
+        style={{ '--chat-panel-height': `${chatHeight}%` }}
+      >
         <FileNavPanel
           open={navOpen}
           onClose={closeNav}
@@ -2399,6 +2615,20 @@ export default function App({ appId, token }) {
           returnFocusRef={navToggleRef}
         />
         <main className="content">{renderMain()}</main>
+        <div
+          className="chat-resizer"
+          role="separator"
+          aria-label="Resize chat and PDF areas"
+          aria-orientation="horizontal"
+          aria-valuemin={24}
+          aria-valuemax={68}
+          aria-valuenow={Math.round(chatHeight)}
+          tabIndex={0}
+          onPointerDown={beginChatResize}
+          onKeyDown={handleResizeKey}
+        >
+          <span className="chat-resizer-bar" aria-hidden="true" />
+        </div>
         <ChatPanel
           appId={appId}
           token={token}
@@ -2428,6 +2658,8 @@ const CSS = `
   color: var(--text, #eef7f1);
   font-family: var(--font, Inter, ui-sans-serif, system-ui, sans-serif);
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: geometricPrecision;
 }
 
 .top-bar {
@@ -2435,20 +2667,21 @@ const CSS = `
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
+  gap: 10px;
+  min-height: 48px;
+  padding: 6px 10px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 .nav-toggle {
   flex: 0 0 auto;
-  width: 44px;
-  height: 44px;
+  width: 34px;
+  height: 34px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-size: 20px;
+  font-size: 16px;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -2457,8 +2690,11 @@ const CSS = `
 .nav-toggle:active { background: var(--surface2); }
 .top-title {
   min-width: 0;
-  text-align: center;
-  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 13px;
   font-weight: 600;
   overflow: hidden;
   white-space: nowrap;
@@ -2466,6 +2702,7 @@ const CSS = `
 }
 .top-path {
   font-family: var(--font);
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -2473,11 +2710,9 @@ const CSS = `
 .top-path--muted { color: var(--muted); font-weight: 400; }
 .top-main-badge {
   flex: 0 0 auto;
-  padding: 2px 7px;
-  border-radius: 999px;
-  font: 700 10px/1.4 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  padding: 3px 7px;
+  border-radius: 7px;
+  font: 650 11px/1.2 var(--font);
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
@@ -2490,13 +2725,13 @@ const CSS = `
   min-width: 0;
 }
 .toolbar-btn {
-  min-height: 36px;
-  padding: 8px 14px;
+  min-height: 32px;
+  padding: 7px 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font: 600 13px/1 var(--font);
+  font: 650 12px/1 var(--font);
   cursor: pointer;
   white-space: nowrap;
 }
@@ -2520,15 +2755,13 @@ const CSS = `
   background: var(--bg);
 }
 .seg-btn {
-  min-height: 30px;
-  padding: 5px 12px;
+  min-height: 28px;
+  padding: 5px 10px;
   border: 0;
   border-radius: 7px;
   background: none;
   color: var(--muted);
-  font: 700 11px/1 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font: 650 11px/1 var(--font);
   cursor: pointer;
 }
 .seg-btn--active {
@@ -2565,14 +2798,14 @@ const CSS = `
   width: 100%;
   height: 100%;
   min-height: 0;
-  padding: 16px;
+  padding: 14px 16px;
   box-sizing: border-box;
   resize: none;
   border: 0;
   outline: none;
   background: var(--bg);
   color: var(--text);
-  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font: 12.5px/1.62 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 .source-editor:focus {
   box-shadow: inset 0 0 0 1px var(--accent);
@@ -2590,7 +2823,7 @@ const CSS = `
   gap: 8px;
   padding: 24px;
 }
-.preview-empty-title { font-size: 26px; font-weight: 700; color: var(--text); letter-spacing: -0.5px; }
+.preview-empty-title { font-size: 26px; font-weight: 700; color: var(--text); letter-spacing: 0; }
 .preview-empty-body { font-size: 14px; line-height: 1.5; max-width: 320px; }
 
 .preview-note {
@@ -2692,10 +2925,11 @@ const CSS = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 14px;
+  min-height: 52px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--border);
 }
-	.drawer-title { display: block; font-size: 16px; font-weight: 700; }
+	.drawer-title { display: block; font-size: 14px; font-weight: 700; }
 	.drawer-count {
 	  display: block;
 	  margin-top: 2px;
@@ -2703,36 +2937,22 @@ const CSS = `
 	  font-size: 11px;
 	  font-weight: 600;
 	}
-.drawer-close {
-  width: 44px;
-  height: 44px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-  font-size: 22px;
-  cursor: pointer;
-  line-height: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
 .drawer-actions {
   display: flex;
-  gap: 8px;
-  padding: 10px 14px;
+  gap: 6px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--border);
 }
 .drawer-btn {
   flex: 1 1 0;
-  min-height: 44px;
-  padding: 10px 12px;
+  min-height: 34px;
+  padding: 7px 10px;
   border-radius: 6px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: 600;
   cursor: pointer;
 }
 .drawer-btn:active { background: var(--surface2, var(--surface)); }
@@ -2758,16 +2978,16 @@ const CSS = `
 	.tree-file, .tree-folder {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   width: 100%;
-  min-height: 44px;
-  padding: 10px 14px;
+  min-height: 34px;
+  padding: 7px 12px;
   text-align: left;
   background: none;
   border: none;
   color: var(--text);
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
 	  font-family: var(--font);
 	  outline: none;
 	}
@@ -2790,11 +3010,9 @@ const CSS = `
 .tree-main-badge {
   margin-left: auto;
   flex: 0 0 auto;
-  padding: 2px 6px;
-  border-radius: 999px;
-  font: 700 9px/1.4 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  padding: 2px 5px;
+  border-radius: 6px;
+  font: 650 9px/1.3 var(--font);
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
@@ -2838,14 +3056,14 @@ const CSS = `
 .ctx-item {
   display: block;
   width: 100%;
-  min-height: 40px;
-  padding: 9px 12px;
+  min-height: 34px;
+  padding: 8px 10px;
   text-align: left;
   border: none;
   border-radius: 7px;
   background: none;
   color: var(--text);
-  font: 500 14px/1.2 var(--font);
+  font: 550 13px/1.2 var(--font);
   cursor: pointer;
 }
 .ctx-item:active { background: var(--surface2, var(--surface)); }
@@ -2876,28 +3094,48 @@ const CSS = `
    always fully visible; flex-shrink keeps it from eating the editor. */
 .chat-panel {
   flex: 0 0 auto;
-  height: 42vh;
-  min-height: 220px;
-  max-height: 60vh;
+  height: var(--chat-panel-height, 36%);
+  min-height: min(220px, 45%);
+  max-height: calc(100% - 180px);
   display: flex;
   flex-direction: column;
   background: var(--surface);
   border-top: 1px solid var(--border);
+}
+.chat-resizer {
+  flex: 0 0 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  touch-action: none;
+}
+.chat-resizer:hover,
+.chat-resizer:focus-visible {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  outline: none;
+}
+.chat-resizer-bar {
+  width: 44px;
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 65%, transparent);
 }
 .chat-head {
   flex: 0 0 auto;
   display: flex;
   align-items: baseline;
   gap: 10px;
-  min-height: 38px;
-  padding: 8px 14px;
+  min-height: 34px;
+  padding: 7px 12px;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
 .chat-head-title {
-  font: 700 12px/1 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font: 700 11px/1 var(--font);
   color: var(--muted);
 }
 .chat-head-hint {
@@ -2983,13 +3221,13 @@ const CSS = `
   gap: 8px;
 }
 .modal-btn {
-  min-height: 44px;
-  padding: 10px 16px;
+  min-height: 36px;
+  padding: 8px 14px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
   font-family: var(--font);
@@ -3023,7 +3261,7 @@ const CSS = `
   border-radius: 999px;
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   background: var(--surface);
   border: 1px solid var(--border);
   color: var(--muted);
@@ -3074,6 +3312,5 @@ const CSS = `
     width: 100%;
     justify-content: flex-end;
   }
-  .chat-panel { height: 46vh; }
 }
 `

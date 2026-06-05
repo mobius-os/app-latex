@@ -28,7 +28,13 @@ async function bundle() {
 }
 
 test('path guards accept only safe paths inside files/', async () => {
-  const { isSafeRelPath, isSafeStoragePath, normalizeFileCacheSnapshot } = await bundle()
+  const {
+    isSafeRelPath,
+    isSafeStoragePath,
+    normalizeFileCacheSnapshot,
+    pdfFromBuildStatusForDoc,
+    pdfPathForTexDoc,
+  } = await bundle()
 
   assert.equal(isSafeRelPath('chapter1.tex'), true)
   assert.equal(isSafeRelPath('notes/2026/draft.md'), true)
@@ -66,6 +72,51 @@ test('path guards accept only safe paths inside files/', async () => {
   assert.deepEqual(snapshot.index, ['files/a.tex', 'files/z.tex'])
   assert.deepEqual(snapshot.contents, { 'files/a.tex': 'a', 'files/z.tex': 'z' })
   assert.equal(snapshot.lastPath, null)
+
+  assert.equal(pdfPathForTexDoc('files/main.tex'), 'files/main.pdf')
+  assert.equal(pdfPathForTexDoc('files/chapters/one.tex'), 'files/chapters/one.pdf')
+  assert.equal(pdfPathForTexDoc('files/main.md'), null)
+  assert.equal(pdfPathForTexDoc('build/target.tex'), null)
+
+  assert.equal(
+    pdfFromBuildStatusForDoc({
+      status: 'done',
+      target: 'files/main.tex',
+      pdf: 'files/main.pdf',
+    }, 'files/main.tex'),
+    'files/main.pdf',
+  )
+  assert.equal(
+    pdfFromBuildStatusForDoc({
+      status: 'done',
+      target: 'files/other.tex',
+      pdf: 'files/other.pdf',
+    }, 'files/main.tex'),
+    null,
+  )
+  assert.equal(
+    pdfFromBuildStatusForDoc({
+      status: 'done',
+      pdf: 'files/main.pdf',
+    }, 'files/main.tex'),
+    'files/main.pdf',
+  )
+  assert.equal(
+    pdfFromBuildStatusForDoc({
+      status: 'error',
+      target: 'files/main.tex',
+      pdf: 'files/main.pdf',
+    }, 'files/main.tex'),
+    null,
+  )
+  assert.equal(
+    pdfFromBuildStatusForDoc({
+      status: 'done',
+      target: 'files/main.tex',
+      pdf: 'build/main.pdf',
+    }, 'files/main.tex'),
+    null,
+  )
 })
 
 test('file tree keeps an accessible composite keyboard contract', () => {
