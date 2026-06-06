@@ -918,52 +918,11 @@ function bootstrapPrompt(appId) {
   ].join('\n')
 }
 
-// Create a real chat the embed can bind to. The old code fell back to a
-// hard-coded id ('latex-chat') that is truthy but not a UUID, so
-// window.mobius.chat treated it as "use this existing chat" and pointed the
-// embed iframe at /shell/embed/chat?chatId=latex-chat — a chat that never
-// exists → 404 → the permanent "no conversation yet" empty state. Instead we
-// mint a genuine chat ourselves via the app-token endpoint
-// (POST /api/app-chats, the same Bearer token makeStorage holds) and mount the
-// embed with that real id. The chat is app-attributed, so it stays out of the
-// owner's drawer history but the embed can still stream it.
-async function createAppChat(appId, token, systemPrompt) {
-  const r = await fetch('/api/app-chats', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ title: 'LaTeX editor', system_prompt: systemPrompt }),
-  })
-  if (!r.ok) throw new Error(`create chat → ${r.status}`)
-  const data = await r.json()
-  if (!data || !data.id) throw new Error('create chat returned no id')
-  return String(data.id)
-}
-
-async function updateAppChatPrompt(chatId, token, systemPrompt) {
-  if (!chatId) return
-  const r = await fetch(`/api/app-chats/${encodeURIComponent(chatId)}`, {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ system_prompt: systemPrompt }),
-  })
-  if (!r.ok) throw new Error(`update chat prompt → ${r.status}`)
-}
-
 function ChatPanel({
   appId, token, storage,
   onFilesMaybeChanged,
 }) {
   const mountRef = useRef(null)
-  // null until resolved; once set it is always a REAL chat id (a persisted
-  // one from chat_id.json or a freshly-created one). We never mount the embed
-  // with a placeholder.
-  const [chatId, setChatId] = useState(null)
   const [error, setError] = useState(null)
   // Keep the latest onFilesMaybeChanged in a ref so the mount effect below
   // does NOT depend on it. That callback's identity changes on every file
@@ -974,46 +933,13 @@ function ChatPanel({
   useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
   const systemPrompt = useMemo(() => bootstrapPrompt(appId), [appId])
 
-  // Resolve a real chat id before mounting the embed: read chat_id.json, and
-  // if absent create one ourselves and persist it. A create failure surfaces
-  // the chat-error rather than silently mounting an empty embed.
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      try {
-        const saved = await storage.get('chat_id.json')
-        if (cancelled) return
-        if (saved && saved.id) {
-          const id = String(saved.id)
-          updateAppChatPrompt(id, token, systemPrompt).catch(() => {})
-          setChatId(id)
-          return
-        }
-      } catch (e) {
-        // Read failure (e.g. offline) — fall through to create below; if
-        // that also fails the catch surfaces the error.
-      }
-      try {
-        const id = await createAppChat(appId, token, systemPrompt)
-        if (cancelled) return
-        setChatId(id)
-        storage.setJSON('chat_id.json', { id }).catch(() => {})
-      } catch (e) {
-        if (!cancelled) {
-          setError(
-            (e && e.message)
-              ? `Could not start the agent chat (${e.message}).`
-              : 'Could not start the agent chat.',
-          )
-        }
-      }
-    })()
-    return () => { cancelled = true }
-  }, [appId, token, storage, systemPrompt])
-
+  // The helper owns the whole app-chat lifecycle: it creates the chat once
+  // (POST /api/app-chats), persists its id as { id } under chat_id.json,
+  // reuses it on later mounts, re-applies the system prompt on resume, and
+  // reconciles the canonical id on 'ready'. We just give it a mount, the
+  // persist key, and the prompt — and destroy the handle on cleanup.
   useEffect(() => {
     const mount = mountRef.current
-    if (!chatId) return undefined
     if (!mount || !window.mobius || typeof window.mobius.chat !== 'function') {
       setError('Embedded chat is not available in this shell.')
       return undefined
@@ -1024,35 +950,20 @@ function ChatPanel({
 
     window.mobius.chat({
       mount,
-      // Always the real id — never a placeholder or undefined, so the embed
-      // binds to a chat that actually exists.
-      chatId,
+      persist: 'chat_id.json',
       title: 'LaTeX editor',
       systemPrompt,
       // LaTeX uses a fixed provider — hide the provider/effort picker so the
       // embedded sheet doesn't surface controls the user shouldn't change here.
       picker: false,
+      onTurnDone: () => { if (onFilesRef.current) onFilesRef.current() },
+      onError: ({ error }) => { setError(typeof error === 'string' ? error : 'Embedded chat reported an error.') },
     }).then((nextHandle) => {
       if (disposed) {
         nextHandle.destroy()
         return
       }
       handle = nextHandle
-      handle
-        .on('ready', ({ chatId: resolved }) => {
-          // The runtime may hand back its own canonical id; reconcile +
-          // persist so a reload re-binds the same conversation.
-          if (!resolved) return
-          const next = String(resolved)
-          if (next !== chatId) {
-            setChatId(next)
-            storage.setJSON('chat_id.json', { id: next }).catch(() => {})
-          }
-        })
-        .on('turn-done', () => { if (onFilesRef.current) onFilesRef.current() })
-        .on('error', ({ error: chatError }) => {
-          setError(chatError || 'Embedded chat reported an error.')
-        })
     }).catch((e) => {
       if (!disposed) setError(e.message || 'Could not mount embedded chat.')
     })
@@ -1061,7 +972,7 @@ function ChatPanel({
       disposed = true
       if (handle) handle.destroy()
     }
-  }, [appId, chatId, storage, systemPrompt])
+  }, [storage, systemPrompt])
 
   return (
     <section className="chat-panel">
