@@ -45,6 +45,17 @@ function isTextProjectPath(path) {
     && !isBinaryProjectPath(path)
 }
 
+// `.json` paths under the project (files-index.json, main.json, chat_id.json,
+// and any .json the user makes) are MANAGED files: every other reader loads
+// them with the typed JSON getter, which throws assertReadKind if they were
+// written as text/plain. The text editor's debounced autosave writes
+// text/plain, so editing a .json as source would corrupt it for every other
+// reader. We make .json paths read-only in the editor instead — shown as
+// source, but never autosaved back as text.
+function isManagedJsonPath(path) {
+  return String(path || '').toLowerCase().endsWith('.json')
+}
+
 export function pdfPathForTexDoc(path) {
   if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return null
   return `${path.slice(0, -'.tex'.length)}.pdf`
@@ -1018,6 +1029,9 @@ function ChatPanel({
       chatId,
       title: 'LaTeX editor',
       systemPrompt,
+      // LaTeX uses a fixed provider — hide the provider/effort picker so the
+      // embedded sheet doesn't surface controls the user shouldn't change here.
+      picker: false,
     }).then((nextHandle) => {
       if (disposed) {
         nextHandle.destroy()
@@ -2560,7 +2574,10 @@ export default function App({ appId, token }) {
   }, [selectedPath])
 
   useEffect(() => {
-    if (!selectedPath || selectedIsBinary || !fileDirty) return undefined
+    // Never autosave a managed .json path as text/plain — that corrupts it for
+    // every typed-JSON reader (see isManagedJsonPath). Such paths are read-only
+    // in the editor.
+    if (!selectedPath || selectedIsBinary || isManagedJsonPath(selectedPath) || !fileDirty) return undefined
     const path = selectedPath
     const body = fileContent
     const timer = setTimeout(() => {
@@ -2590,7 +2607,9 @@ export default function App({ appId, token }) {
   ])
 
   const handleSaveFile = useCallback(async () => {
-    if (!selectedPath || selectedIsBinary || fileSaving) return
+    // Managed .json paths are read-only in the editor — skip the text/plain
+    // write that would corrupt them for typed-JSON readers.
+    if (!selectedPath || selectedIsBinary || isManagedJsonPath(selectedPath) || fileSaving) return
     setFileSaving(true)
     setFileError(null)
     try {
@@ -2691,6 +2710,25 @@ export default function App({ appId, token }) {
     // Otherwise: the editable source for the open text file.
     if (fileLoading) return <div className="preview-note">Loading source…</div>
     if (fileError) return <div className="preview-note">{fileError}</div>
+    // Managed .json files (files-index.json, main.json, chat_id.json, etc.) are
+    // shown read-only: editing them as text/plain here would corrupt them for
+    // every typed-JSON reader, so we don't autosave them. Surface that.
+    if (isManagedJsonPath(selectedPath)) {
+      return (
+        <div className="editor-readonly">
+          <div className="readonly-note">
+            Managed file — edit via the app, not the source.
+          </div>
+          <textarea
+            className="source-editor"
+            value={fileContent}
+            readOnly
+            spellCheck={false}
+            aria-label={`Source for ${selectedPath} (read-only)`}
+          />
+        </div>
+      )
+    }
     return (
       <textarea
         className="source-editor"
@@ -2848,8 +2886,9 @@ const CSS = `
 }
 .nav-toggle {
   flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
@@ -2898,7 +2937,7 @@ const CSS = `
   min-width: 0;
 }
 .toolbar-btn {
-  min-height: 32px;
+  min-height: 44px;
   padding: 7px 12px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -2928,7 +2967,7 @@ const CSS = `
   background: var(--bg);
 }
 .seg-btn {
-  min-height: 28px;
+  min-height: 44px;
   padding: 5px 10px;
   border: 0;
   border-radius: 7px;
@@ -2983,6 +3022,26 @@ const CSS = `
 .source-editor:focus {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
+
+/* Managed .json files render read-only with an inline notice above the
+   source — editing them as text/plain would corrupt them for typed-JSON
+   readers, so the editor never autosaves them. */
+.editor-readonly {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.readonly-note {
+  flex: 0 0 auto;
+  padding: 8px 16px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.editor-readonly .source-editor { cursor: default; }
 
 /* ---- empty / notes ---- */
 .preview-empty {
@@ -3118,7 +3177,7 @@ const CSS = `
 }
 .drawer-btn {
   flex: 1 1 0;
-  min-height: 34px;
+  min-height: 44px;
   padding: 7px 10px;
   border-radius: 6px;
   border: 1px solid var(--border);
@@ -3129,7 +3188,7 @@ const CSS = `
   cursor: pointer;
 }
 .drawer-btn:active { background: var(--surface2, var(--surface)); }
-.drawer-btn--danger { color: var(--accent); border-color: var(--accent); }
+.drawer-btn--danger { color: var(--danger); border-color: var(--danger); }
 .drawer-btn:disabled { opacity: 0.45; cursor: default; }
 .drawer-syncing {
   padding: 8px 14px;
@@ -3153,7 +3212,7 @@ const CSS = `
   align-items: center;
   gap: 7px;
   width: 100%;
-  min-height: 34px;
+  min-height: 44px;
   padding: 7px 12px;
   text-align: left;
   background: none;
@@ -3229,7 +3288,7 @@ const CSS = `
 .ctx-item {
   display: block;
   width: 100%;
-  min-height: 34px;
+  min-height: 44px;
   padding: 8px 10px;
   text-align: left;
   border: none;
@@ -3240,7 +3299,7 @@ const CSS = `
   cursor: pointer;
 }
 .ctx-item:active { background: var(--surface2, var(--surface)); }
-.ctx-item--danger { color: var(--accent); }
+.ctx-item--danger { color: var(--danger); }
 .tree-icon {
   display: inline-flex;
   align-items: center;
@@ -3376,6 +3435,7 @@ const CSS = `
 .modal-input {
   display: block;
   width: 100%;
+  min-height: 44px;
   padding: 9px 11px;
   font-size: 14px;
   font-family: var(--font);
@@ -3394,7 +3454,7 @@ const CSS = `
   gap: 8px;
 }
 .modal-btn {
-  min-height: 36px;
+  min-height: 44px;
   padding: 8px 14px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -3411,9 +3471,9 @@ const CSS = `
   border-color: var(--accent);
 }
 .modal-btn--danger {
-  background: var(--accent);
+  background: var(--danger);
   color: #fff;
-  border-color: var(--accent);
+  border-color: var(--danger);
 }
 .modal-btn--secondary { background: var(--surface); }
 
