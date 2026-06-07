@@ -3291,7 +3291,6 @@ const CSS = `
   color: var(--muted);
   flex: 0 0 auto;
 }
-.tree-file--selected .tree-icon { color: rgba(255,255,255,0.8); }
 .tree-name {
   overflow: hidden;
   white-space: nowrap;
@@ -3419,7 +3418,7 @@ const CSS = `
   width: 100%;
   min-height: 44px;
   padding: 9px 11px;
-  font-size: 14px;
+  font-size: 16px;
   font-family: var(--font);
   background: var(--surface);
   color: var(--text);
@@ -3429,7 +3428,7 @@ const CSS = `
   margin-bottom: 14px;
   box-sizing: border-box;
 }
-.modal-input:focus { border-color: var(--accent); }
+.modal-input:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -3449,7 +3448,7 @@ const CSS = `
 }
 .modal-btn--primary {
   background: var(--accent);
-  color: #fff;
+  color: #062016;
   border-color: var(--accent);
 }
 .modal-btn--danger {
