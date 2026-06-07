@@ -42,6 +42,16 @@ case "$TEX" in
   *) write_status error "" "build target must be a .tex file"; exit 0 ;;
 esac
 STEM="${TEX%.tex}"
+# Empty-source guard. A file that was never written, truncated, or contains only
+# whitespace makes tectonic fail with a raw "no input" error that the app
+# surfaces as an opaque "can't preview". Catch it here and write a friendly
+# status BEFORE invoking tectonic. The path checks above already guarantee $TEX
+# is traversal-free, so resolving it under files/ is safe.
+SRC="$STORAGE_DIR/files/$TEX"
+if [ ! -s "$SRC" ] || ! grep -q '[^[:space:]]' "$SRC" 2>/dev/null; then
+  write_status error "" "Nothing to compile — this file is empty."
+  exit 0
+fi
 LOG="$(cd "$STORAGE_DIR/files" && TECTONIC_CACHE_DIR="$STORAGE_DIR/tectonic-cache" \
   tectonic --keep-logs --outfmt=pdf -- "$TEX" 2>&1)"
 if [ $? -eq 0 ]; then

@@ -177,7 +177,17 @@ function makeStorage(appId, token) {
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
-    if (!r.ok) return null
+    // Distinguish "the file doesn't exist yet" (404 — e.g. never built) from a
+    // transient/other transport failure, so a caller can render an actionable
+    // message instead of one opaque "could not load". 404 → null (sentinel for
+    // absent); any other non-200 → a typed error carrying the HTTP status.
+    if (r.status === 404) return null
+    if (!r.ok) {
+      const err = new Error(`get blob ${path} → ${r.status}`)
+      err.name = 'BlobFetchError'
+      err.status = r.status
+      throw err
+    }
     return r.blob()
   }
   async function setText(path, text) {
@@ -293,8 +303,15 @@ function ImagePreview({ storage, path }) {
 // note is a SIBLING, not a child of the host.
 function PdfPreview({ storage, path, version }) {
   const wrapRef = useRef(null)
+  // `err` is null when fine, otherwise { message, retryable }. We keep a
+  // retryable flag so the same render can show a Retry button only when
+  // re-attempting could actually help (a transport blip), but NOT for the
+  // "not built yet" case where the user should tap Build, or the
+  // "not a valid PDF yet" case where re-fetching the same empty bytes won't.
   const [err, setErr] = useState(null)
   const [loading, setLoading] = useState(true)
+  // Bumping this re-runs the load effect — the in-app Retry mechanism.
+  const [retryNonce, setRetryNonce] = useState(0)
   useEffect(() => {
     let cancelled = false
     setErr(null); setLoading(true)
@@ -302,8 +319,23 @@ function PdfPreview({ storage, path, version }) {
       try {
         const pdfjs = await import('pdfjs-dist')
         pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
-        const blob = await storage.getBlob(path)
-        if (!blob) throw new Error('Could not load the PDF.')
+        let blob
+        try {
+          blob = await storage.getBlob(path)
+        } catch (fetchErr) {
+          // getBlob throws only for transient/other transport failures (404 is
+          // returned as null below); re-fetching may succeed, so make it
+          // retryable.
+          const e = new Error('Couldn’t load the PDF — tap Retry.')
+          e.retryable = true
+          throw e
+        }
+        if (!blob) {
+          // 404 / absent: the doc has never been compiled. Build, don't retry.
+          const e = new Error('No compiled PDF for this document yet — tap Build to compile it.')
+          e.retryable = false
+          throw e
+        }
         const data = new Uint8Array(await blob.arrayBuffer())
         const doc = await pdfjs.getDocument({ data }).promise
         if (cancelled) { doc.destroy && doc.destroy(); return }
@@ -330,12 +362,38 @@ function PdfPreview({ storage, path, version }) {
         if (!cancelled) setLoading(false)
         doc.destroy && doc.destroy()
       } catch (e) {
-        if (!cancelled) { setErr((e && e.message) || 'PDF failed to render.'); setLoading(false) }
+        if (cancelled) return
+        // A pdf.js parse failure on bytes that aren't a real PDF yet (empty
+        // file, or a half-written build) surfaces as MissingPDFException /
+        // InvalidPDFException — translate it into an honest, non-alarming note.
+        let message = (e && e.message) || 'PDF failed to render.'
+        let retryable = !!(e && e.retryable)
+        const en = e && e.name
+        if (en === 'MissingPDFException' || en === 'InvalidPDFException') {
+          message = 'This file isn’t a valid PDF yet (it may be empty or still building).'
+          retryable = false
+        }
+        setErr({ message, retryable })
+        setLoading(false)
       }
     })()
     return () => { cancelled = true }
-  }, [storage, path, version])
-  if (err) return <div className="preview-note">{err}</div>
+  }, [storage, path, version, retryNonce])
+  if (err) {
+    return (
+      <div className="preview-note">
+        <div>{err.message}</div>
+        {err.retryable && (
+          <button
+            className="preview-retry-btn"
+            onClick={() => setRetryNonce((n) => n + 1)}
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    )
+  }
   return (
     <div className="pdf-viewer">
       {loading && <div className="preview-note">Rendering PDF…</div>}
@@ -2978,6 +3036,19 @@ const CSS = `
 }
 .preview-note b { color: var(--text); }
 .build-note { padding: 32px 18px; }
+.preview-retry-btn {
+  margin-top: 12px;
+  min-height: 44px;
+  padding: 8px 18px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.preview-retry-btn:active { background: var(--surface2, var(--surface)); }
 
 /* ---- build failure ---- */
 .build-error {
