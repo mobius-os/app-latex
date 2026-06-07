@@ -1,7 +1,7 @@
 {
   "id": "latex",
   "name": "LaTeX",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "description": "Overleaf-style LaTeX editor: a VSCode-like side file drawer, a real in-app PDF viewer (pdf.js), a Source/PDF toggle, a settable main document, and an embedded agent that writes your .tex for you.",
   "author": "mobius-os",
   "license": "MIT",
@@ -30,5 +30,6 @@
   },
   "schedule": {
     "job": "build.sh"
-  }
+  },
+  "embeds_agent": true
 }
