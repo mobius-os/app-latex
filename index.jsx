@@ -210,12 +210,16 @@ export function normalizeFileCacheSnapshot(parsed) {
 // Layout (mobile-first, VSCode-shaped):
 //   - Top bar: ☰ (toggle the left file drawer) · the open file's name
 //     (+ a "main" badge if it's the document Build compiles) · a
-//     segmented [Source | PDF] toggle and a primary Build button (both
-//     for .tex only).
+//     single row of icon buttons: a source/preview view toggle and a
+//     play-triangle Build button (both for .tex only; each icon button
+//     carries an aria-label + title).
 //   - Left drawer: slides in over a backdrop from the left edge — the
 //     file tree + New file/folder/Upload + per-file context actions
-//     (rename / delete / set-as-main). Tapping a file or the backdrop
-//     closes it.
+//     (rename / delete / set-as-main). Each non-main .tex row also shows
+//     a visible target icon to set it as the main document (the
+//     discoverable twin of the context-menu action); the current main
+//     doc wears a target "main" badge instead. Tapping a file or the
+//     backdrop closes it.
 //   - Main area: the SOURCE editor (CodeMirror) OR the compiled PDF
 //     (pdf.js canvas), toggled. Images render inline; a .pdf in the
 //     tree renders directly in the pdf.js viewer.
@@ -561,6 +565,43 @@ function fileIcon(name) {
   return '·'
 }
 
+// Inline 24x24 line icons for the top-bar controls, in the same
+// stroke=currentColor / strokeWidth=2 / round-cap style as Workout's
+// <SportIcon>. The toolbar shows them in icon-only buttons (each with its
+// own aria-label + title), so the glyph stands in for the old text label.
+//   source  — a code/'</>' glyph (view the .tex source)
+//   preview — a document-page glyph (view the compiled PDF)
+//   build   — a play triangle (compile the main document)
+//   target  — a target/bullseye glyph (the "set as main document" affordance)
+const ICON_PATHS = {
+  source: <><polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" /></>,
+  preview: (
+    <>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 3 14 8 19 8" />
+    </>
+  ),
+  build: <polygon points="7 4 20 12 7 20 7 4" />,
+  target: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <circle cx="12" cy="12" r="4" />
+    </>
+  ),
+}
+
+function ToolIcon({ name, size = 24 }) {
+  return (
+    <svg
+      viewBox="0 0 24 24" width={size} height={size}
+      fill="none" stroke="currentColor" strokeWidth="2"
+      strokeLinecap="round" strokeLinejoin="round" aria-hidden
+    >
+      {ICON_PATHS[name] || ICON_PATHS.source}
+    </svg>
+  )
+}
+
 // Detect whether a path's leaf is a file (vs a folder we haven't
 // expanded yet). For the index-driven tree, anything in the flat
 // list IS a file; folders only exist as intermediate path segments.
@@ -655,7 +696,7 @@ function useLongPress(onLongPress) {
 
 function FileNode({
   node, selectedPath, onSelect, depth,
-  onContextMenu, onMoveInto, mainPath, parentPath = '',
+  onContextMenu, onMoveInto, mainPath, onSetMain, parentPath = '',
 }) {
   const [expanded, setExpanded] = useState(true)
   const [dropActive, setDropActive] = useState(false)
@@ -666,6 +707,19 @@ function FileNode({
   if (node.children.size === 0 && node.isFile) {
     const selected = node.path === selectedPath
     const isMain = node.path === mainPath
+    const isTex = node.path.toLowerCase().endsWith('.tex')
+    // Discoverable "set as main document" affordance: a visible target button
+    // on every .tex that isn't already the main doc, alongside the existing
+    // right-click / long-press context-menu path (which still works). The
+    // current target is marked with a filled "main" badge instead. We render
+    // the control as a role="button" span (not a nested <button>, which is
+    // invalid inside the row's own <button>) and stop propagation so tapping
+    // it sets the target without also selecting/opening the file.
+    const activateSetMain = (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      if (onSetMain) onSetMain(node.path)
+    }
     return (
       <button
         type="button"
@@ -694,7 +748,25 @@ function FileNode({
       >
         <span className="tree-icon">{fileIcon(node.name)}</span>
         <span className="tree-name">{node.name}</span>
-        {isMain && <span className="tree-main-badge" title="Build compiles this file">target</span>}
+        {isMain && (
+          <span className="tree-main-badge" title="Build compiles this file (the main document)">
+            <ToolIcon name="target" size={13} />
+            main
+          </span>
+        )}
+        {isTex && !isMain && onSetMain && (
+          <span
+            className="tree-set-main"
+            role="button"
+            tabIndex={0}
+            aria-label="Set as main document"
+            title="Set as main document (Build will compile this file)"
+            onClick={activateSetMain}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') activateSetMain(e) }}
+          >
+            <ToolIcon name="target" size={16} />
+          </span>
+        )}
       </button>
     )
   }
@@ -752,6 +824,7 @@ function FileNode({
             onContextMenu={onContextMenu}
             onMoveInto={onMoveInto}
             mainPath={mainPath}
+            onSetMain={onSetMain}
             parentPath=""
           />
         ))}
@@ -806,6 +879,7 @@ function FileNode({
               onContextMenu={onContextMenu}
               onMoveInto={onMoveInto}
               mainPath={mainPath}
+              onSetMain={onSetMain}
               parentPath={node.path}
             />
           ))}
@@ -1015,9 +1089,7 @@ function FileNavPanel({
           {files.length === 0 ? (
             canMutate ? (
               <div className="drawer-empty">
-                No files yet. Tap “New file”, Upload, or ask the agent below
-                to make one. Long-press a .tex file to set it as the main
-                document.
+                No files yet. Tap “New file” or Upload to make one.
               </div>
             ) : null
           ) : (
@@ -1029,6 +1101,7 @@ function FileNavPanel({
               onContextMenu={setCtx}
               onMoveInto={onMove}
               mainPath={mainPath}
+              onSetMain={onSetMain}
             />
           )}
         </div>
@@ -1126,9 +1199,7 @@ function ChatPanel({
       persist: 'chat_id.json',
       title: 'LaTeX editor',
       systemPrompt,
-      // LaTeX uses a fixed provider — hide the provider/effort picker so the
-      // embedded sheet doesn't surface controls the user shouldn't change here.
-      picker: false,
+      picker: true,
       onTurnDone: () => { if (onFilesRef.current) onFilesRef.current() },
       onError: ({ error }) => { setError(typeof error === 'string' ? error : 'Embedded chat reported an error.') },
     }).then((nextHandle) => {
@@ -2781,8 +2852,7 @@ export default function App({ appId, token }) {
         <div className="preview-empty">
           <div className="preview-empty-title">LaTeX</div>
           <div className="preview-empty-body">
-            Open the file drawer to pick a file, or ask the agent below to
-            create one.
+            Open the file drawer to pick a file.
           </div>
         </div>
       )
@@ -2866,28 +2936,33 @@ export default function App({ appId, token }) {
                   type="button"
                   role="tab"
                   aria-selected={viewMode === 'source'}
+                  aria-label="View source"
+                  title="View source"
                   className={`seg-btn ${viewMode === 'source' ? 'seg-btn--active' : ''}`}
                   onClick={() => setViewMode('source')}
                 >
-                  Source
+                  <ToolIcon name="source" />
                 </button>
                 <button
                   type="button"
                   role="tab"
                   aria-selected={viewMode === 'pdf'}
+                  aria-label="View PDF preview"
+                  title="View PDF preview"
                   className={`seg-btn ${viewMode === 'pdf' ? 'seg-btn--active' : ''}`}
                   onClick={() => setViewMode('pdf')}
                 >
-                  PDF
+                  <ToolIcon name="preview" />
                 </button>
               </div>
               <button
                 className="toolbar-btn toolbar-btn--primary"
                 onClick={handleBuild}
                 disabled={build.buildStatus === 'building'}
+                aria-label={build.buildStatus === 'building' ? 'Building the main document' : 'Build the main document'}
                 title={`Compile the main document (${mainPath.replace(/^files\//, '')})`}
               >
-                {build.buildStatus === 'building' ? 'Building…' : 'Build'}
+                <ToolIcon name="build" />
               </button>
             </>
           )}
@@ -3029,16 +3104,20 @@ const CSS = `
   gap: 8px;
   min-width: 0;
 }
+/* Icon-only Build button: a square tap target with the play glyph centred. */
 .toolbar-btn {
+  width: 44px;
+  height: 44px;
   min-height: 44px;
-  padding: 7px 12px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font: 650 12px/1 var(--font);
   cursor: pointer;
-  white-space: nowrap;
 }
 .toolbar-btn--primary {
   background: var(--accent);
@@ -3050,7 +3129,7 @@ const CSS = `
   cursor: default;
 }
 
-/* ---- segmented [Source | PDF] toggle ---- */
+/* ---- segmented source/preview toggle (icon-only) ---- */
 .seg-toggle {
   display: inline-flex;
   flex: 0 0 auto;
@@ -3060,13 +3139,16 @@ const CSS = `
   background: var(--bg);
 }
 .seg-btn {
-  min-height: 44px;
-  padding: 5px 10px;
+  width: 40px;
+  height: 40px;
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   border-radius: 7px;
   background: none;
   color: var(--muted);
-  font: 650 11px/1 var(--font);
   cursor: pointer;
 }
 .seg-btn--active {
@@ -3335,9 +3417,14 @@ const CSS = `
 .tree-main-badge {
   margin-left: auto;
   flex: 0 0 auto;
-  padding: 2px 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px 2px 4px;
   border-radius: 6px;
   font: 650 9px/1.3 var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
@@ -3347,6 +3434,29 @@ const CSS = `
 	  background: color-mix(in srgb, var(--accent) 18%, transparent);
 	  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 	}
+/* Discoverable "set as main document" affordance: a muted target icon on
+   the right of every non-main .tex row, brightening on hover/focus. It's the
+   visible twin of the context-menu's "Set as main document" item. */
+.tree-set-main {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  color: var(--muted);
+  opacity: 0.65;
+  cursor: pointer;
+}
+.tree-set-main:hover,
+.tree-set-main:focus-visible {
+  color: var(--accent);
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: none;
+}
 .tree-file[draggable="true"] { cursor: grab; }
 /* Drop-target highlight while a drag hovers a folder or the root. */
 .tree-drop-active {
@@ -3624,18 +3734,5 @@ const CSS = `
   z-index: auto;
   box-shadow: none;
   white-space: nowrap;
-}
-
-/* Narrow phones: let the top bar wrap its actions onto a second row so
-   the [Source | PDF] toggle + Build never crowd the filename. */
-@media (max-width: 560px) {
-  .top-bar {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-  .top-actions {
-    grid-column: 1 / -1;
-    width: 100%;
-    justify-content: flex-end;
-  }
 }
 `
