@@ -1003,7 +1003,81 @@ function FileNavPanel({
 }) {
   const root = useMemo(() => buildTree(files), [files])
   const treeRef = useRef(null)
+  const drawerRef = useRef(null)
+  const dragStart = useRef(null) // { x, y } or null
   const prevOpenRef = useRef(open)
+
+  // Swipe-left-to-close, ported faithfully from the Möbius shell Drawer:
+  // touchstart captures the origin (only while open + single touch),
+  // touchmove drags the panel 1:1 with the finger when the gesture is
+  // dominantly horizontal-left, touchend either closes (>=70px past origin
+  // AND horizontal-dominant) or snaps back. The CSS transition is disabled
+  // mid-drag via `file-drawer--dragging` so the panel tracks the finger
+  // without easing; on release the normal transform-transition animates the
+  // snap/close. Scrim-click-to-close stays the separate, intact path.
+  const drawerWidth = useCallback(() => {
+    const el = drawerRef.current
+    if (el && el.offsetWidth) return el.offsetWidth
+    return Math.min(window.innerWidth * 0.78, 320)
+  }, [])
+
+  const onTouchStart = useCallback((e) => {
+    if (!open || e.touches.length !== 1) return
+    dragStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }
+  }, [open])
+
+  const onTouchMove = useCallback((e) => {
+    if (!dragStart.current || e.touches.length !== 1) return
+    const dx = e.touches[0].clientX - dragStart.current.x
+    const dy = e.touches[0].clientY - dragStart.current.y
+    if (dx < 0 && Math.abs(dx) > Math.abs(dy) * 1.15) {
+      const el = drawerRef.current
+      if (!el) return
+      el.classList.add('file-drawer--dragging')
+      el.style.transform = `translateX(${Math.max(dx, -drawerWidth())}px)`
+    }
+  }, [drawerWidth])
+
+  const onTouchEnd = useCallback((e) => {
+    if (!dragStart.current) return
+    const t = e.changedTouches[0]
+    const dx = t.clientX - dragStart.current.x
+    const dy = t.clientY - dragStart.current.y
+    const shouldClose = dx < -70 && Math.abs(dx) > Math.abs(dy) * 1.35
+    const el = drawerRef.current
+    if (el) {
+      el.classList.remove('file-drawer--dragging')
+      if (shouldClose) {
+        // Animate from the drag position to closed, then clear the inline
+        // transform after the transition so the next open doesn't start from
+        // translateX(-100%) inline (which would fight .file-drawer--open).
+        el.style.transform = 'translateX(-100%)'
+        const cleanup = () => {
+          if (el) el.style.transform = ''
+          el.removeEventListener('transitionend', cleanup)
+        }
+        el.addEventListener('transitionend', cleanup, { once: true })
+      } else {
+        // Snap back to open: clearing the inline transform lets the
+        // .file-drawer--open class's translateX(0) take over with the
+        // transition running from the drag position.
+        el.style.transform = ''
+      }
+    }
+    dragStart.current = null
+    if (shouldClose) onClose?.()
+  }, [onClose])
+
+  // touchcancel positions are unreliable (clientX can be 0 or stale);
+  // treat cancel as "snap back, don't close" — never evaluate the threshold.
+  const onTouchCancel = useCallback(() => {
+    const el = drawerRef.current
+    if (el) {
+      el.classList.remove('file-drawer--dragging')
+      el.style.transform = ''
+    }
+    dragStart.current = null
+  }, [])
   // Hidden inputs the Upload buttons click programmatically. Two separate
   // inputs because `webkitdirectory` and a plain multi-file picker can't share
   // one element — the directory flag turns the whole picker into folder mode.
@@ -1116,9 +1190,14 @@ function FileNavPanel({
         aria-hidden="true"
       />
       <aside
+        ref={drawerRef}
         className={`file-drawer ${open ? 'file-drawer--open' : ''}`}
         aria-label="File tree"
         aria-hidden={!open}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchCancel}
       >
         <div className="drawer-head">
           <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
@@ -3151,9 +3230,16 @@ const CSS = `
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
 }
-.nav-toggle:active { background: var(--surface2); }
-.nav-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Bare like the Möbius shell's .shell__brand: closing the drawer must leave
+   NO highlight or bounding box, so no :active background and no focus ring
+   on either :focus or :focus-visible. */
+.nav-toggle:focus,
+.nav-toggle:focus-visible { outline: none; }
 .nav-toggle-logo { display: block; object-fit: cover; }
 .top-title {
   min-width: 0;
@@ -3406,6 +3492,10 @@ const CSS = `
   flex-direction: column;
 }
 .file-drawer--open { transform: translateX(0); }
+/* While the finger drags, kill the transform-transition so the panel tracks
+   1:1; on release the inline class is removed and the normal transition
+   animates the snap-back or close. Mirrors the shell's .drawer--dragging. */
+.file-drawer--dragging { transition: none; }
 .drawer-head {
   display: flex;
   align-items: center;
