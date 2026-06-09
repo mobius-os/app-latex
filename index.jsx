@@ -309,6 +309,17 @@ function makeStorage(appId, token) {
     }
     return r.blob()
   }
+  async function getBlobFresh(path) {
+    // Server-canonical blob read, bypassing the runtime's cache-first blob
+    // mirror. After a successful build the PDF at a DETERMINISTIC path
+    // (files/x.pdf) changes bytes without changing its key, so the mirror can
+    // hand back the previous build's blob. Newer runtimes expose getBlobFresh;
+    // on those without it, ms.getBlob now re-checks the server (the shell was
+    // fixed), and the direct fetch below is the last fallback.
+    if (ms && typeof ms.getBlobFresh === 'function') return ms.getBlobFresh(path)
+    if (ms && typeof ms.getBlob === 'function') return ms.getBlob(path)
+    return getBlob(path)
+  }
   async function setText(path, text) {
     // Write through the runtime's TYPED text writer — ms.set is the JSON writer
     // (sends application/json + JSON.stringify), which corrupts/400s a .tex or
@@ -365,7 +376,7 @@ function makeStorage(appId, token) {
     return () => {}
   }
   return {
-    get, getFresh, getBlob,
+    get, getFresh, getBlob, getBlobFresh,
     setText, setBlob, setJSON, remove,
     subscribeText,
     pendingCount,
@@ -602,6 +613,22 @@ function ToolIcon({ name, size = 24 }) {
   )
 }
 
+// Vertical ⋯ kebab for the per-row actions button. A visible, always-faint
+// handle onto the same Rename / Delete / Set-main menu the right-click and
+// long-press gestures open — so the destructive action is discoverable on
+// touch without a hidden long-press.
+function KebabIcon({ size = 18 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden>
+      <circle cx="12" cy="5" r="0.6" />
+      <circle cx="12" cy="12" r="0.6" />
+      <circle cx="12" cy="19" r="0.6" />
+    </svg>
+  )
+}
+
 // Detect whether a path's leaf is a file (vs a folder we haven't
 // expanded yet). For the index-driven tree, anything in the flat
 // list IS a file; folders only exist as intermediate path segments.
@@ -704,6 +731,16 @@ function FileNode({
   const longPress = useLongPress((cx, cy) => {
     onContextMenu({ x: cx, y: cy, path: node.path, isFolder })
   })
+  // Open the per-row action menu (Set main / Rename / Delete) anchored at the
+  // kebab button. Same menu the right-click / long-press gesture opens — the
+  // visible ⋯ button just makes those actions (the destructive Delete in
+  // particular) discoverable without a hidden long-press.
+  const openMenuFromButton = useCallback((e, isFolderItem) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const r = e.currentTarget.getBoundingClientRect()
+    onContextMenu({ x: r.right, y: r.bottom, path: node.path, isFolder: isFolderItem })
+  }, [node.path, onContextMenu])
   if (node.children.size === 0 && node.isFile) {
     const selected = node.path === selectedPath
     const isMain = node.path === mainPath
@@ -711,63 +748,74 @@ function FileNode({
     // Discoverable "set as main document" affordance: a visible target button
     // on every .tex that isn't already the main doc, alongside the existing
     // right-click / long-press context-menu path (which still works). The
-    // current target is marked with a filled "main" badge instead. We render
-    // the control as a role="button" span (not a nested <button>, which is
-    // invalid inside the row's own <button>) and stop propagation so tapping
-    // it sets the target without also selecting/opening the file.
+    // current target is marked instead with a single compact accent glyph (the
+    // bullseye) — no text chip. We render the control as a role="button" span
+    // (not a nested <button>, which is invalid inside the row's own <button>)
+    // and stop propagation so tapping it sets the target without also
+    // selecting/opening the file.
     const activateSetMain = (e) => {
       e.preventDefault()
       e.stopPropagation()
       if (onSetMain) onSetMain(node.path)
     }
     return (
-      <button
-        type="button"
-        className={`tree-file ${selected ? 'tree-file--selected' : ''}`}
-        style={{ paddingLeft: `${10 + depth * 16}px` }}
-        role="treeitem"
-        aria-level={depth + 1}
-        aria-selected={selected}
-        tabIndex={-1}
-        data-tree-path={node.path}
-        data-parent-path={parentPath}
-        data-tree-kind="file"
-        onClick={() => onSelect(node.path)}
-        // Draggable so a file can be dropped onto a folder (or the root) to
-        // move it. dataTransfer carries the source path.
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer.setData('text/mobius-path', node.path)
-          e.dataTransfer.effectAllowed = 'move'
-        }}
-        onContextMenu={(e) => {
-          e.preventDefault()
-          onContextMenu({ x: e.clientX, y: e.clientY, path: node.path, isFolder: false })
-        }}
-        {...longPress}
-      >
-        <span className="tree-icon">{fileIcon(node.name)}</span>
-        <span className="tree-name">{node.name}</span>
-        {isMain && (
-          <span className="tree-main-badge" title="Build compiles this file (the main document)">
-            <ToolIcon name="target" size={13} />
-            main
-          </span>
-        )}
-        {isTex && !isMain && onSetMain && (
-          <span
-            className="tree-set-main"
-            role="button"
-            tabIndex={0}
-            aria-label="Set as main document"
-            title="Set as main document (Build will compile this file)"
-            onClick={activateSetMain}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') activateSetMain(e) }}
-          >
-            <ToolIcon name="target" size={16} />
-          </span>
-        )}
-      </button>
+      <div className="tree-row">
+        <button
+          type="button"
+          className={`tree-file ${selected ? 'tree-file--selected' : ''}`}
+          style={{ paddingLeft: `${10 + depth * 16}px` }}
+          role="treeitem"
+          aria-level={depth + 1}
+          aria-selected={selected}
+          tabIndex={-1}
+          data-tree-path={node.path}
+          data-parent-path={parentPath}
+          data-tree-kind="file"
+          onClick={() => onSelect(node.path)}
+          // Draggable so a file can be dropped onto a folder (or the root) to
+          // move it. dataTransfer carries the source path.
+          draggable
+          onDragStart={(e) => {
+            e.dataTransfer.setData('text/mobius-path', node.path)
+            e.dataTransfer.effectAllowed = 'move'
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            onContextMenu({ x: e.clientX, y: e.clientY, path: node.path, isFolder: false })
+          }}
+          {...longPress}
+        >
+          <span className="tree-icon">{fileIcon(node.name)}</span>
+          <span className="tree-name">{node.name}</span>
+          {isMain && (
+            <span className="tree-main-glyph" title="Build compiles this file (the main document)" aria-label="Main document">
+              <ToolIcon name="target" size={15} />
+            </span>
+          )}
+          {isTex && !isMain && onSetMain && (
+            <span
+              className="tree-set-main"
+              role="button"
+              tabIndex={0}
+              aria-label="Set as main document"
+              title="Set as main document (Build will compile this file)"
+              onClick={activateSetMain}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') activateSetMain(e) }}
+            >
+              <ToolIcon name="target" size={16} />
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          className="tree-menu-btn"
+          aria-label={`Actions for ${node.name}`}
+          title="File actions"
+          onClick={(e) => openMenuFromButton(e, false)}
+        >
+          <KebabIcon />
+        </button>
+      </div>
     )
   }
   // Folder node — own row plus indented children. We filter `.keep`
@@ -833,40 +881,51 @@ function FileNode({
   }
   return (
     <>
-      <button
-        type="button"
-        className={`tree-folder ${dropActive ? 'tree-drop-active' : ''}`}
-        style={{ paddingLeft: `${10 + depth * 16}px` }}
-        role="treeitem"
-        aria-level={depth + 1}
-        aria-expanded={expanded}
-        tabIndex={-1}
-        data-tree-path={node.path}
-        data-parent-path={parentPath}
-        data-tree-kind="folder"
-        onClick={() => setExpanded((e) => !e)}
-        onKeyDown={(e) => {
-          if (e.key === 'ArrowRight' && !expanded) {
+      <div className="tree-row">
+        <button
+          type="button"
+          className={`tree-folder ${dropActive ? 'tree-drop-active' : ''}`}
+          style={{ paddingLeft: `${10 + depth * 16}px` }}
+          role="treeitem"
+          aria-level={depth + 1}
+          aria-expanded={expanded}
+          tabIndex={-1}
+          data-tree-path={node.path}
+          data-parent-path={parentPath}
+          data-tree-kind="folder"
+          onClick={() => setExpanded((e) => !e)}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowRight' && !expanded) {
+              e.preventDefault()
+              setExpanded(true)
+            } else if (e.key === 'ArrowLeft' && expanded) {
+              e.preventDefault()
+              setExpanded(false)
+            }
+          }}
+          // Folders are drop targets for moves.
+          onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropActive(true) }}
+          onDragLeave={() => setDropActive(false)}
+          onDrop={(e) => dropMove(e, node.path)}
+          onContextMenu={(e) => {
             e.preventDefault()
-            setExpanded(true)
-          } else if (e.key === 'ArrowLeft' && expanded) {
-            e.preventDefault()
-            setExpanded(false)
-          }
-        }}
-        // Folders are drop targets for moves.
-        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropActive(true) }}
-        onDragLeave={() => setDropActive(false)}
-        onDrop={(e) => dropMove(e, node.path)}
-        onContextMenu={(e) => {
-          e.preventDefault()
-          onContextMenu({ x: e.clientX, y: e.clientY, path: node.path, isFolder: true })
-        }}
-        {...longPress}
-      >
-        <span className="tree-icon">{expanded ? '▾' : '▸'}</span>
-        <span className="tree-name">{node.name}/</span>
-      </button>
+            onContextMenu({ x: e.clientX, y: e.clientY, path: node.path, isFolder: true })
+          }}
+          {...longPress}
+        >
+          <span className="tree-icon">{expanded ? '▾' : '▸'}</span>
+          <span className="tree-name">{node.name}/</span>
+        </button>
+        <button
+          type="button"
+          className="tree-menu-btn"
+          aria-label={`Actions for ${node.name} folder`}
+          title="Folder actions"
+          onClick={(e) => openMenuFromButton(e, true)}
+        >
+          <KebabIcon />
+        </button>
+      </div>
       {expanded && (
         <div role="group" className="tree-group">
           {sortedChildren.map((c) => (
@@ -901,6 +960,7 @@ function FileNode({
 // the handler refuses too, but greying the buttons is the honest surface
 // rather than a tap that pops an explanatory modal.
 function FileNavPanel({
+  appId,
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
   onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
@@ -1025,7 +1085,16 @@ function FileNavPanel({
       >
         <div className="drawer-head">
           <div>
-            <span className="drawer-title">Files</span>
+            <span className="drawer-brand">
+              <img
+                className="drawer-brand-logo"
+                src={`/api/apps/${appId}/icon`}
+                width={24}
+                height={24}
+                alt=""
+              />
+              <span className="drawer-brand-name">LaTeX</span>
+            </span>
             <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
           </div>
         </div>
@@ -1118,46 +1187,12 @@ function FileNavPanel({
 // iframe, so this app does not duplicate SSE handling, composer state,
 // attachments, provider controls, queueing, or polling.
 // ----------------------------------------------------------------------
-function bootstrapPrompt(appId) {
+function bootstrapPrompt() {
   return [
-    `You are the LaTeX-editor sub-agent for Möbius app id ${appId}.`,
-    '',
-    `Your working directory is /data/apps/${appId}/files/. Edit .tex files`,
-    'there using the Edit and Write tools. The user describes documents in',
-    'prose; you translate that to LaTeX. Your default action is to modify',
-    'the project files, not to solve the task only in chat. If the user asks',
-    'for a derivation, proof, rewrite, section, table, bibliography, or figure',
-    'that belongs in the document, write it into the current/main .tex file',
-    'unless they explicitly ask for a chat-only explanation. Keep the user’s',
-    'intent; do not invent sections they did not ask for. After editing,',
-    'summarise the change in ONE short sentence — the embedded chat panel',
-    'renders only the last assistant message.',
-    '',
-    `After creating or deleting a file, append/remove its path (relative to`,
-    `/data/apps/${appId}/files/, e.g. "files/chapter1.tex") in the JSON`,
-    `array at /data/apps/${appId}/files-index.json. The mini-app reads`,
-    'that file to populate its file tree; new files are invisible to the',
-    'user until the index is updated.',
-    '',
-    'Folders created by the user appear as a `<folder>/.keep` placeholder',
-    'in the index — the storage backend has no mkdir, so an empty folder',
-    'is materialised by writing that 0-byte file. Leave .keep files alone',
-    'unless the user explicitly asks to remove the folder.',
-    '',
-    `The MAIN document — the single root .tex the user compiles — is recorded`,
-    `at /data/apps/${appId}/main.json as {"path": "files/<root>.tex"}. The`,
-    'Build button always compiles that file. If you create a brand-new',
-    'project with a different root than files/welcome.tex, update main.json',
-    'to point at it (and keep its value to an existing .tex). The user can',
-    'also set it from the file drawer.',
-    '',
-    'To build manually after edits: write the main document path (for',
-    `example "files/welcome.tex") to /data/apps/${appId}/build/target.txt,`,
-    `then call: curl -sS -X POST -H "Authorization: Bearer $AGENT_TOKEN"`,
-    `"$API_BASE_URL/api/apps/${appId}/run-job". Poll or read`,
-    `/data/apps/${appId}/build/status.json for {"status":"done","pdf":...}`,
-    'or {"status":"error","log":...}. Report build errors briefly and fix',
-    'the .tex when the error is actionable.',
+    'You help the user write and compile their LaTeX documents in this app.',
+    'Use the embedded-app-agent skill, which carries the full methodology;',
+    'rely on the injected app_context for this app’s id, file paths, and',
+    'build commands.',
     '',
     'This is a silent setup brief — do NOT reply to it. Wait for the',
     'user’s first message and act on that.',
@@ -1177,7 +1212,7 @@ function ChatPanel({
   // streaming turn mid-flight. The turn-done handler reads the ref instead.
   const onFilesRef = useRef(onFilesMaybeChanged)
   useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
-  const systemPrompt = useMemo(() => bootstrapPrompt(appId), [appId])
+  const systemPrompt = useMemo(() => bootstrapPrompt(), [])
 
   // The helper owns the whole app-chat lifecycle: it creates the chat once
   // (POST /api/app-chats), persists its id as { id } under chat_id.json,
@@ -1220,10 +1255,6 @@ function ChatPanel({
 
   return (
     <section className="chat-panel">
-      <div className="chat-head">
-        <span className="chat-head-title">Agent</span>
-        <span className="chat-head-hint">Describe your document — it writes the LaTeX</span>
-      </div>
       {error && <div className="chat-error">{error}</div>}
       <div className="chat-embed" ref={mountRef} />
     </section>
@@ -1598,8 +1629,14 @@ function useBuild({ appId, token, storage, online }) {
       // The token gives each build a new value identity so PdfPreview refetches.
       const ver = (buildSeqRef.current += 1)
       setPdfByDoc((prev) => ({ ...prev, [doc]: { pdf, ver } }))
+      // Pull the just-built PDF from the server BEFORE PdfPreview re-reads it,
+      // so the runtime's cache-first blob mirror holds the new bytes (and not
+      // the prior build's tombstoned/stale blob) when the viewer asks. Fire-
+      // and-forget: PdfPreview's own getBlob is the real read; this just warms
+      // the cache so the fresh PDF shows immediately on build-done.
+      storage.getBlobFresh(pdf).catch(() => {})
     }
-  }, [clearPoll])
+  }, [clearPoll, storage])
 
   const finishError = useCallback((log) => {
     clearPoll()
@@ -2687,7 +2724,6 @@ export default function App({ appId, token }) {
   // always compiles the MAIN file and the PDF view shows its output, so both
   // controls track the main doc, not the currently-open file (Overleaf model).
   const hasMain = !!mainPath
-  const selectedIsMain = !!selectedPath && selectedPath === mainPath
   // The PDF compiled from the MAIN document this session, if any: a
   // { pdf, ver } record (ver is the build token, see useBuild). The PDF view
   // is gated on this so a never-built doc can't show a blank canvas.
@@ -2926,7 +2962,6 @@ export default function App({ appId, token }) {
           {openName
             ? <span className="top-path" title={selectedPath}>{openName}</span>
             : <span className="top-path top-path--muted">No file open</span>}
-          {selectedIsMain && <span className="top-main-badge" title="Build compiles this file">Build target</span>}
         </div>
         <div className="top-actions">
           {showTexControls && (
@@ -2976,6 +3011,7 @@ export default function App({ appId, token }) {
         style={{ '--chat-panel-height': `${chatHeight}%` }}
       >
         <FileNavPanel
+          appId={appId}
           open={navOpen}
           onClose={closeNav}
           files={files}
@@ -3088,15 +3124,6 @@ const CSS = `
   text-overflow: ellipsis;
 }
 .top-path--muted { color: var(--muted); font-weight: 400; }
-.top-main-badge {
-  flex: 0 0 auto;
-  padding: 3px 7px;
-  border-radius: 7px;
-  font: 650 11px/1.2 var(--font);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-}
 .top-actions {
   display: inline-flex;
   align-items: center;
@@ -3336,7 +3363,20 @@ const CSS = `
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
 }
-	.drawer-title { display: block; font-size: 14px; font-weight: 700; }
+	/* Brand row mirroring the shell brand: the app's own icon + its name. */
+	.drawer-brand {
+	  display: flex;
+	  align-items: center;
+	  gap: 8px;
+	}
+	.drawer-brand-logo {
+	  flex: 0 0 auto;
+	  width: 24px;
+	  height: 24px;
+	  border-radius: 6px;
+	  object-fit: cover;
+	}
+	.drawer-brand-name { font-size: 14px; font-weight: 600; }
 	.drawer-count {
 	  display: block;
 	  margin-top: 2px;
@@ -3382,11 +3422,20 @@ const CSS = `
   color: var(--muted);
   line-height: 1.5;
 }
+	/* Each tree row pairs the (flex-growing) file/folder button with a trailing
+	   ⋯ menu button. The row is the hover unit so the menu button reveals with
+	   the row on a pointer device; on touch it stays visible (see below). */
+	.tree-row {
+	  display: flex;
+	  align-items: stretch;
+	  width: 100%;
+	}
 	.tree-file, .tree-folder {
   display: flex;
   align-items: center;
   gap: 7px;
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 44px;
   padding: 7px 12px;
   text-align: left;
@@ -3397,6 +3446,30 @@ const CSS = `
   font-size: 13px;
 	  font-family: var(--font);
 	  outline: none;
+	}
+	/* Per-row ⋯ actions button: faint until the row is hovered/focused so it
+	   doesn't compete with the filename; on touch (no hover) it stays visible so
+	   the actions — Delete in particular — are reachable without a long-press. */
+	.tree-menu-btn {
+	  flex: 0 0 auto;
+	  width: 40px;
+	  min-height: 44px;
+	  display: inline-flex;
+	  align-items: center;
+	  justify-content: center;
+	  border: none;
+	  background: none;
+	  color: var(--muted);
+	  cursor: pointer;
+	  opacity: 0.5;
+	  transition: opacity 0.12s ease, color 0.12s ease;
+	}
+	.tree-row:hover .tree-menu-btn,
+	.tree-menu-btn:focus-visible { opacity: 1; }
+	.tree-menu-btn:hover { color: var(--text); }
+	.tree-menu-btn:active { color: var(--accent); }
+	@media (hover: none) {
+	  .tree-menu-btn { opacity: 1; }
 	}
 	.tree-file:hover, .tree-folder:hover {
 	  background: color-mix(in srgb, var(--accent) 8%, transparent);
@@ -3414,26 +3487,19 @@ const CSS = `
 	  box-shadow: inset 3px 0 0 var(--accent);
 	}
 	.tree-file--selected .tree-icon { color: var(--accent); }
-.tree-main-badge {
+/* The main / build-target marker: ONE compact accent glyph (the bullseye) on
+   that row — no text chip. Replaces both the old in-tree "main" badge and the
+   removed top-bar "Build target" chip. */
+.tree-main-glyph {
   margin-left: auto;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  padding: 2px 6px 2px 4px;
-  border-radius: 6px;
-  font: 650 9px/1.3 var(--font);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
 }
-	.tree-file--selected .tree-main-badge {
-	  color: var(--accent);
-	  background: color-mix(in srgb, var(--accent) 18%, transparent);
-	  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-	}
 /* Discoverable "set as main document" affordance: a muted target icon on
    the right of every non-main .tex row, brightening on hover/focus. It's the
    visible twin of the context-menu's "Set as main document" item. */
@@ -3557,27 +3623,6 @@ const CSS = `
   height: 3px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--muted) 65%, transparent);
-}
-.chat-head {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-height: 34px;
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.chat-head-title {
-  font: 700 11px/1 var(--font);
-  color: var(--muted);
-}
-.chat-head-hint {
-  font-size: 12px;
-  color: var(--muted);
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
 }
 .chat-embed {
   flex: 1 1 auto;
