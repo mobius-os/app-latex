@@ -311,14 +311,35 @@ function makeStorage(appId, token) {
   }
   async function getBlobFresh(path) {
     // Server-canonical blob read, bypassing the runtime's cache-first blob
-    // mirror. After a successful build the PDF at a DETERMINISTIC path
-    // (files/x.pdf) changes bytes without changing its key, so the mirror can
-    // hand back the previous build's blob. Newer runtimes expose getBlobFresh;
-    // on those without it, ms.getBlob now re-checks the server (the shell was
-    // fixed), and the direct fetch below is the last fallback.
+    // mirror. After a build the PDF at a DETERMINISTIC path (files/x.pdf)
+    // changes bytes without changing its key, so the mirror hands back the
+    // PREVIOUS build's blob. The runtime's plain getBlob is cache-first for a
+    // PRESENT blob — it only re-checks the server for an absent/tombstoned key
+    // — so falling back to ms.getBlob here returned the stale prior PDF on
+    // every rebuild (the "can't see the PDF after building" bug). Prefer the
+    // runtime's own fresh getter if it exposes one; otherwise fetch the bytes
+    // DIRECTLY with cache:'no-store' so a rebuild's new PDF actually shows.
+    // Only a network failure (offline) falls back to the cache-first mirror, so
+    // a previously-built PDF still opens without a connection.
     if (ms && typeof ms.getBlobFresh === 'function') return ms.getBlobFresh(path)
-    if (ms && typeof ms.getBlob === 'function') return ms.getBlob(path)
-    return getBlob(path)
+    let r
+    try {
+      r = await fetch(`/api/storage/apps/${appId}/${path}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
+      })
+    } catch (netErr) {
+      if (ms && typeof ms.getBlob === 'function') return ms.getBlob(path)
+      throw netErr
+    }
+    if (r.status === 404) return null
+    if (!r.ok) {
+      const err = new Error(`get blob ${path} → ${r.status}`)
+      err.name = 'BlobFetchError'
+      err.status = r.status
+      throw err
+    }
+    return r.blob()
   }
   async function setText(path, text) {
     // Write through the runtime's TYPED text writer — ms.set is the JSON writer
@@ -451,7 +472,10 @@ function PdfPreview({ storage, path, version }) {
         pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
         let blob
         try {
-          blob = await storage.getBlob(path)
+          // getBlobFresh re-reads from the server (cache:'no-store') so a
+          // just-rebuilt PDF at the same path shows the new bytes, not the
+          // runtime mirror's stale prior build.
+          blob = await storage.getBlobFresh(path)
         } catch (fetchErr) {
           // getBlob throws only for transient/other transport failures (404 is
           // returned as null below); re-fetching may succeed, so make it
