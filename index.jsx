@@ -208,7 +208,7 @@ export function normalizeFileCacheSnapshot(parsed) {
 // LaTeX editor mini-app for Möbius — an Overleaf-style editor.
 //
 // Layout (mobile-first, VSCode-shaped):
-//   - Top bar: ☰ (toggle the left file drawer) · the open file's name
+//   - Top bar: the app logo (toggles the left file drawer) · the open file's name
 //     (+ a "main" badge if it's the document Build compiles) · a
 //     single row of icon buttons: a source/preview view toggle and a
 //     play-triangle Build button (both for .tex only; each icon button
@@ -950,7 +950,7 @@ function FileNode({
 
 // Left slide-in file drawer (VSCode explorer shape): a panel that
 // transforms in from the left edge over a dimming backdrop, opened by
-// the ☰ button in the top bar. It is ALWAYS mounted (the `--open` class
+// the app-logo toggle in the top bar. It is ALWAYS mounted (the `--open` class
 // drives the transform), so the slide animation plays both ways and the
 // tree state survives a close/reopen.
 //
@@ -960,7 +960,6 @@ function FileNode({
 // the handler refuses too, but greying the buttons is the honest surface
 // rather than a tap that pops an explanatory modal.
 function FileNavPanel({
-  appId,
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
   onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
@@ -1084,19 +1083,7 @@ function FileNavPanel({
         aria-hidden={!open}
       >
         <div className="drawer-head">
-          <div>
-            <span className="drawer-brand">
-              <img
-                className="drawer-brand-logo"
-                src={`/api/apps/${appId}/icon`}
-                width={24}
-                height={24}
-                alt=""
-              />
-              <span className="drawer-brand-name">LaTeX</span>
-            </span>
-            <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
-          </div>
+          <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
         </div>
         <div className="drawer-actions">
           <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>New file</button>
@@ -2949,14 +2936,33 @@ export default function App({ appId, token }) {
     <div className="latex-root">
       <style>{CSS}</style>
       <header className="top-bar">
+        {/* The app's own logo IS the file-drawer toggle (the shell pattern:
+            the brand logo, not a hamburger, opens the drawer). The icon comes
+            from the public /api/apps/<id>/icon route; if the app has no custom
+            icon (404), onError swaps in the ☰ glyph so the toggle still reads. */}
         <button
           ref={navToggleRef}
           className="nav-toggle"
           onClick={toggleNav}
-          aria-label={navOpen ? 'Close file drawer' : 'Open file drawer'}
+          aria-label={navOpen ? 'Close files' : 'Open files'}
           aria-expanded={navOpen}
+          title="Toggle files"
         >
-          ☰
+          <img
+            className="nav-toggle-logo"
+            src={`/api/apps/${appId}/icon`}
+            width={28}
+            height={28}
+            alt=""
+            style={{ borderRadius: 6 }}
+            onError={(e) => {
+              // No custom icon for this app — fall back to the hamburger glyph.
+              e.currentTarget.style.display = 'none'
+              const fallback = e.currentTarget.nextElementSibling
+              if (fallback) fallback.style.display = 'inline'
+            }}
+          />
+          <span className="nav-toggle-fallback" aria-hidden style={{ display: 'none' }}>☰</span>
         </button>
         <div className="top-title">
           {openName
@@ -3011,7 +3017,6 @@ export default function App({ appId, token }) {
         style={{ '--chat-panel-height': `${chatHeight}%` }}
       >
         <FileNavPanel
-          appId={appId}
           open={navOpen}
           onClose={closeNav}
           files={files}
@@ -3088,22 +3093,27 @@ const CSS = `
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
+/* The logo-as-toggle: a bare 44px tap target holding the app icon, so the
+   logo (not a hamburger) opens the file drawer — mirroring the Möbius shell. */
 .nav-toggle {
   flex: 0 0 auto;
   width: 44px;
   height: 44px;
   min-height: 44px;
   border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg);
+  border: none;
+  background: transparent;
   color: var(--text);
   font-size: 16px;
   cursor: pointer;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
 .nav-toggle:active { background: var(--surface2); }
+.nav-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nav-toggle-logo { display: block; object-fit: cover; }
 .top-title {
   min-width: 0;
   display: flex;
@@ -3187,7 +3197,7 @@ const CSS = `
 /* ---- body: content area + bounded chat, stacked ----
    position: relative so the absolutely-positioned file drawer + its
    backdrop resolve against THIS box — i.e. they overlay only the area
-   below the top bar, leaving the ☰ toggle always tappable. */
+   below the top bar, leaving the logo toggle always tappable. */
 .body {
   position: relative;
   flex: 1 1 auto;
@@ -3363,20 +3373,6 @@ const CSS = `
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
 }
-	/* Brand row mirroring the shell brand: the app's own icon + its name. */
-	.drawer-brand {
-	  display: flex;
-	  align-items: center;
-	  gap: 8px;
-	}
-	.drawer-brand-logo {
-	  flex: 0 0 auto;
-	  width: 24px;
-	  height: 24px;
-	  border-radius: 6px;
-	  object-fit: cover;
-	}
-	.drawer-brand-name { font-size: 14px; font-weight: 600; }
 	.drawer-count {
 	  display: block;
 	  margin-top: 2px;
