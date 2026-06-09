@@ -723,11 +723,16 @@ function useLongPress(onLongPress) {
 
 function FileNode({
   node, selectedPath, onSelect, depth,
-  onContextMenu, onMoveInto, mainPath, onSetMain, parentPath = '',
+  onContextMenu, onMoveInto, mainPath, onSetMain, openMenuPath, parentPath = '',
 }) {
   const [expanded, setExpanded] = useState(true)
   const [dropActive, setDropActive] = useState(false)
   const isFolder = !(node.children.size === 0 && node.isFile)
+  // The per-row ⋯ menu is open for THIS row when the open context-menu's
+  // anchor path matches ours. Mirrors the shell drawer's Radix trigger, which
+  // gets data-state="open" so the lit/accent-tinted kebab visibly belongs to
+  // the row whose menu is showing.
+  const menuOpen = openMenuPath === node.path
   const longPress = useLongPress((cx, cy) => {
     onContextMenu({ x: cx, y: cy, path: node.path, isFolder })
   })
@@ -745,8 +750,8 @@ function FileNode({
     const selected = node.path === selectedPath
     const isMain = node.path === mainPath
     const isTex = node.path.toLowerCase().endsWith('.tex')
-    // Discoverable "set as main document" affordance: a visible target button
-    // on every .tex that isn't already the main doc, alongside the existing
+    // Discoverable "set as build target" affordance: a visible target button
+    // on every .tex that isn't already the build target, alongside the existing
     // right-click / long-press context-menu path (which still works). The
     // current target is marked instead with a single compact accent glyph (the
     // bullseye) — no text chip. We render the control as a role="button" span
@@ -788,7 +793,7 @@ function FileNode({
           <span className="tree-icon">{fileIcon(node.name)}</span>
           <span className="tree-name">{node.name}</span>
           {isMain && (
-            <span className="tree-main-glyph" title="Build compiles this file (the main document)" aria-label="Main document">
+            <span className="tree-main-glyph" title="Build target — Build compiles this file" aria-label="Build target">
               <ToolIcon name="target" size={15} />
             </span>
           )}
@@ -797,8 +802,8 @@ function FileNode({
               className="tree-set-main"
               role="button"
               tabIndex={0}
-              aria-label="Set as main document"
-              title="Set as main document (Build will compile this file)"
+              aria-label="Set as build target"
+              title="Set as build target (Build will compile this file)"
               onClick={activateSetMain}
               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') activateSetMain(e) }}
             >
@@ -809,6 +814,9 @@ function FileNode({
         <button
           type="button"
           className="tree-menu-btn"
+          data-state={menuOpen ? 'open' : undefined}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
           aria-label={`Actions for ${node.name}`}
           title="File actions"
           onClick={(e) => openMenuFromButton(e, false)}
@@ -873,6 +881,7 @@ function FileNode({
             onMoveInto={onMoveInto}
             mainPath={mainPath}
             onSetMain={onSetMain}
+            openMenuPath={openMenuPath}
             parentPath=""
           />
         ))}
@@ -919,6 +928,9 @@ function FileNode({
         <button
           type="button"
           className="tree-menu-btn"
+          data-state={menuOpen ? 'open' : undefined}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
           aria-label={`Actions for ${node.name} folder`}
           title="Folder actions"
           onClick={(e) => openMenuFromButton(e, true)}
@@ -939,6 +951,7 @@ function FileNode({
               onMoveInto={onMoveInto}
               mainPath={mainPath}
               onSetMain={onSetMain}
+              openMenuPath={openMenuPath}
               parentPath={node.path}
             />
           ))}
@@ -1055,12 +1068,13 @@ function FileNavPanel({
     }
   }, [focusTreeItem, treeItems])
 
-  // Context actions. A .tex file additionally offers "Set as main
-  // document" (unless it already is the main) so the user can pick which
-  // file Build compiles, Overleaf-style.
+  // Context actions. A .tex file additionally offers "Set as build target"
+  // (unless it already is the target) so the user can pick which file Build
+  // compiles, Overleaf-style. The choice persists to main.json and Build
+  // writes it to build/target.txt.
   const ctxItems = ctx ? [
     ...(!ctx.isFolder && ctx.path.endsWith('.tex') && ctx.path !== mainPath
-      ? [{ label: 'Set as main document', onSelect: () => onSetMain(ctx.path) }]
+      ? [{ label: 'Set as build target', onSelect: () => onSetMain(ctx.path) }]
       : []),
     { label: 'Rename', onSelect: () => onRename(ctx.path) },
     {
@@ -1158,6 +1172,7 @@ function FileNavPanel({
               onMoveInto={onMove}
               mainPath={mainPath}
               onSetMain={onSetMain}
+              openMenuPath={ctx ? ctx.path : null}
             />
           )}
         </div>
@@ -2216,8 +2231,9 @@ export default function App({ appId, token }) {
     }
   }, [online, syncProjectFromStorage])
 
-  // Set a .tex as the main document (from the drawer context menu).
-  // Persists immediately so Build + reload agree on the target.
+  // Set a .tex as the build target (from the drawer's target button or its
+  // "…" menu). Persists immediately to main.json so Build + reload agree on
+  // the target; Build then writes the chosen path to build/target.txt.
   const handleSetMain = useCallback(async (path) => {
     if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return
     setMainPath(path)
@@ -2829,14 +2845,15 @@ export default function App({ appId, token }) {
     }
   }, [mainPath, fileDirty, fileSaving, canEditSelected, build, onBuildDone, handleSaveFile])
 
-  // The PDF view: the MAIN document's compiled output (with the build's
-  // running / failed states), since Build always compiles the main file.
+  // The PDF view: the build target's compiled output (with the build's
+  // running / failed states), since Build always compiles the target file.
   function renderPdfView() {
     if (!mainPath) {
       return (
         <div className="preview-note">
-          No main document set yet. Open the file drawer and long-press a
-          .tex file to set it as the main document, then Build.
+          No build target set yet. Open the file drawer and tap the target
+          icon on a .tex file (or use its “…” menu) to set it as the build
+          target, then Build.
         </div>
       )
     }
@@ -3000,8 +3017,8 @@ export default function App({ appId, token }) {
                 className="toolbar-btn toolbar-btn--primary"
                 onClick={handleBuild}
                 disabled={build.buildStatus === 'building'}
-                aria-label={build.buildStatus === 'building' ? 'Building the main document' : 'Build the main document'}
-                title={`Compile the main document (${mainPath.replace(/^files\//, '')})`}
+                aria-label={build.buildStatus === 'building' ? 'Building the build target' : 'Build the build target'}
+                title={`Compile the build target (${mainPath.replace(/^files\//, '')})`}
               >
                 <ToolIcon name="build" />
               </button>
@@ -3464,6 +3481,17 @@ const CSS = `
 	.tree-menu-btn:focus-visible { opacity: 1; }
 	.tree-menu-btn:hover { color: var(--text); }
 	.tree-menu-btn:active { color: var(--accent); }
+	/* Pressed/open state — while this row's action menu is open the kebab stays
+	   lit and accent-tinted (accent text + a subtle --accent-dim wash), the same
+	   treatment the shell drawer's kebab gets via data-state="open". It overrides
+	   the touch opacity reveal so the open menu visibly belongs to this row, and
+	   :active gives the same feedback on the press itself (touch has no hover). */
+	.tree-menu-btn[data-state="open"],
+	.tree-menu-btn:active {
+	  opacity: 1;
+	  color: var(--accent);
+	  background: var(--accent-dim, color-mix(in srgb, var(--accent) 12%, transparent));
+	}
 	@media (hover: none) {
 	  .tree-menu-btn { opacity: 1; }
 	}
@@ -3565,13 +3593,23 @@ const CSS = `
 }
 .ctx-item:active { background: var(--surface2, var(--surface)); }
 .ctx-item--danger { color: var(--danger); }
+/* File/folder glyph: a BARE glyph like the Möbius shell drawer's icons
+   (.drawer__item-icon) — no border, no background fill, no boxed padding.
+   Just the glyph, centred in a fixed inline slot for column alignment, in
+   the muted text color (the selected/main rows tint it via --accent). */
 .tree-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
+  width: 18px;
+  height: 18px;
   font-size: 12px;
+  line-height: 1;
   color: var(--muted);
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
   flex: 0 0 auto;
 }
 .tree-name {
