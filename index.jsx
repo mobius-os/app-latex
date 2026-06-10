@@ -1285,7 +1285,12 @@ function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
   onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
+  pinned = false,
 }) {
+  // On desktop (>=860px) the panel is a persistent left rail, never an overlay:
+  // it's always visible, the scrim/focus-trap/focus-return don't apply, and
+  // swipe-to-close is a no-op.
+  const shown = open || pinned
   const root = useMemo(() => buildTree(files), [files])
   const treeRef = useRef(null)
   const drawerRef = useRef(null)
@@ -1393,6 +1398,9 @@ function FileNavPanel({
   }, [focusTreeItem, selectedPath, treeItems])
 
   useEffect(() => {
+    // Pinned (desktop rail) never opens/closes, so don't auto-move focus into
+    // it on mount or yank focus back to the toggle — it's just part of the page.
+    if (pinned) { prevOpenRef.current = open; return }
     const wasOpen = prevOpenRef.current
     prevOpenRef.current = open
     if (open && !wasOpen) {
@@ -1402,7 +1410,7 @@ function FileNavPanel({
     if (!open && wasOpen) {
       returnFocusRef?.current?.focus?.()
     }
-  }, [focusSelectedOrFirst, open, returnFocusRef])
+  }, [focusSelectedOrFirst, open, returnFocusRef, pinned])
 
   const handleTreeFocus = useCallback((event) => {
     if (event.target === treeRef.current) focusSelectedOrFirst()
@@ -1469,23 +1477,29 @@ function FileNavPanel({
 
   return (
     <>
-      <div
-        className={`drawer-scrim ${open ? 'drawer-scrim--open' : ''}`}
-        onClick={onClose}
-        aria-hidden="true"
-      />
+      {/* No scrim for the pinned desktop rail — it doesn't overlay content. */}
+      {!pinned && (
+        <div
+          className={`drawer-scrim ${open ? 'drawer-scrim--open' : ''}`}
+          onClick={onClose}
+          aria-hidden="true"
+        />
+      )}
       <aside
         ref={drawerRef}
-        className={`file-drawer ${open ? 'file-drawer--open' : ''}`}
+        className={`file-drawer ${shown ? 'file-drawer--open' : ''} ${pinned ? 'file-drawer--pinned' : ''}`}
         aria-label="File tree"
-        aria-hidden={!open}
+        aria-hidden={!shown}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
       >
         <div className="drawer-head">
-          <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
+          <div className="drawer-head-text">
+            <span className="drawer-title">Files</span>
+            <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
+          </div>
         </div>
         <div className="drawer-actions">
           <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>New file</button>
@@ -2230,6 +2244,28 @@ export default function App({ appId, token }) {
   // always compiles the main file, so the PDF tab shows that one output
   // regardless of which file is currently open).
   const [viewMode, setViewMode] = useState('source')
+  // Desktop split: at >=860px the editor and PDF sit side-by-side (Overleaf's
+  // two-pane layout) and the file tree is a persistent rail, so the [Source|PDF]
+  // toggle is unnecessary. Below that we stay single-pane + toggle (phone/tablet).
+  // Drives only the .tex branch; everything else renders identically at any width.
+  const [isWide, setIsWide] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(min-width: 860px)').matches
+      : false
+  )
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const mq = window.matchMedia('(min-width: 860px)')
+    const onChange = (e) => setIsWide(e.matches)
+    setIsWide(mq.matches)
+    // addEventListener is the modern API; older Safari only has addListener.
+    if (mq.addEventListener) mq.addEventListener('change', onChange)
+    else mq.addListener(onChange)
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener('change', onChange)
+      else mq.removeListener(onChange)
+    }
+  }, [])
   // The designated MAIN document — the single root .tex that Build
   // compiles and the PDF view renders. Persisted in main.json and
   // defaulted (below) to the first .tex (preferring files/welcome.tex).
@@ -3331,12 +3367,29 @@ export default function App({ appId, token }) {
     if (selectedExt === 'pdf') {
       return <PdfPreview storage={storage} path={selectedPath} version={previewReloadKey} />
     }
+    // Desktop (>=860px): a .tex with a build target shows the Overleaf-style
+    // two-pane split — editable source on the left, the main doc's PDF on the
+    // right — instead of the single-pane toggle. The editor measure is capped
+    // by .split-editor so source doesn't stretch edge-to-edge on a wide monitor.
+    if (selectedIsTex && hasMain && isWide) {
+      return (
+        <div className="split">
+          <div className="split-editor">{renderEditor()}</div>
+          <div className="split-pdf">{renderPdfView()}</div>
+        </div>
+      )
+    }
     // PDF mode (only reachable for .tex selections via the toggle) shows the
     // MAIN document's compiled output.
     if (selectedIsTex && viewMode === 'pdf') {
       return renderPdfView()
     }
-    // Otherwise: the editable source for the open text file.
+    return renderEditor()
+  }
+
+  // The editable source for the open text file (or a read-only view of a
+  // managed .json). Extracted so the desktop split can place it beside the PDF.
+  function renderEditor() {
     if (fileLoading) return <div className="preview-note">Loading source…</div>
     if (fileError) return <div className="preview-note">{fileError}</div>
     // Managed .json files (files-index.json, main.json, chat_id.json, etc.) are
@@ -3415,6 +3468,9 @@ export default function App({ appId, token }) {
         <div className="top-actions">
           {showTexControls && (
             <>
+              {/* On desktop both panes show side-by-side, so the source/PDF
+                  toggle is redundant — only render it in single-pane (mobile). */}
+              {!isWide && (
               <div className="seg-toggle" role="tablist" aria-label="View mode">
                 <button
                   type="button"
@@ -3439,6 +3495,7 @@ export default function App({ appId, token }) {
                   <ToolIcon name="preview" />
                 </button>
               </div>
+              )}
               <button
                 className="toolbar-btn toolbar-btn--primary"
                 onClick={handleBuild}
@@ -3476,6 +3533,7 @@ export default function App({ appId, token }) {
           mainPath={mainPath}
           onSetMain={handleSetMain}
           returnFocusRef={navToggleRef}
+          pinned={isWide}
         />
         <main className="content">{renderMain()}</main>
         <div
@@ -3511,6 +3569,13 @@ export default function App({ appId, token }) {
 // --surface2|--muted|--font); no hard-coded brand colors anywhere.
 // ----------------------------------------------------------------------
 const CSS = `
+/* mobius-ui:Focus v1 -- shared keyboard focus ring (WCAG 2.4.7); never bare outline:none */
+:where(button,a,input,textarea,select,summary,[role="button"],[tabindex]:not([tabindex="-1"])):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* /mobius-ui:Focus */
+
 /* mobius-ui:Root v1 */
 .latex-root {
   position: relative;
@@ -3534,7 +3599,9 @@ const CSS = `
   align-items: center;
   gap: 10px;
   min-height: 48px;
-  padding: 6px 10px;
+  /* Top-pinned bar: grow the top pad into the device safe area (notch/status
+     bar) so the toolbar never sits under it on a full-bleed PWA. */
+  padding: max(6px, env(safe-area-inset-top)) 10px 6px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
@@ -3579,7 +3646,6 @@ const CSS = `
   text-overflow: ellipsis;
 }
 .top-path {
-  font-family: var(--font);
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -3720,7 +3786,7 @@ const CSS = `
   gap: 8px;
   padding: 24px;
 }
-.preview-empty-title { font-size: 26px; font-weight: 700; color: var(--text); letter-spacing: 0; }
+.preview-empty-title { font-size: 26px; font-weight: 700; color: var(--text); }
 .preview-empty-body { font-size: 14px; line-height: 1.5; max-width: 320px; }
 
 .preview-note {
@@ -3767,7 +3833,9 @@ const CSS = `
   border-radius: 8px;
   background: var(--surface);
   color: var(--text);
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* Same JetBrains Mono token as the CodeMirror scroller it sits beside, so
+     the build log doesn't diverge from the source editor's typeface. */
+  font: 12px/1.5 var(--mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -3896,12 +3964,27 @@ const CSS = `
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
 }
+.drawer-head-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.drawer-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.2;
+}
 	.drawer-count {
 	  display: block;
 	  margin-top: 2px;
 	  color: var(--muted);
 	  font-size: 11px;
 	  font-weight: 600;
+	  /* a count is metadata — mono token, tabular figures, matches the app's
+	     other numeric readouts (zoom %, sync pill). */
+	  font-family: var(--mono, ui-monospace, monospace);
+	  font-variant-numeric: tabular-nums;
 	}
 .drawer-actions {
   display: flex;
@@ -3966,12 +4049,15 @@ const CSS = `
   cursor: pointer;
   font-size: 13px;
 	  font-family: var(--font);
-	  outline: none;
 	  -webkit-tap-highlight-color: transparent;
 	  touch-action: manipulation;
 	  user-select: none;
 	  -webkit-user-select: none;
 	}
+	/* The inset accent bar is the pointer/keyboard cue; only suppress the
+	   default ring for non-keyboard focus so :focus-visible still rings. */
+	.tree-file:focus:not(:focus-visible),
+	.tree-folder:focus:not(:focus-visible) { outline: none; }
 	/* Per-row ⋯ actions button: faint until the row is hovered/focused so it
 	   doesn't compete with the filename; on touch (no hover) it stays visible so
 	   the actions — Delete in particular — are reachable without a long-press. */
@@ -4057,7 +4143,6 @@ const CSS = `
   color: var(--accent);
   opacity: 1;
   background: color-mix(in srgb, var(--accent) 12%, transparent);
-  outline: none;
 }
 .tree-file[draggable="true"] { cursor: grab; }
 /* Drop-target highlight while a drag hovers a folder or the root. */
@@ -4124,9 +4209,6 @@ const CSS = `
   line-height: 1;
   color: var(--muted);
   background: none;
-  border: none;
-  border-radius: 0;
-  padding: 0;
   flex: 0 0 auto;
 }
 .tree-name {
@@ -4169,7 +4251,6 @@ const CSS = `
 .chat-resizer:hover,
 .chat-resizer:focus-visible {
   background: color-mix(in srgb, var(--accent) 12%, var(--surface));
-  outline: none;
 }
 .chat-resizer-bar {
   width: 44px;
@@ -4244,10 +4325,12 @@ const CSS = `
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 8px;
-  outline: none;
   margin-bottom: 14px;
   box-sizing: border-box;
 }
+/* Border-tint + inner ring is the focus cue; suppress the default outline
+   only for non-keyboard focus so :focus-visible still gets the shared ring. */
+.modal-input:focus:not(:focus-visible) { outline: none; }
 .modal-input:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .modal-actions {
   display: flex;
@@ -4338,4 +4421,62 @@ const CSS = `
   box-shadow: none;
   white-space: nowrap;
 }
+
+/* mobius-ui:Desktop v1 -- at >=860px the phone stack becomes the Overleaf
+   three-pane layout: a persistent file-tree rail, then a two-pane editor/PDF
+   split (handled in renderMain), with the chat docked below the split. The
+   body switches from a vertical flex stack to a CSS grid: the rail spans all
+   rows in column 1; content / resizer / chat fill column 2. The .split itself
+   caps the editor measure so source doesn't stretch edge-to-edge on a monitor. */
+@media (min-width: 860px) {
+  .body {
+    display: grid;
+    grid-template-columns: 264px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto auto;
+  }
+  /* The pinned rail: a static left column, not an overlay. Spans all rows. */
+  .file-drawer--pinned {
+    position: static;
+    grid-column: 1;
+    grid-row: 1 / -1;
+    width: auto;
+    max-width: none;
+    transform: none;
+    border-right: 1px solid var(--border);
+  }
+  /* Content / resizer / chat stack down the right column. */
+  .content { grid-column: 2; grid-row: 1; }
+  .chat-resizer { grid-column: 2; grid-row: 2; }
+  .chat-panel { grid-column: 2; grid-row: 3; }
+  /* Two-pane editor/PDF split. The editor measure is capped so long source
+     lines stay readable; the PDF pane takes the remaining width. */
+  .split { display: flex; flex: 1 1 auto; height: 100%; min-height: 0; }
+  .split-editor {
+    flex: 0 1 620px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .split-pdf { flex: 1 1 0; min-width: 0; overflow: hidden; }
+  /* Single-pane prose states (build errors, notes, the empty placeholder) get
+     a comfortable reading measure instead of stretching the full window. */
+  .preview-note, .build-error {
+    max-width: 760px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
+/* mobius-ui:ReducedMotion v1 -- honor the OS reduce-motion setting */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+/* /mobius-ui:ReducedMotion */
 `
