@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.3.8'
+const APP_VERSION = '2.3.9'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -412,29 +412,79 @@ function makeStorage(appId, token) {
 // fetch the file as a blob and convert to an object URL — <img src>
 // can't carry an Authorization header.
 // ----------------------------------------------------------------------
-function ImagePreview({ storage, path }) {
+// `reloadKey` is bumped by the parent on signals that the open file may have
+// been rewritten or deleted server-side (a chat turn finished, or the window
+// regained focus after another device touched it). The initial paint reads
+// cache-first (getBlob) so an offline reopen is instant; a later reload reads
+// getBlobFresh so a same-path REWRITE actually shows new bytes (the cache-first
+// mirror would otherwise hand back the stale prior image), and a DELETE
+// (blob === null) clears the stale preview to an honest note instead of leaving
+// the gone image on screen.
+function ImagePreview({ storage, path, reloadKey = 0 }) {
   const [url, setUrl] = useState(null)
   const [err, setErr] = useState(null)
+  // Track which path the live `url` belongs to. A path change shows the
+  // "Loading…" placeholder (we're switching files); a reloadKey bump on the
+  // SAME path keeps the current image painted until the fresh bytes arrive, so
+  // a background revalidation doesn't flash the placeholder.
+  const shownPathRef = useRef(null)
+  // The currently-committed object URL, so the unmount cleanup can revoke
+  // whatever is still displayed without the load effect having to (the load
+  // effect only owns URLs it created but never committed — see below).
+  const committedUrlRef = useRef(null)
+  const commitUrl = useCallback((next) => {
+    setUrl((prev) => {
+      if (prev && prev !== next) URL.revokeObjectURL(prev)
+      committedUrlRef.current = next
+      return next
+    })
+  }, [])
   useEffect(() => {
     let live = true
-    let revoke = null
-    setUrl(null); setErr(null)
-    storage.getBlob(path).then((blob) => {
-      if (!live || !blob) {
-        if (live) setErr('Image could not be loaded.')
+    let created = null
+    setErr(null)
+    if (shownPathRef.current !== path) {
+      // Different file: revoke whatever we were showing and clear to the
+      // loading placeholder.
+      commitUrl(null)
+      shownPathRef.current = path
+    }
+    // First paint reads cache-first (fast offline); a reload reads fresh so a
+    // same-path REWRITE shows new bytes instead of the cache-first mirror's
+    // stale prior image.
+    const fetcher = reloadKey > 0 && typeof storage.getBlobFresh === 'function'
+      ? storage.getBlobFresh(path)
+      : storage.getBlob(path)
+    fetcher.then((blob) => {
+      if (!live) return
+      if (!blob) {
+        // 404 / deleted: drop the now-stale object URL and show a note rather
+        // than keep painting a file that no longer exists.
+        commitUrl(null)
+        setErr('Image could not be loaded — it may have been deleted.')
         return
       }
       const u = URL.createObjectURL(blob)
-      revoke = u
-      setUrl(u)
+      created = u
+      commitUrl(u) // committed → owned by state; this run no longer revokes it
+      created = null
     }).catch((e) => {
       if (live) setErr(e.message || 'Image load failed.')
     })
     return () => {
       live = false
-      if (revoke) URL.revokeObjectURL(revoke)
+      // Revoke a URL this run created but didn't commit (fetch resolved after
+      // the effect was torn down). The committed URL is revoked on the next
+      // swap / path change, or on unmount by the effect below.
+      if (created) URL.revokeObjectURL(created)
     }
-  }, [storage, path])
+  }, [storage, path, reloadKey, commitUrl])
+  // Unmount-only: revoke the last displayed URL so leaving the image preview
+  // doesn't leak the final object URL.
+  useEffect(() => () => {
+    if (committedUrlRef.current) URL.revokeObjectURL(committedUrlRef.current)
+    committedUrlRef.current = null
+  }, [])
   if (err) return <div className="preview-note">{err}</div>
   if (!url) return <div className="preview-note">Loading image…</div>
   return <img className="img-preview" src={url} alt={path} />
@@ -2189,6 +2239,14 @@ export default function App({ appId, token }) {
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
   const build = useBuild({ appId, token, storage, online })
   const seenBuildStatusRef = useRef('')
+  // Bumped on signals that the open file's bytes may have changed underneath us
+  // (a chat turn finished — the agent likely rewrote files — or the window
+  // regained focus after another device edited them). Binary previews
+  // (image / tree-opened PDF) read this so a same-path REWRITE re-fetches fresh
+  // bytes; the text editor already revalidates via its own subscription + poll.
+  // Deliberately NOT bumped on the 5s timer, so a static preview doesn't flicker.
+  const [previewReloadKey, setPreviewReloadKey] = useState(0)
+  const bumpPreviewReload = useCallback(() => { setPreviewReloadKey((n) => n + 1) }, [])
 
   useEffect(() => {
     if (typeof localStorage === 'undefined') return
@@ -2330,7 +2388,16 @@ export default function App({ appId, token }) {
         // unselect so the preview pane shows the empty state rather
         // than a stale buffer. Also drop its cache entry so we
         // don't keep a body for a path that's been deleted.
-        if (selectedPath && !cleaned.includes(selectedPath)) {
+        //
+        // BUT never yank the file out from under an active edit: if the user
+        // has unsaved changes (dirty) or a save is in flight, a 5s index sync
+        // that observes an agent/other-device rename or delete would otherwise
+        // blank their buffer (setFileContent('')) and unselect mid-keystroke,
+        // silently losing the draft. We leave the selection + buffer intact in
+        // that case (the autosave will re-create the file at the path on its
+        // next write), matching the selected-file loader's own dirty guard.
+        const editingSelected = fileDirtyRef.current || fileSavingRef.current
+        if (selectedPath && !cleaned.includes(selectedPath) && !editingSelected) {
           setSelectedPath(null)
           setFileContent('')
           setFileCache((prev) => {
@@ -2556,32 +2623,26 @@ export default function App({ appId, token }) {
   useEffect(() => {
     if (!online) return undefined
     syncProjectFromStorage()
+    // The interval syncs project metadata only — it must NOT bump the preview
+    // reload, or an open image/PDF would flicker-refetch every 5s. A binary
+    // preview only re-fetches on the discrete signals below (focus / tab
+    // return), where another device may have rewritten the file.
     const interval = setInterval(syncProjectFromStorage, PROJECT_SYNC_MS)
+    const onFocus = () => { syncProjectFromStorage(); bumpPreviewReload() }
     const onVisible = () => {
-      if (document.visibilityState === 'visible') syncProjectFromStorage()
+      if (document.visibilityState === 'visible') {
+        syncProjectFromStorage()
+        bumpPreviewReload()
+      }
     }
-    window.addEventListener('focus', syncProjectFromStorage)
+    window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       clearInterval(interval)
-      window.removeEventListener('focus', syncProjectFromStorage)
+      window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [online, syncProjectFromStorage])
-
-  // Set a .tex as the build target (from the drawer's target button or its
-  // "…" menu). Persists immediately to main.json so Build + reload agree on
-  // the target; Build then writes the chosen path to build/target.txt.
-  const handleSetMain = useCallback(async (path) => {
-    if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return
-    setMainPath(path)
-    try {
-      await storage.setJSON('main.json', { path })
-      refreshPending()
-    } catch (e) {
-      await modal.alert(e.message || String(e), { title: 'Could not set main document' })
-    }
-  }, [storage, refreshPending, modal])
+  }, [online, syncProjectFromStorage, bumpPreviewReload])
 
   // Load the selected file's content. Cache-first for first paint, then
   // stale-while-revalidate while online: the editor starts from the
@@ -2726,7 +2787,11 @@ export default function App({ appId, token }) {
       // selected-file subscription applies the fresh value when it arrives.
       storage.get(path).catch(() => {})
     }
-  }, [syncProjectFromStorage, storage, online])
+    // A binary preview (image / tree-opened PDF) doesn't subscribe to storage,
+    // so nudge it to re-fetch fresh bytes — the agent may have regenerated a
+    // figure or the compiled PDF at the same path during this turn.
+    if (online) bumpPreviewReload()
+  }, [syncProjectFromStorage, storage, online, bumpPreviewReload])
 
   // Gate every UI write to files-index.json. Until we've confirmed the
   // index against the server (indexLoaded), `files` may be a stale or
@@ -2744,6 +2809,27 @@ export default function App({ appId, token }) {
     )
     return false
   }, [indexLoaded, modal])
+
+  // Set a .tex as the build target (from the drawer's target button or its
+  // "…" menu). Routed through the SAME index-confirmed gate as every other
+  // storage mutation: until the index has synced from the server, `mainPath`
+  // and the file list are only the (possibly stale/empty) localStorage
+  // snapshot, so persisting main.json from that state could queue a write that
+  // drains over the server's real main pointer on reconnect. We still flip the
+  // local selection optimistically once the gate passes; the write then queues
+  // through the runtime outbox (offline-safe, last-write-wins per path) exactly
+  // like handleCreateFile's index write does.
+  const handleSetMain = useCallback(async (path) => {
+    if (!isSafeStoragePath(path) || !path.endsWith('.tex')) return
+    if (!(await ensureIndexWritable())) return
+    setMainPath(path)
+    try {
+      await storage.setJSON('main.json', { path })
+      refreshPending()
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Could not set main document' })
+    }
+  }, [storage, refreshPending, modal, ensureIndexWritable])
 
   const handleCreateFile = useCallback(async () => {
     if (!(await ensureIndexWritable())) return
@@ -3236,12 +3322,14 @@ export default function App({ appId, token }) {
       )
     }
     // Images: always inline. A .pdf opened from the tree: the pdf.js viewer
-    // (static document, no build state).
+    // (static document, no build state). Both take previewReloadKey so a
+    // same-path rewrite/delete by the agent (or another device) re-fetches
+    // fresh bytes instead of stranding the stale preview on screen.
     if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(selectedExt)) {
-      return <ImagePreview storage={storage} path={selectedPath} />
+      return <ImagePreview storage={storage} path={selectedPath} reloadKey={previewReloadKey} />
     }
     if (selectedExt === 'pdf') {
-      return <PdfPreview storage={storage} path={selectedPath} />
+      return <PdfPreview storage={storage} path={selectedPath} version={previewReloadKey} />
     }
     // PDF mode (only reachable for .tex selections via the toggle) shows the
     // MAIN document's compiled output.
