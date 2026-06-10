@@ -5,6 +5,8 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
+const APP_VERSION = '2.3.8'
+
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
 // in the Source/PDF redesign. Files are shown as raw source in a CodeMirror
@@ -438,6 +440,15 @@ function ImagePreview({ storage, path }) {
   return <img className="img-preview" src={url} alt={path} />
 }
 
+// Zoom step ladder and helpers for the in-content PDF zoom.
+const ZOOM_STEPS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+const ZOOM_FIT = 1.0         // fit = pages fill container width
+const ZOOM_DOUBLE_TAP = 2.0  // double-tap toggles fit <-> 2×
+
+function clampZoom(z) {
+  return Math.max(ZOOM_STEPS[0], Math.min(ZOOM_STEPS[ZOOM_STEPS.length - 1], z))
+}
+
 // PDF preview — a real pdf.js canvas render. Mobile browsers refuse to
 // render a blob-URL PDF inline in an <iframe> (they offer an "open
 // externally" button instead), so we fetch the bytes ourselves and
@@ -452,8 +463,21 @@ function ImagePreview({ storage, path }) {
 // appendChild — it MUST NOT also carry React children, or React would
 // clobber the canvases on its next reconcile; that's why the loading
 // note is a SIBLING, not a child of the host.
+//
+// In-content zoom: pinch-to-zoom + double-tap + toolbar (+/−/fit).
+// The shell locks page pinch-zoom, so we implement our own using
+// pointer events. During a live pinch a CSS transform is applied to
+// .pdf-pages for instant feedback; on gesture end we re-render the
+// canvases at the committed scale via rerenderAtScale (reuses docRef,
+// no re-fetch). renderScale is state + a ref copy so gesture closures
+// read the latest value without stale captures.
 function PdfPreview({ storage, path, version }) {
-  const wrapRef = useRef(null)
+  const scrollRef = useRef(null)  // the scrollable .pdf-viewer wrapper
+  const pagesRef = useRef(null)   // the .pdf-pages canvas host
+  const docRef = useRef(null)     // the loaded pdfjs document (kept for re-render)
+  const numPagesRef = useRef(0)
+  const isRenderingRef = useRef(false)  // prevents concurrent re-render races
+
   // `err` is null when fine, otherwise { message, retryable }. We keep a
   // retryable flag so the same render can show a Retry button only when
   // re-attempting could actually help (a transport blip), but NOT for the
@@ -463,9 +487,71 @@ function PdfPreview({ storage, path, version }) {
   const [loading, setLoading] = useState(true)
   // Bumping this re-runs the load effect — the in-app Retry mechanism.
   const [retryNonce, setRetryNonce] = useState(0)
+
+  // renderScale drives crisp re-renders at the committed zoom level.
+  // renderScaleRef is a sync copy so gesture closures read the latest
+  // value without stale captures (React state reads are async).
+  const [renderScale, setRenderScale] = useState(ZOOM_FIT)
+  const renderScaleRef = useRef(ZOOM_FIT)
+
+  // Re-render all pages at a given scale using the already-loaded docRef.
+  // Does NOT re-fetch the PDF blob — reuses the pdfjs document in memory.
+  // isRenderingRef prevents two concurrent re-renders racing each other.
+  const rerenderAtScale = useCallback(async (scale) => {
+    const doc = docRef.current
+    const host = pagesRef.current
+    if (!doc || !host) return
+    if (isRenderingRef.current) return
+    isRenderingRef.current = true
+    try {
+      host.innerHTML = ''
+      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      const containerWidth = Math.max(
+        (scrollRef.current && scrollRef.current.clientWidth) || 600,
+        200,
+      )
+      for (let i = 1; i <= numPagesRef.current; i++) {
+        const page = await doc.getPage(i)
+        const base = page.getViewport({ scale: 1 })
+        const cssScale = (containerWidth / base.width) * scale
+        const vp = page.getViewport({ scale: cssScale * dpr })
+        const canvas = document.createElement('canvas')
+        canvas.className = 'pdf-page'
+        canvas.width = Math.floor(vp.width)
+        canvas.height = Math.floor(vp.height)
+        canvas.style.width = `${Math.floor(vp.width / dpr)}px`
+        canvas.style.height = `${Math.floor(vp.height / dpr)}px`
+        host.appendChild(canvas)
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
+      }
+      // Clear any live-preview CSS transform applied during pinch
+      host.style.transform = ''
+      host.style.transformOrigin = ''
+    } finally {
+      isRenderingRef.current = false
+    }
+  }, [])
+
+  // Re-render effect: fires when renderScale changes; skips the very first
+  // render (load effect handles that using renderScaleRef for initial paint).
+  const initialRenderDoneRef = useRef(false)
+  useEffect(() => {
+    if (!initialRenderDoneRef.current) return
+    rerenderAtScale(renderScale)
+  }, [renderScale, rerenderAtScale])
+
+  // Load effect: fetch + initial render. Runs on storage/path/version/retryNonce changes.
   useEffect(() => {
     let cancelled = false
+    // Reset state for a fresh load
+    initialRenderDoneRef.current = false
     setErr(null); setLoading(true)
+    // Destroy any prior document
+    if (docRef.current) {
+      try { docRef.current.destroy && docRef.current.destroy() } catch {}
+      docRef.current = null
+      numPagesRef.current = 0
+    }
     ;(async () => {
       try {
         const pdfjs = await import('pdfjs-dist')
@@ -493,28 +579,38 @@ function PdfPreview({ storage, path, version }) {
         const data = new Uint8Array(await blob.arrayBuffer())
         const doc = await pdfjs.getDocument({ data }).promise
         if (cancelled) { doc.destroy && doc.destroy(); return }
-        const host = wrapRef.current
+        docRef.current = doc
+        numPagesRef.current = doc.numPages
+        const host = pagesRef.current
         if (!host) return
-        host.innerHTML = ''            // imperative target — keep React children OUT of this node
+        // Initial paint uses renderScaleRef (sync) so the first render
+        // uses the current zoom without triggering the re-render effect.
+        const initScale = renderScaleRef.current
+        host.innerHTML = ''
         const dpr = Math.min(window.devicePixelRatio || 1, 2)
-        const cw = Math.max(host.clientWidth || 600, 200)
+        const containerWidth = Math.max(
+          (scrollRef.current && scrollRef.current.clientWidth) || 600,
+          200,
+        )
         for (let i = 1; i <= doc.numPages; i++) {
           if (cancelled) break
           const page = await doc.getPage(i)
           const base = page.getViewport({ scale: 1 })
-          const cssScale = cw / base.width
+          const cssScale = (containerWidth / base.width) * initScale
           const vp = page.getViewport({ scale: cssScale * dpr })
           const canvas = document.createElement('canvas')
           canvas.className = 'pdf-page'
           canvas.width = Math.floor(vp.width)
           canvas.height = Math.floor(vp.height)
-          canvas.style.width = '100%'
-          canvas.style.height = 'auto'
+          canvas.style.width = `${Math.floor(vp.width / dpr)}px`
+          canvas.style.height = `${Math.floor(vp.height / dpr)}px`
           host.appendChild(canvas)
           await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
         }
-        if (!cancelled) setLoading(false)
-        doc.destroy && doc.destroy()
+        if (!cancelled) {
+          setLoading(false)
+          initialRenderDoneRef.current = true
+        }
       } catch (e) {
         if (cancelled) return
         // A pdf.js parse failure on bytes that aren't a real PDF yet (empty
@@ -531,8 +627,111 @@ function PdfPreview({ storage, path, version }) {
         setLoading(false)
       }
     })()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      // Destroy doc on cleanup
+      if (docRef.current) {
+        try { docRef.current.destroy && docRef.current.destroy() } catch {}
+        docRef.current = null
+        numPagesRef.current = 0
+      }
+    }
   }, [storage, path, version, retryNonce])
+
+  // ----- Pinch-to-zoom gesture handlers -----
+  // Named onPinchStart/Move/End to avoid shadowing the double-tap touch handlers.
+  // During the gesture a CSS transform is applied to .pdf-pages for instant
+  // live preview; on gesture end we re-render at the committed scale.
+  const pinchRef = useRef(null) // { dist0, scale0 } captured at gesture start
+
+  const onPinchStart = useCallback((e) => {
+    if (e.touches.length !== 2) return
+    const dx = e.touches[0].clientX - e.touches[1].clientX
+    const dy = e.touches[0].clientY - e.touches[1].clientY
+    pinchRef.current = {
+      dist0: Math.sqrt(dx * dx + dy * dy),
+      scale0: renderScaleRef.current,
+    }
+  }, [])
+
+  const onPinchMove = useCallback((e) => {
+    if (e.touches.length !== 2 || !pinchRef.current) return
+    e.preventDefault()
+    const dx = e.touches[0].clientX - e.touches[1].clientX
+    const dy = e.touches[0].clientY - e.touches[1].clientY
+    const dist = Math.sqrt(dx * dx + dy * dy)
+    const ratio = dist / pinchRef.current.dist0
+    const liveScale = clampZoom(pinchRef.current.scale0 * ratio)
+    const host = pagesRef.current
+    if (host) {
+      const visualScale = liveScale / renderScaleRef.current
+      host.style.transform = `scale(${visualScale})`
+      host.style.transformOrigin = 'top center'
+    }
+  }, [])
+
+  const onPinchEnd = useCallback((e) => {
+    if (!pinchRef.current) return
+    const host = pagesRef.current
+    // Compute final scale from the last two-touch state before lifting
+    let finalScale = renderScaleRef.current
+    if (e.touches.length < 2 && e.changedTouches.length > 0) {
+      // Use the scale implied by the last move's transform ratio
+      if (host && host.style.transform) {
+        const m = host.style.transform.match(/scale\(([^)]+)\)/)
+        if (m) {
+          finalScale = clampZoom(renderScaleRef.current * parseFloat(m[1]))
+        }
+      }
+    }
+    pinchRef.current = null
+    // Snap to nearest ZOOM_STEPS entry
+    const snapped = ZOOM_STEPS.reduce((best, s) => (
+      Math.abs(s - finalScale) < Math.abs(best - finalScale) ? s : best
+    ), ZOOM_STEPS[0])
+    renderScaleRef.current = snapped
+    setRenderScale(snapped)
+    // rerenderAtScale will clear the CSS transform after re-painting
+  }, [])
+
+  // ----- Double-tap to toggle fit <-> 2× -----
+  const lastTapRef = useRef(0)
+  const onDoubleTap = useCallback((e) => {
+    const now = Date.now()
+    if (now - lastTapRef.current < 300) {
+      e.preventDefault()
+      const next = renderScaleRef.current === ZOOM_FIT ? ZOOM_DOUBLE_TAP : ZOOM_FIT
+      renderScaleRef.current = next
+      setRenderScale(next)
+    }
+    lastTapRef.current = now
+  }, [])
+
+  // ----- Zoom toolbar helpers -----
+  const zoomIn = useCallback(() => {
+    const cur = renderScaleRef.current
+    const next = ZOOM_STEPS.find((s) => s > cur + 0.001) ?? cur
+    renderScaleRef.current = next
+    setRenderScale(next)
+  }, [])
+
+  const zoomOut = useCallback(() => {
+    const cur = renderScaleRef.current
+    const arr = [...ZOOM_STEPS].reverse()
+    const next = arr.find((s) => s < cur - 0.001) ?? cur
+    renderScaleRef.current = next
+    setRenderScale(next)
+  }, [])
+
+  const zoomFit = useCallback(() => {
+    renderScaleRef.current = ZOOM_FIT
+    setRenderScale(ZOOM_FIT)
+  }, [])
+
+  const zoomPct = Math.round(renderScale * 100)
+  const atMin = renderScale <= ZOOM_STEPS[0] + 0.001
+  const atMax = renderScale >= ZOOM_STEPS[ZOOM_STEPS.length - 1] - 0.001
+
   if (err) {
     return (
       <div className="preview-note">
@@ -549,9 +748,45 @@ function PdfPreview({ storage, path, version }) {
     )
   }
   return (
-    <div className="pdf-viewer">
+    <div
+      className="pdf-viewer"
+      ref={scrollRef}
+      onTouchStart={onPinchStart}
+      onTouchMove={onPinchMove}
+      onTouchEnd={onPinchEnd}
+      onTouchCancel={onPinchEnd}
+    >
+      <div className="pdf-zoom-toolbar" aria-label="Zoom controls">
+        <button
+          type="button"
+          className="pdf-zoom-btn"
+          aria-label="Zoom out"
+          title="Zoom out"
+          onClick={zoomOut}
+          disabled={atMin}
+        >−</button>
+        <button
+          type="button"
+          className="pdf-zoom-btn pdf-zoom-pct"
+          aria-label={`Zoom level: ${zoomPct}%`}
+          title="Reset to fit width"
+          onClick={zoomFit}
+        >{zoomPct}%</button>
+        <button
+          type="button"
+          className="pdf-zoom-btn"
+          aria-label="Zoom in"
+          title="Zoom in"
+          onClick={zoomIn}
+          disabled={atMax}
+        >+</button>
+      </div>
       {loading && <div className="preview-note">Rendering PDF…</div>}
-      <div className="pdf-pages" ref={wrapRef} />
+      <div
+        className="pdf-pages"
+        ref={pagesRef}
+        onClick={onDoubleTap}
+      />
     </div>
   )
 }
@@ -3188,6 +3423,7 @@ export default function App({ appId, token }) {
 // --surface2|--muted|--font); no hard-coded brand colors anywhere.
 // ----------------------------------------------------------------------
 const CSS = `
+/* mobius-ui:Root v1 */
 .latex-root {
   position: relative;
   display: flex;
@@ -3202,6 +3438,7 @@ const CSS = `
   text-rendering: geometricPrecision;
 }
 
+/* mobius-ui:Toolbar v1 */
 .top-bar {
   flex: 0 0 auto;
   display: grid;
@@ -3282,6 +3519,8 @@ const CSS = `
   background: var(--bg);
   color: var(--text);
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 .toolbar-btn--primary {
   background: var(--accent);
@@ -3291,6 +3530,12 @@ const CSS = `
 .toolbar-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+.toolbar-btn:active { background: var(--surface2, var(--surface)); }
+.toolbar-btn--primary:active { background: color-mix(in srgb, var(--accent) 80%, #000); }
+@media (hover: hover) {
+  .toolbar-btn:hover:not(:disabled) { background: var(--surface2, var(--surface)); }
+  .toolbar-btn--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 85%, #000); }
 }
 
 /* ---- segmented source/preview toggle (icon-only) ---- */
@@ -3314,11 +3559,17 @@ const CSS = `
   background: none;
   color: var(--muted);
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 .seg-btn--active {
   background: var(--surface2, var(--surface));
   color: var(--text);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+.seg-btn:active { background: var(--surface2, var(--surface)); }
+@media (hover: hover) {
+  .seg-btn:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--text); }
 }
 
 /* ---- body: content area + bounded chat, stacked ----
@@ -3445,8 +3696,61 @@ const CSS = `
 .pdf-viewer {
   height: 100%;
   overflow-y: auto;
-  overflow-x: hidden;
+  overflow-x: auto;
   background: var(--surface2, var(--surface));
+  /* touch-action: none lets us intercept pinch/double-tap without the
+     browser's own page zoom interfering (shell already locks pinch-zoom,
+     this reinforces it at the component level). */
+  touch-action: none;
+  overscroll-behavior: contain;
+  position: relative;
+}
+/* Sticky zoom toolbar inside the viewer — backdrop-blurred so page content
+   doesn't visually merge with the controls while scrolling. */
+.pdf-zoom-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.pdf-zoom-btn {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.pdf-zoom-btn:disabled { opacity: 0.35; cursor: default; }
+.pdf-zoom-btn:active:not(:disabled) { background: var(--surface2, var(--surface)); }
+@media (hover: hover) {
+  .pdf-zoom-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+}
+/* The % readout button is slightly wider to fit the text. */
+.pdf-zoom-pct {
+  font-size: 13px;
+  min-width: 56px;
+  font-variant-numeric: tabular-nums;
 }
 .pdf-pages {
   display: flex;
@@ -3454,16 +3758,16 @@ const CSS = `
   align-items: center;
   gap: 14px;
   padding: 16px 12px 28px;
+  transform-origin: top center;
 }
 .pdf-page {
   display: block;
-  width: 100%;
-  max-width: 820px;
   border-radius: 4px;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.28);
   background: #fff;
 }
 
+/* mobius-ui:FileTree v1 */
 /* ---- file drawer ---- */
 .drawer-scrim {
   position: absolute;
@@ -3528,6 +3832,8 @@ const CSS = `
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 .drawer-btn:active { background: var(--surface2, var(--surface)); }
 .drawer-btn--danger { color: var(--danger); border-color: var(--danger); }
@@ -3573,6 +3879,10 @@ const CSS = `
   font-size: 13px;
 	  font-family: var(--font);
 	  outline: none;
+	  -webkit-tap-highlight-color: transparent;
+	  touch-action: manipulation;
+	  user-select: none;
+	  -webkit-user-select: none;
 	}
 	/* Per-row ⋯ actions button: faint until the row is hovered/focused so it
 	   doesn't compete with the filename; on touch (no hover) it stays visible so
@@ -3675,6 +3985,7 @@ const CSS = `
   display: block;
 }
 
+/* mobius-ui:ContextMenu v1 */
 /* In-app context menu (right-click / long-press). position: fixed so its
    left/top (set from the pointer's clientX/clientY — viewport coords) land
    exactly under the finger regardless of which positioned ancestor (the
@@ -3704,6 +4015,10 @@ const CSS = `
   color: var(--text);
   font: 550 13px/1.2 var(--font);
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
 }
 .ctx-item:active { background: var(--surface2, var(--surface)); }
 .ctx-item--danger { color: var(--danger); }
@@ -3731,6 +4046,7 @@ const CSS = `
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* mobius-ui:ChatEmbed v1 */
 /* ---- chat panel (bottom sheet, bounded height) ----
    The embedded shell chat runs inside an iframe (window.mobius.chat).
    The classic flexbox overflow trap is what cut the conversation off:
@@ -3749,6 +4065,7 @@ const CSS = `
   flex-direction: column;
   background: var(--surface);
   border-top: 1px solid var(--border);
+  overscroll-behavior: contain;
 }
 .chat-resizer {
   flex: 0 0 9px;
@@ -3795,6 +4112,7 @@ const CSS = `
   font-size: 12px;
 }
 
+/* mobius-ui:Sheet v1 */
 /* ---- modal ---- */
 .modal-scrim {
   position: absolute;
@@ -3859,7 +4177,10 @@ const CSS = `
   font-weight: 600;
   cursor: pointer;
   font-family: var(--font);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
+.modal-btn:active { filter: brightness(0.92); }
 .modal-btn--primary {
   background: var(--accent);
   color: #062016;
@@ -3872,6 +4193,7 @@ const CSS = `
 }
 .modal-btn--secondary { background: var(--surface); }
 
+/* mobius-ui:SyncPill v1 */
 /* ---- sync pill ----
    Bottom-right floating pill that surfaces unsynced writes / offline
    state. Hidden in the steady state (online + 0 pending) so it
