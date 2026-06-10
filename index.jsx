@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.3.9'
+const APP_VERSION = '2.4.0'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -616,7 +616,7 @@ function PdfPreview({ storage, path, version }) {
           // getBlob throws only for transient/other transport failures (404 is
           // returned as null below); re-fetching may succeed, so make it
           // retryable.
-          const e = new Error('Couldn’t load the PDF — tap Retry.')
+          const e = new Error("Couldn't load the PDF — tap Retry.")
           e.retryable = true
           throw e
         }
@@ -670,7 +670,7 @@ function PdfPreview({ storage, path, version }) {
         let retryable = !!(e && e.retryable)
         const en = e && e.name
         if (en === 'MissingPDFException' || en === 'InvalidPDFException') {
-          message = 'This file isn’t a valid PDF yet (it may be empty or still building).'
+          message = "This file isn't a valid PDF yet (it may be empty or still building)."
           retryable = false
         }
         setErr({ message, retryable })
@@ -1590,22 +1590,137 @@ function FileNavPanel({
 // Embedded shell chat. The runtime mounts the real ChatView into an
 // iframe, so this app does not duplicate SSE handling, composer state,
 // attachments, provider controls, queueing, or polling.
+//
+// In Read/Edit modes the chat rides inside a window.mobius.split() container
+// (pill ↔ split ↔ full) when that API is available. When absent (older shell)
+// we fall back to the bespoke chatHeight bottom-panel — identical behavior to
+// the previous version. The split path and the fallback path are clearly
+// fenced so they never touch each other's layout state.
 // ----------------------------------------------------------------------
 function bootstrapPrompt() {
   return [
-    'You help the user write and compile their LaTeX documents in this app.',
-    'Use the embedded-app-agent skill, which carries the full methodology;',
-    'rely on the injected app_context for this app’s id, file paths, and',
-    'build commands.',
-    '',
-    'This is a silent setup brief — do NOT reply to it. Wait for the',
-    'user’s first message and act on that.',
+    "You help the user write and compile their LaTeX documents in this app.",
+    "Use the embedded-app-agent skill, which carries the full methodology;",
+    "rely on the injected app_context for this app's id, file paths, and",
+    "build commands.",
+    "",
+    "This is a silent setup brief — do NOT reply to it. Wait for the",
+    "user's first message and act on that.",
   ].join('\n')
 }
 
+// Parse build log lines starting with "! " into ≤3 error chip strings.
+// Returns an empty array when the log is empty or has no such lines.
+export function parseBuildErrorChips(log) {
+  if (!log || typeof log !== 'string') return []
+  return log
+    .split('\n')
+    .filter((l) => l.startsWith('! '))
+    .map((l) => l.slice(2).trim())
+    .filter(Boolean)
+    .slice(0, 3)
+}
+
+// ---------------------------------------------------------------------------
+// ChatSplitPanel — mounts the embedded chat inside a window.mobius.split()
+// container. Requires the split API (guard is checked by the caller).
+// Renders: a root div with data-split-role="content" child + data-split-role="chat" child.
+// The split handle is injected by window.mobius.split() into the root div.
+// ---------------------------------------------------------------------------
+function ChatSplitPanel({
+  appId, token, storage,
+  onFilesMaybeChanged,
+  quickActions,
+  getContext,
+  contentChildren,
+  viewMode,
+}) {
+  const rootRef = useRef(null)
+  const chatMountRef = useRef(null)
+  const [chatError, setChatError] = useState(null)
+  const onFilesRef = useRef(onFilesMaybeChanged)
+  useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
+  const quickActionsRef = useRef(quickActions)
+  useEffect(() => { quickActionsRef.current = quickActions }, [quickActions])
+  const getContextRef = useRef(getContext)
+  useEffect(() => { getContextRef.current = getContext }, [getContext])
+  const systemPrompt = useMemo(() => bootstrapPrompt(), [])
+
+  // Mount split + chat together — both need the DOM ready. Destroy on unmount.
+  useEffect(() => {
+    const root = rootRef.current
+    const chatMount = chatMountRef.current
+    if (!root || !chatMount) return undefined
+    if (!window.mobius || typeof window.mobius.split !== 'function') return undefined
+    if (typeof window.mobius.chat !== 'function') return undefined
+
+    let disposed = false
+    let chatHandle = null
+    setChatError(null)
+
+    // 1. Wire split — the handle injects the drag bar into root.
+    const split = window.mobius.split({
+      mount: root,
+      defaultRatio: 0.65,
+      minContentPx: 120,
+      minChatPx: 96,
+      persistKey: 'latex-split-v1',
+    })
+
+    // 2. Wire chat — quickActions and getContext are live via refs so they
+    // reflect the latest build state without remounting the chat iframe.
+    window.mobius.chat({
+      mount: chatMount,
+      persist: 'chat_id.json',
+      title: 'LaTeX editor',
+      systemPrompt,
+      picker: true,
+      quickActions: quickActionsRef.current,
+      getContext: () => {
+        const fn = getContextRef.current
+        return fn ? fn() : null
+      },
+      onTurnDone: () => { if (onFilesRef.current) onFilesRef.current() },
+      onError: ({ error: e }) => {
+        if (!disposed) setChatError(typeof e === 'string' ? e : 'Embedded chat reported an error.')
+      },
+    }).then((h) => {
+      if (disposed) { h.destroy(); return }
+      chatHandle = h
+    }).catch((e) => {
+      if (!disposed) setChatError(e.message || 'Could not mount embedded chat.')
+    })
+
+    return () => {
+      disposed = true
+      split.destroy()
+      if (chatHandle) chatHandle.destroy()
+    }
+    // systemPrompt is stable (useMemo []); only re-mount when storage identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storage, systemPrompt])
+
+  return (
+    <div ref={rootRef} className="ma-root ma-root--split">
+      <div data-split-role="content" className="ma-split-content">
+        {contentChildren}
+      </div>
+      <div data-split-role="chat" className="ma-split-chat" ref={chatMountRef}>
+        {chatError && <div className="chat-error">{chatError}</div>}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// ChatPanel (fallback) — the original bespoke bottom-sheet used when
+// window.mobius.split is absent. Unchanged from 2.3.x behavior.
+// ---------------------------------------------------------------------------
 function ChatPanel({
   appId, token, storage,
   onFilesMaybeChanged,
+  quickActions,
+  getContext,
 }) {
   const mountRef = useRef(null)
   const [error, setError] = useState(null)
@@ -1616,6 +1731,10 @@ function ChatPanel({
   // streaming turn mid-flight. The turn-done handler reads the ref instead.
   const onFilesRef = useRef(onFilesMaybeChanged)
   useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
+  const quickActionsRef = useRef(quickActions)
+  useEffect(() => { quickActionsRef.current = quickActions }, [quickActions])
+  const getContextRef = useRef(getContext)
+  useEffect(() => { getContextRef.current = getContext }, [getContext])
   const systemPrompt = useMemo(() => bootstrapPrompt(), [])
 
   // The helper owns the whole app-chat lifecycle: it creates the chat once
@@ -1639,8 +1758,13 @@ function ChatPanel({
       title: 'LaTeX editor',
       systemPrompt,
       picker: true,
+      quickActions: quickActionsRef.current,
+      getContext: () => {
+        const fn = getContextRef.current
+        return fn ? fn() : null
+      },
       onTurnDone: () => { if (onFilesRef.current) onFilesRef.current() },
-      onError: ({ error }) => { setError(typeof error === 'string' ? error : 'Embedded chat reported an error.') },
+      onError: ({ error: e }) => { setError(typeof e === 'string' ? e : 'Embedded chat reported an error.') },
     }).then((nextHandle) => {
       if (disposed) {
         nextHandle.destroy()
@@ -2238,12 +2362,17 @@ export default function App({ appId, token }) {
   // and on a 10s background poll.
   const [pending, setPending] = useState(0)
   const [chatHeight, setChatHeight] = useState(() => readChatHeight(appId))
-  // Viewer mode, toggled by the [Source | PDF] segmented control in the
-  // top bar. 'source' shows the editable CodeMirror editor for the open file;
-  // 'pdf' shows the MAIN document's compiled PDF (Overleaf-style — Build
-  // always compiles the main file, so the PDF tab shows that one output
-  // regardless of which file is currently open).
-  const [viewMode, setViewMode] = useState('source')
+  // Tab mode: 'read' = full-screen PDF, 'edit' = full-screen CodeMirror, 'chat' = full-screen chat.
+  // On desktop (>=860px) the two-pane layout still takes over in the content area;
+  // the tab bar is mobile-first. viewMode mirrors 'source'/'pdf' for internal logic
+  // that relied on it (onBuildDone, seenBuildStatusRef).
+  const [tabMode, setTabMode] = useState('edit') // 'edit' | 'read' | 'chat'
+  // viewMode is derived from tabMode for backward-compatible logic inside the
+  // build callbacks and the desktop split. Always 'pdf' when tab is 'read', else 'source'.
+  const viewMode = tabMode === 'read' ? 'pdf' : 'source'
+  const setViewMode = useCallback((mode) => {
+    setTabMode(mode === 'pdf' ? 'read' : 'edit')
+  }, [])
   // Desktop split: at >=860px the editor and PDF sit side-by-side (Overleaf's
   // two-pane layout) and the file tree is a persistent rail, so the [Source|PDF]
   // toggle is unnecessary. Below that we stay single-pane + toggle (phone/tablet).
@@ -2838,9 +2967,9 @@ export default function App({ appId, token }) {
   const ensureIndexWritable = useCallback(async () => {
     if (indexLoaded) return true
     await modal.alert(
-      'Your file list hasn’t loaded yet. Reconnect (or wait for it to '
-        + 'sync) before adding or deleting files, so this doesn’t '
-        + 'overwrite work that’s already saved.',
+      "Your file list hasn't loaded yet. Reconnect (or wait for it to "
+        + "sync) before adding or deleting files, so this doesn't "
+        + "overwrite work that's already saved.",
       { title: 'File list not ready' },
     )
     return false
@@ -2900,7 +3029,9 @@ export default function App({ appId, token }) {
       setSelectedPath(path)
       closeNav()
       refreshPending()
+      try { if (window.mobius?.signal) window.mobius.signal('item_created', { type: 'tex-file' }) } catch (sigErr) {}
     } catch (e) {
+      try { if (window.mobius?.signal) window.mobius.signal('error', { message: e.message || String(e), source: 'create-file' }) } catch (sigErr) {}
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
   }, [storage, modal, closeNav, refreshPending, ensureIndexWritable])
@@ -3123,7 +3254,7 @@ export default function App({ appId, token }) {
     // directory — surprising from a "New name" prompt. Re-parenting is the
     // job of explicit drag-to-move; reject slashes here.
     if (clean.includes('/')) {
-      await modal.alert('A name can’t contain “/”. Drag the item to move it.', { title: 'Invalid name' })
+      await modal.alert('A name can\'t contain “/”. Drag the item to move it.', { title: 'Invalid name' })
       return
     }
     const to = parent ? `${parent}/${clean}` : clean
@@ -3195,6 +3326,82 @@ export default function App({ appId, token }) {
   // single-flight in the hook, keyed by buildDoc.)
   const mainBuilding = build.buildStatus === 'building' && build.buildDoc === mainPath
   const mainBuildError = build.buildStatus === 'error' && build.buildDoc === mainPath
+
+  // Whether the platform provides the ChatSplit API. Checked once on mount and
+  // stored so the fallback path doesn't flash in/out. If the API is absent the
+  // bespoke chatHeight panel takes over.
+  const hasSplit = typeof window !== 'undefined' && typeof window.mobius?.split === 'function'
+
+  // Dismissible error chips: parsed from buildLog '! ' lines when build failed.
+  const [dismissedChips, setDismissedChips] = useState([])
+  const errorChips = useMemo(() => {
+    if (!mainBuildError) return []
+    return parseBuildErrorChips(build.buildLog).filter((c) => !dismissedChips.includes(c))
+  }, [mainBuildError, build.buildLog, dismissedChips])
+  const dismissChip = useCallback((chip) => {
+    setDismissedChips((prev) => [...prev, chip])
+  }, [])
+  // Reset dismissed chips whenever a new build starts so stale dismissals
+  // don't carry over into the next error set.
+  useEffect(() => {
+    if (build.buildStatus === 'building') setDismissedChips([])
+  }, [build.buildStatus])
+
+  // quickActions passed to window.mobius.chat: context-aware chips that appear
+  // in the embedded chat's empty state. Only "Fix compilation errors" when in
+  // error state; the other two are always present.
+  const quickActions = useMemo(() => {
+    const actions = []
+    if (mainBuildError) {
+      actions.push({ label: 'Fix compilation errors', prompt: 'Fix the compilation errors in the build log.' })
+    }
+    actions.push({ label: 'Continue my document', prompt: 'Continue writing the document where it left off.' })
+    actions.push({ label: 'Add a section', prompt: 'Add a new section to the document.' })
+    return actions
+  }, [mainBuildError])
+
+  // getContext: supplies the agent with current app state so it can act without
+  // asking clarifying questions. Passed to both the split and fallback chat paths.
+  const getContext = useCallback(() => {
+    const buildError = mainBuildError && build.buildLog
+      ? build.buildLog.slice(0, 500)
+      : null
+    return Promise.resolve({
+      openFile: selectedPath || null,
+      viewMode: tabMode,
+      buildStatus: build.buildStatus,
+      buildError,
+      mainFile: mainPath || null,
+    })
+  }, [selectedPath, tabMode, build.buildStatus, build.buildLog, mainBuildError, mainPath])
+
+  // ── Signals ──────────────────────────────────────────────────────────────
+  // Fire app_ready once the file index has loaded. item_count = file count.
+  const signalReadySentRef = useRef(false)
+  useEffect(() => {
+    if (!indexLoaded || signalReadySentRef.current) return
+    signalReadySentRef.current = true
+    try {
+      if (window.mobius?.signal) {
+        window.mobius.signal('app_ready', { item_count: files.length })
+      }
+    } catch (e) {}
+  }, [indexLoaded, files.length])
+
+  // Fire build_succeeded / build_failed when the build status transitions.
+  const prevBuildStatusRef = useRef(build.buildStatus)
+  useEffect(() => {
+    const prev = prevBuildStatusRef.current
+    const cur = build.buildStatus
+    prevBuildStatusRef.current = cur
+    if (!window.mobius?.signal) return
+    if (prev === 'building' && cur === 'done') {
+      try { window.mobius.signal('build_succeeded', { doc: build.buildDoc || undefined }) } catch (e) {}
+    } else if (prev === 'building' && cur === 'error') {
+      try { window.mobius.signal('build_failed', { doc: build.buildDoc || undefined }) } catch (e) {}
+    }
+  }, [build.buildStatus, build.buildDoc])
+  // ── /Signals ─────────────────────────────────────────────────────────────
 
   // Reset the viewer to source whenever the user switches files, so opening a
   // file always lands on its editable source rather than the (whole-document)
@@ -3422,11 +3629,175 @@ export default function App({ appId, token }) {
     )
   }
 
-  // The PDF view shows the MAIN doc's output, so the [Source | PDF] toggle
-  // and Build are meaningful while a .tex is open. (Showing them only on a
-  // .tex keeps a clean toolbar for images/pdf/other files.)
-  const showTexControls = selectedIsTex && hasMain
   const openName = selectedPath ? selectedPath.replace(/^files\//, '') : null
+
+  // ── Tab bar ────────────────────────────────────────────────────────────────
+  // Three tabs: Edit (CodeMirror), Read (PDF viewer), Chat (full-screen chat).
+  // On desktop (>=860px) the tab bar is hidden — the three-pane layout takes over.
+  // The tab names are intentionally short for the narrow phone bar.
+  // Build button stays in the top bar (always reachable regardless of tab).
+  // ─────────────────────────────────────────────────────────────────────────
+  const showTabBar = !isWide && hasMain && selectedIsTex
+
+  // Content to render inside the split "content" pane (or as the main content
+  // area in the fallback layout). In Read tab: PDF viewer. In Edit tab: editor.
+  // In Chat tab with split API: the chat owns the full area; no content pane.
+  function renderContentForSplit() {
+    // Read tab: PDF viewer
+    if (tabMode === 'read') return renderPdfView()
+    // Edit tab: editor
+    return renderMain()
+  }
+
+  // ── Fallback layout render (no split API) ──────────────────────────────────
+  // Identical to 2.3.x: the body is a flex column with content + resizer +
+  // chat-panel stacked vertically. Chat tab in fallback just shows the chat
+  // panel at max height.
+  function renderFallbackBody() {
+    // In Chat tab on fallback: push the chat up to its max extent.
+    const chatPanelStyle = tabMode === 'chat'
+      ? { '--chat-panel-height': `${CHAT_MAX_PCT}%` }
+      : { '--chat-panel-height': `${chatHeight}%` }
+    const showResizer = tabMode !== 'chat'
+    return (
+      <div
+        ref={bodyRef}
+        className="body"
+        style={chatPanelStyle}
+      >
+        <FileNavPanel
+          open={navOpen}
+          onClose={closeNav}
+          files={files}
+          selectedPath={selectedPath}
+          onSelect={setSelectedPath}
+          canMutate={indexLoaded}
+          onCreateFile={handleCreateFile}
+          onCreateFolder={handleCreateFolder}
+          onDeleteFile={handleDeleteFile}
+          onDeleteFolder={handleDeleteFolder}
+          onUpload={uploadFiles}
+          onMove={movePath}
+          onRename={handleRename}
+          mainPath={mainPath}
+          onSetMain={handleSetMain}
+          returnFocusRef={navToggleRef}
+          pinned={isWide}
+        />
+        {tabMode !== 'chat' && (
+          <main className="content">{renderContentForSplit()}</main>
+        )}
+        {showResizer && (
+          <div
+            className="chat-resizer"
+            role="separator"
+            aria-label="Resize chat and editor areas"
+            aria-orientation="horizontal"
+            aria-valuemin={CHAT_MIN_PCT}
+            aria-valuemax={CHAT_MAX_PCT}
+            aria-valuenow={Math.round(chatHeight)}
+            tabIndex={0}
+            onPointerDown={beginChatResize}
+            onKeyDown={handleResizeKey}
+          >
+            <span className="chat-resizer-bar" aria-hidden="true" />
+          </div>
+        )}
+        <ChatPanel
+          appId={appId}
+          token={token}
+          storage={storage}
+          onFilesMaybeChanged={onFilesMaybeChanged}
+          quickActions={quickActions}
+          getContext={getContext}
+        />
+      </div>
+    )
+  }
+
+  // ── Split layout render (split API available) ─────────────────────────────
+  // In Read or Edit tabs: content pane + chat in a ChatSplitPanel.
+  // In Chat tab: the full body is the ChatSplitPanel in 'full' chat state.
+  function renderSplitBody() {
+    return (
+      <div ref={bodyRef} className="body body--split-host">
+        <FileNavPanel
+          open={navOpen}
+          onClose={closeNav}
+          files={files}
+          selectedPath={selectedPath}
+          onSelect={setSelectedPath}
+          canMutate={indexLoaded}
+          onCreateFile={handleCreateFile}
+          onCreateFolder={handleCreateFolder}
+          onDeleteFile={handleDeleteFile}
+          onDeleteFolder={handleDeleteFolder}
+          onUpload={uploadFiles}
+          onMove={movePath}
+          onRename={handleRename}
+          mainPath={mainPath}
+          onSetMain={handleSetMain}
+          returnFocusRef={navToggleRef}
+          pinned={isWide}
+        />
+        <div className="split-body-area">
+          <ChatSplitPanel
+            appId={appId}
+            token={token}
+            storage={storage}
+            onFilesMaybeChanged={onFilesMaybeChanged}
+            quickActions={quickActions}
+            getContext={getContext}
+            viewMode={tabMode}
+            contentChildren={tabMode !== 'chat' ? (
+              <main className="content content--fill">{renderContentForSplit()}</main>
+            ) : null}
+          />
+        </div>
+      </div>
+    )
+  }
+
+  // Error chips: float above the PDF viewer when build failed, dismissible.
+  // Tapping a chip pre-fills the chat by switching to Chat tab and using
+  // the postMessage draft mechanism.
+  function renderErrorChips() {
+    if (!errorChips.length) return null
+    return (
+      <div className="error-chips" aria-label="Build errors" role="region">
+        {errorChips.map((chip) => (
+          <div key={chip} className="error-chip">
+            <span className="error-chip-text" title={chip}>{chip}</span>
+            <button
+              type="button"
+              className="error-chip-fix"
+              aria-label={`Fix: ${chip}`}
+              onClick={() => {
+                // Switch to Chat tab and pre-fill via shell postMessage.
+                setTabMode('chat')
+                try {
+                  window.parent.postMessage(
+                    { type: 'moebius:new-chat', draft: `Fix this error: ${chip}` },
+                    window.location.origin,
+                  )
+                } catch (e) {}
+              }}
+            >
+              Fix
+            </button>
+            <button
+              type="button"
+              className="error-chip-dismiss"
+              aria-label="Dismiss"
+              onClick={() => dismissChip(chip)}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+    )
+  }
 
   return (
     <div className="latex-root">
@@ -3466,97 +3837,66 @@ export default function App({ appId, token }) {
             : <span className="top-path top-path--muted">No file open</span>}
         </div>
         <div className="top-actions">
-          {showTexControls && (
-            <>
-              {/* On desktop both panes show side-by-side, so the source/PDF
-                  toggle is redundant — only render it in single-pane (mobile). */}
-              {!isWide && (
-              <div className="seg-toggle" role="tablist" aria-label="View mode">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={viewMode === 'source'}
-                  aria-label="View source"
-                  title="View source"
-                  className={`seg-btn ${viewMode === 'source' ? 'seg-btn--active' : ''}`}
-                  onClick={() => setViewMode('source')}
-                >
-                  <ToolIcon name="source" />
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={viewMode === 'pdf'}
-                  aria-label="View PDF preview"
-                  title="View PDF preview"
-                  className={`seg-btn ${viewMode === 'pdf' ? 'seg-btn--active' : ''}`}
-                  onClick={() => setViewMode('pdf')}
-                >
-                  <ToolIcon name="preview" />
-                </button>
-              </div>
-              )}
-              <button
-                className="toolbar-btn toolbar-btn--primary"
-                onClick={handleBuild}
-                disabled={build.buildStatus === 'building'}
-                aria-label={build.buildStatus === 'building' ? 'Building the build target' : 'Build the build target'}
-                title={`Compile the build target (${mainPath.replace(/^files\//, '')})`}
-              >
-                <ToolIcon name="build" />
-              </button>
-            </>
+          {hasMain && selectedIsTex && (
+            <button
+              className="toolbar-btn toolbar-btn--primary"
+              onClick={handleBuild}
+              disabled={build.buildStatus === 'building'}
+              aria-label={build.buildStatus === 'building' ? 'Building the build target' : 'Build the build target'}
+              title={`Compile the build target (${mainPath.replace(/^files\//, '')})`}
+            >
+              <ToolIcon name="build" />
+            </button>
           )}
           <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
         </div>
       </header>
 
-      <div
-        ref={bodyRef}
-        className="body"
-        style={{ '--chat-panel-height': `${chatHeight}%` }}
-      >
-        <FileNavPanel
-          open={navOpen}
-          onClose={closeNav}
-          files={files}
-          selectedPath={selectedPath}
-          onSelect={setSelectedPath}
-          canMutate={indexLoaded}
-          onCreateFile={handleCreateFile}
-          onCreateFolder={handleCreateFolder}
-          onDeleteFile={handleDeleteFile}
-          onDeleteFolder={handleDeleteFolder}
-          onUpload={uploadFiles}
-          onMove={movePath}
-          onRename={handleRename}
-          mainPath={mainPath}
-          onSetMain={handleSetMain}
-          returnFocusRef={navToggleRef}
-          pinned={isWide}
-        />
-        <main className="content">{renderMain()}</main>
-        <div
-          className="chat-resizer"
-          role="separator"
-          aria-label="Resize chat and PDF areas"
-          aria-orientation="horizontal"
-          aria-valuemin={CHAT_MIN_PCT}
-          aria-valuemax={CHAT_MAX_PCT}
-          aria-valuenow={Math.round(chatHeight)}
-          tabIndex={0}
-          onPointerDown={beginChatResize}
-          onKeyDown={handleResizeKey}
-        >
-          <span className="chat-resizer-bar" aria-hidden="true" />
-        </div>
-        <ChatPanel
-          appId={appId}
-          token={token}
-          storage={storage}
-          onFilesMaybeChanged={onFilesMaybeChanged}
-        />
-      </div>
+      {/* Error chips float over the content area when build fails */}
+      {renderErrorChips()}
+
+      {/* Bottom tab bar — phone-form-factor navigation (hidden on desktop) */}
+      {showTabBar && (
+        <nav className="tab-bar" role="tablist" aria-label="View">
+          <button
+            type="button"
+            role="tab"
+            className={`tab-btn ${tabMode === 'read' ? 'tab-btn--active' : ''}`}
+            aria-selected={tabMode === 'read'}
+            onClick={() => setTabMode('read')}
+          >
+            <ToolIcon name="preview" size={20} />
+            <span className="tab-label">Read</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={`tab-btn ${tabMode === 'edit' ? 'tab-btn--active' : ''}`}
+            aria-selected={tabMode === 'edit'}
+            onClick={() => setTabMode('edit')}
+          >
+            <ToolIcon name="source" size={20} />
+            <span className="tab-label">Edit</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={`tab-btn ${tabMode === 'chat' ? 'tab-btn--active' : ''}`}
+            aria-selected={tabMode === 'chat'}
+            onClick={() => setTabMode('chat')}
+          >
+            {/* Chat icon: a speech-bubble glyph */}
+            <svg viewBox="0 0 24 24" width={20} height={20} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            <span className="tab-label">Chat</span>
+          </button>
+        </nav>
+      )}
+
+      {/* ── Split path (window.mobius.split available) ── */}
+      {hasSplit ? renderSplitBody() : renderFallbackBody()}
+
       {modal.node}
     </div>
   )
@@ -4217,15 +4557,16 @@ const CSS = `
   text-overflow: ellipsis;
 }
 /* mobius-ui:ChatEmbed v1 */
-/* ---- chat panel (bottom sheet, bounded height) ----
-   The embedded shell chat runs inside an iframe (window.mobius.chat).
-   The classic flexbox overflow trap is what cut the conversation off:
-   the panel needs a BOUNDED height and the embed needs min-height:0
-   so the iframe (which has its own internal scroll + a sticky composer)
-   can shrink to fit and scroll internally instead of overflowing the
-   container and pushing its own composer off-screen. The panel is a
-   fixed-height bottom sheet (about 42vh) so the messages + composer are
-   always fully visible; flex-shrink keeps it from eating the editor. */
+/* ---- Fallback chat panel (bottom sheet, bounded height) ----
+   Used when window.mobius.split is absent (older shell). The embedded
+   shell chat runs inside an iframe (window.mobius.chat). The classic
+   flexbox overflow trap is what cut the conversation off: the panel
+   needs a BOUNDED height and the embed needs min-height:0 so the iframe
+   (which has its own internal scroll + a sticky composer) can shrink to
+   fit and scroll internally instead of overflowing the container and
+   pushing its own composer off-screen. The panel is a fixed-height
+   bottom sheet (about 42vh) so the messages + composer are always fully
+   visible; flex-shrink keeps it from eating the editor. */
 .chat-panel {
   flex: 0 0 auto;
   height: var(--chat-panel-height, 36%);
@@ -4279,6 +4620,189 @@ const CSS = `
   background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--text);
   font-size: 12px;
+}
+
+/* ---- Bottom tab bar (phone form factor) ----
+   Three equal-width tabs at the bottom: Read / Edit / Chat.
+   Hidden on desktop (>=860px) via the media query below — the three-pane
+   Overleaf layout takes over. Each tab has a 20px icon + a label. */
+.tab-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  /* Sit above the bottom safe area on iPhone home-indicator devices. */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.tab-btn {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 52px;
+  padding: 6px 4px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  transition: color 0.12s ease;
+}
+.tab-btn--active {
+  color: var(--accent);
+  /* Subtle top-border cue, same as the Möbius shell's active tab. */
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.tab-btn:active { color: var(--text); }
+.tab-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+
+/* ---- Error chips (float above the main area when build fails) ----
+   Up to 3 dismissible chips float at the top of the content area; tapping
+   "Fix" switches to Chat and pre-fills the composer. */
+.error-chips {
+  position: absolute;
+  top: 52px; /* just below the top-bar */
+  left: 0;
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  pointer-events: none; /* chips themselves have pointer-events: auto */
+}
+.error-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--danger, var(--accent)) 55%, var(--border));
+  border-radius: 8px;
+  padding: 6px 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  pointer-events: auto;
+  max-width: 100%;
+}
+.error-chip-text {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: var(--danger, var(--text));
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.error-chip-fix {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 3px 10px;
+  border-radius: 5px;
+  border: none;
+  background: var(--accent);
+  color: #062016;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.error-chip-fix:active { filter: brightness(0.9); }
+.error-chip-dismiss {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.error-chip-dismiss:hover { color: var(--text); }
+.error-chip-dismiss:active { background: var(--surface2, var(--surface)); }
+
+/* ---- ChatSplit layout (window.mobius.split path) ----
+   The body area contains a FileNavPanel + a split-body-area that fills the
+   rest. When the file tree is pinned (desktop), it occupies the left column
+   via CSS grid (same as before). The split-body-area is the mount for
+   ChatSplitPanel: position:relative is required by window.mobius.split. */
+.body--split-host {
+  /* Same as .body: flex column, fills remaining height */
+}
+.split-body-area {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+/* mobius-ui:ChatSplit v1 — keep in sync with app-component-shapes.md §9 */
+.ma-root--split {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+/* Portrait (stacked): content on top, chat panel below */
+.ma-root--split[data-orientation="portrait"] .ma-split-content {
+  position: absolute; top: 0; left: 0; right: 0;
+  height: var(--cs-content-h, 100%);
+  overflow: hidden;
+  transition: height 0.18s ease;
+}
+.ma-root--split[data-orientation="portrait"] .ma-split-chat {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  top: var(--cs-content-h, 100%);
+  overflow: hidden;
+  transition: top 0.18s ease;
+}
+/* Pill state: a fixed-height pill anchor at bottom */
+.ma-root--split[data-split-state="pill"][data-orientation="portrait"] .ma-split-chat {
+  top: auto;
+  height: 36px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  border-radius: 12px 12px 0 0;
+  display: flex; align-items: center; justify-content: center;
+}
+/* Side-by-side (wide): content left, chat right */
+.ma-root--split[data-orientation="side"] .ma-split-content {
+  position: absolute; top: 0; left: 0; bottom: 0;
+  width: var(--cs-content-w, 65%);
+  overflow: hidden;
+  transition: width 0.18s ease;
+}
+.ma-root--split[data-orientation="side"] .ma-split-chat {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  left: var(--cs-content-w, 65%);
+  overflow: hidden;
+  transition: left 0.18s ease;
+}
+/* /mobius-ui:ChatSplit */
+.content--fill {
+  /* Inside the content pane the main must also stretch; .content itself
+     already sets flex:1 1 auto and min-height:0. This rule just matches
+     the selector used inside the split pane to avoid specificity fights. */
+  height: 100%;
+}
+.ma-split-chat .chat-error {
+  /* Inline inside the split pane — remove absolute positioning. */
+  margin: 8px 12px 0;
 }
 
 /* mobius-ui:Sheet v1 */
@@ -4427,9 +4951,13 @@ const CSS = `
    split (handled in renderMain), with the chat docked below the split. The
    body switches from a vertical flex stack to a CSS grid: the rail spans all
    rows in column 1; content / resizer / chat fill column 2. The .split itself
-   caps the editor measure so source doesn't stretch edge-to-edge on a monitor. */
+   caps the editor measure so source doesn't stretch edge-to-edge on a monitor.
+   The tab bar is hidden at desktop — the three-pane layout provides the same
+   navigation. */
 @media (min-width: 860px) {
-  .body {
+  /* Hide the tab bar — desktop has the three-pane layout. */
+  .tab-bar { display: none; }
+  .body, .body--split-host {
     display: grid;
     grid-template-columns: 264px minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto auto;
@@ -4444,10 +4972,12 @@ const CSS = `
     transform: none;
     border-right: 1px solid var(--border);
   }
-  /* Content / resizer / chat stack down the right column. */
+  /* Fallback layout: content / resizer / chat stack down the right column. */
   .content { grid-column: 2; grid-row: 1; }
   .chat-resizer { grid-column: 2; grid-row: 2; }
   .chat-panel { grid-column: 2; grid-row: 3; }
+  /* Split layout: the split-body-area spans the right column. */
+  .split-body-area { grid-column: 2; grid-row: 1 / -1; }
   /* Two-pane editor/PDF split. The editor measure is capped so long source
      lines stay readable; the PDF pane takes the remaining width. */
   .split { display: flex; flex: 1 1 auto; height: 100%; min-height: 0; }
@@ -4467,6 +4997,8 @@ const CSS = `
     margin-left: auto;
     margin-right: auto;
   }
+  /* Error chips: tuck below the top-bar, absolute within the root. */
+  .error-chips { top: 54px; }
 }
 
 /* mobius-ui:ReducedMotion v1 -- honor the OS reduce-motion setting */
