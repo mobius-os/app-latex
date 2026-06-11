@@ -885,14 +885,63 @@ function buildTree(paths) {
   return root
 }
 
-function fileIcon(name) {
+// File-type kind for the tree glyph. The glyph itself is a bare lucide-style
+// SVG (see FileGlyph) — the kind only selects which inner mark it draws.
+function fileKind(name) {
   const lower = name.toLowerCase()
-  if (lower.endsWith('.tex')) return 'T'
-  if (lower.endsWith('.md')) return 'M'
-  if (lower.endsWith('.pdf')) return 'P'
-  if (lower.match(/\.(png|jpe?g|gif|webp|svg)$/)) return 'i'
-  return '·'
+  if (lower.endsWith('.tex')) return 'tex'
+  if (lower.endsWith('.md')) return 'md'
+  if (lower.endsWith('.pdf')) return 'pdf'
+  if (lower.match(/\.(png|jpe?g|gif|webp|svg)$/)) return 'image'
+  return 'file'
 }
+
+// Bare lucide-style file glyph for the tree (fill none, currentColor stroke,
+// round caps — the shared Möbius icon idiom). Inherits the row's text color.
+/* mobius-ui:FileGlyph v1 */
+function FileGlyph({ name, size = 16 }) {
+  const kind = fileKind(name)
+  const sharedProps = {
+    viewBox: '0 0 24 24', width: size, height: size, fill: 'none',
+    stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round',
+    strokeLinejoin: 'round', 'aria-hidden': true,
+  }
+  if (kind === 'image') {
+    return (
+      <svg {...sharedProps}>
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <circle cx="8.5" cy="9.5" r="1.5" />
+        <path d="m21 16-5-5L5 20" />
+      </svg>
+    )
+  }
+  const page = <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+  const fold = <path d="M14 3v5h5" />
+  return (
+    <svg {...sharedProps}>
+      {page}
+      {fold}
+      {kind === 'tex' && <path d="M9 13h6M9 16h4M10.5 10l3 0" />}
+      {kind === 'md' && <path d="M9 17V11l2 2 2-2v6M15 11h1" />}
+      {kind === 'pdf' && <path d="M9 14c0-1.1.9-2 2-2h.5c.8 0 1.5.7 1.5 1.5S12.3 15 11.5 15H11v2" />}
+      {kind === 'file' && <path d="M9 14h6M9 17h4" />}
+    </svg>
+  )
+}
+/* mobius-ui:FileGlyph end */
+
+// Bare chevron for folder rows — rotates via CSS when the folder is expanded.
+/* mobius-ui:ChevronIcon v1 */
+function ChevronIcon({ size = 14 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden>
+      <path d="m9 6 6 6-6 6" />
+    </svg>
+  )
+}
+/* mobius-ui:ChevronIcon end */
 
 // Inline 24x24 line icons for the top-bar controls, in the same
 // stroke=currentColor / strokeWidth=2 / round-cap style as Workout's
@@ -1118,7 +1167,7 @@ function FileNode({
           }}
           {...longPress}
         >
-          <span className="tree-icon">{fileIcon(node.name)}</span>
+          <span className="tree-icon"><FileGlyph name={node.name} /></span>
           <span className="tree-name">{node.name}</span>
           {isMain && (
             <span className="tree-main-glyph" title="Build target — Build compiles this file" aria-label="Build target">
@@ -1250,7 +1299,7 @@ function FileNode({
           }}
           {...longPress}
         >
-          <span className="tree-icon">{expanded ? '▾' : '▸'}</span>
+          <span className={`tree-icon tree-chevron${expanded ? ' tree-chevron--open' : ''}`}><ChevronIcon /></span>
           <span className="tree-name">{node.name}/</span>
         </button>
         <button
@@ -1517,7 +1566,6 @@ function FileNavPanel({
         <div className="drawer-head">
           <div className="drawer-head-text">
             <span className="drawer-title">Files</span>
-            <span className="drawer-count">{files.filter(p => !p.endsWith('/.keep')).length} items</span>
           </div>
         </div>
         <div className="drawer-actions">
@@ -1666,35 +1714,20 @@ function ChatSplitPanel({
   useEffect(() => { getContextRef.current = getContext }, [getContext])
   const systemPrompt = useMemo(() => bootstrapPrompt(), [])
 
-  // Mount split + chat together — both need the DOM ready, and chatOpen must
-  // be true. Destroy on unmount or when chatOpen flips to false.
+  // Mount chat ONCE on load — independent of chatOpen so toggling the panel
+  // never tears down a streaming turn. Visibility is controlled by CSS below.
   useEffect(() => {
-    if (!chatOpen) return undefined
-    const root = rootRef.current
     const chatMount = chatMountRef.current
-    if (!root || !chatMount) return undefined
-    if (!window.mobius || typeof window.mobius.split !== 'function') return undefined
-    if (typeof window.mobius.chat !== 'function') return undefined
+    if (!chatMount || !window.mobius || typeof window.mobius.chat !== 'function') return undefined
 
     let disposed = false
     let chatHandle = null
     setChatError(null)
 
-    // 1. Wire split — the handle injects the drag bar into root.
-    const split = window.mobius.split({
-      mount: root,
-      defaultRatio: 0.65,
-      minContentPx: 120,
-      minChatPx: 96,
-      persistKey: 'latex-split-v1',
-    })
-
-    // 2. Wire chat — quickActions and getContext are live via refs so they
-    // reflect the latest build state without remounting the chat iframe.
     window.mobius.chat({
       mount: chatMount,
       persist: 'chat_id.json',
-      title: 'LaTeX editor',
+      title: 'LaTeX',
       systemPrompt,
       picker: true,
       quickActions: quickActionsRef.current,
@@ -1715,32 +1748,43 @@ function ChatSplitPanel({
 
     return () => {
       disposed = true
-      split.destroy()
       if (chatHandle) chatHandle.destroy()
     }
     // systemPrompt is stable (useMemo []); only re-mount when storage identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storage, systemPrompt, chatOpen])
+  }, [storage, systemPrompt])
 
-  if (!chatOpen) {
-    // Chat off: render content full-screen, no split.
-    return (
-      <div className="ma-root ma-root--split">
-        <div className="ma-split-content ma-split-content--full">
-          {contentChildren}
-        </div>
-        {/* Keep chatMountRef alive so the effect can reference it when chatOpen flips */}
-        <div ref={chatMountRef} style={{ display: 'none' }} />
-      </div>
-    )
-  }
+  // Wire/destroy the split handle when chatOpen changes. The chat iframe stays
+  // mounted throughout; only the drag-bar is added/removed.
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root || !chatOpen) return undefined
+    if (!window.mobius || typeof window.mobius.split !== 'function') return undefined
+
+    const split = window.mobius.split({
+      mount: root,
+      defaultRatio: 0.65,
+      minContentPx: 120,
+      minChatPx: 96,
+      persistKey: 'latex-split-v1',
+    })
+    return () => { split.destroy() }
+  }, [chatOpen])
 
   return (
     <div ref={rootRef} className="ma-root ma-root--split">
-      <div data-split-role="content" className="ma-split-content">
+      <div
+        data-split-role="content"
+        className={chatOpen ? 'ma-split-content' : 'ma-split-content ma-split-content--full'}
+      >
         {contentChildren}
       </div>
-      <div data-split-role="chat" className="ma-split-chat" ref={chatMountRef}>
+      <div
+        data-split-role="chat"
+        className="ma-split-chat"
+        ref={chatMountRef}
+        style={chatOpen ? undefined : { display: 'none' }}
+      >
         {chatError && <div className="chat-error">{chatError}</div>}
       </div>
     </div>
@@ -1791,7 +1835,7 @@ function ChatPanel({
     window.mobius.chat({
       mount,
       persist: 'chat_id.json',
-      title: 'LaTeX editor',
+      title: 'LaTeX',
       systemPrompt,
       picker: true,
       quickActions: quickActionsRef.current,
@@ -3421,7 +3465,7 @@ export default function App({ appId, token }) {
     signalReadySentRef.current = true
     try {
       if (window.mobius?.signal) {
-        window.mobius.signal('app_ready', { item_count: files.length })
+        window.mobius.signal('app_ready', { item_count: files.length, version: APP_VERSION })
       }
     } catch (e) {}
   }, [indexLoaded, files.length])
@@ -3856,9 +3900,9 @@ export default function App({ appId, token }) {
           <button
             type="button"
             className="toolbar-btn chat-toggle-btn"
-            aria-label="Toggle chat"
+            aria-label={chatOpen ? 'Close chat' : 'Open chat'}
             aria-pressed={chatOpen}
-            title={chatOpen ? 'Hide chat' : 'Show chat'}
+            title={chatOpen ? 'Close chat' : 'Open chat'}
             onClick={toggleChat}
           >
             <ChatBubbleIcon size={20} />
@@ -4330,17 +4374,6 @@ const CSS = `
   color: var(--text);
   line-height: 1.2;
 }
-	.drawer-count {
-	  display: block;
-	  margin-top: 2px;
-	  color: var(--muted);
-	  font-size: 11px;
-	  font-weight: 600;
-	  /* a count is metadata — mono token, tabular figures, matches the app's
-	     other numeric readouts (zoom %, sync pill). */
-	  font-family: var(--mono, ui-monospace, monospace);
-	  font-variant-numeric: tabular-nums;
-	}
 .drawer-actions {
   display: flex;
   gap: 6px;
@@ -4560,11 +4593,17 @@ const CSS = `
   justify-content: center;
   width: 18px;
   height: 18px;
-  font-size: 12px;
-  line-height: 1;
   color: var(--muted);
   background: none;
   flex: 0 0 auto;
+}
+.tree-icon svg { display: block; }
+/* Folder chevron points right when collapsed, rotates down when expanded. */
+.tree-chevron {
+  transition: transform 0.12s ease;
+}
+.tree-chevron--open {
+  transform: rotate(90deg);
 }
 .tree-name {
   overflow: hidden;
