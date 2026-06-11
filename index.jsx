@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.4.0'
+const APP_VERSION = '2.5.0'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -696,27 +696,36 @@ function PdfPreview({ storage, path, version }) {
 
   const onPinchStart = useCallback((e) => {
     if (e.touches.length !== 2) return
-    const dx = e.touches[0].clientX - e.touches[1].clientX
-    const dy = e.touches[0].clientY - e.touches[1].clientY
+    const t0 = e.touches[0], t1 = e.touches[1]
+    const dx = t0.clientX - t1.clientX
+    const dy = t0.clientY - t1.clientY
     pinchRef.current = {
       dist0: Math.sqrt(dx * dx + dy * dy),
       scale0: renderScaleRef.current,
+      midX: (t0.clientX + t1.clientX) / 2,
+      midY: (t0.clientY + t1.clientY) / 2,
     }
   }, [])
 
   const onPinchMove = useCallback((e) => {
     if (e.touches.length !== 2 || !pinchRef.current) return
     e.preventDefault()
-    const dx = e.touches[0].clientX - e.touches[1].clientX
-    const dy = e.touches[0].clientY - e.touches[1].clientY
+    const t0 = e.touches[0], t1 = e.touches[1]
+    const dx = t0.clientX - t1.clientX
+    const dy = t0.clientY - t1.clientY
     const dist = Math.sqrt(dx * dx + dy * dy)
     const ratio = dist / pinchRef.current.dist0
     const liveScale = clampZoom(pinchRef.current.scale0 * ratio)
     const host = pagesRef.current
     if (host) {
       const visualScale = liveScale / renderScaleRef.current
+      // Anchor the CSS transform at the initial pinch midpoint relative to
+      // .pdf-pages so zooming feels centred on the user's fingers.
+      const hostRect = host.getBoundingClientRect()
+      const originX = pinchRef.current.midX - hostRect.left
+      const originY = pinchRef.current.midY - hostRect.top
+      host.style.transformOrigin = `${originX}px ${originY}px`
       host.style.transform = `scale(${visualScale})`
-      host.style.transformOrigin = 'top center'
     }
   }, [])
 
@@ -1721,6 +1730,7 @@ function ChatPanel({
   onFilesMaybeChanged,
   quickActions,
   getContext,
+  collapsed = false,
 }) {
   const mountRef = useRef(null)
   const [error, setError] = useState(null)
@@ -1782,7 +1792,7 @@ function ChatPanel({
   }, [storage, systemPrompt])
 
   return (
-    <section className="chat-panel">
+    <section className={`chat-panel${collapsed ? ' chat-panel--collapsed' : ''}`}>
       {error && <div className="chat-error">{error}</div>}
       <div className="chat-embed" ref={mountRef} />
     </section>
@@ -1992,11 +2002,11 @@ function chatHeightKey(appId) {
   return `latex:${appId}:chat-height:v${CHAT_HEIGHT_CACHE_VERSION}`
 }
 
-// The chat's min height (% of body). Low enough to drag the chat down to about
-// composer height (hide-chat / full-vibe), so the editor + PDF can take the
-// whole pane. The default opening height stays comfortable.
-const CHAT_MIN_PCT = 10
-const CHAT_MAX_PCT = 68
+// The chat's min height (% of body). 0 = fully collapsed to the 24px handle
+// bar (CSS enforces the 24px minimum via .chat-panel--collapsed). The default
+// opening height stays comfortable; the keyboard shortcuts still use CHAT_MAX_PCT.
+const CHAT_MIN_PCT = 0
+const CHAT_MAX_PCT = 100
 const CHAT_DEFAULT_PCT = 36
 
 function readChatHeight(appId) {
@@ -2362,17 +2372,8 @@ export default function App({ appId, token }) {
   // and on a 10s background poll.
   const [pending, setPending] = useState(0)
   const [chatHeight, setChatHeight] = useState(() => readChatHeight(appId))
-  // Tab mode: 'read' = full-screen PDF, 'edit' = full-screen CodeMirror, 'chat' = full-screen chat.
-  // On desktop (>=860px) the two-pane layout still takes over in the content area;
-  // the tab bar is mobile-first. viewMode mirrors 'source'/'pdf' for internal logic
-  // that relied on it (onBuildDone, seenBuildStatusRef).
-  const [tabMode, setTabMode] = useState('edit') // 'edit' | 'read' | 'chat'
-  // viewMode is derived from tabMode for backward-compatible logic inside the
-  // build callbacks and the desktop split. Always 'pdf' when tab is 'read', else 'source'.
-  const viewMode = tabMode === 'read' ? 'pdf' : 'source'
-  const setViewMode = useCallback((mode) => {
-    setTabMode(mode === 'pdf' ? 'read' : 'edit')
-  }, [])
+  // viewMode: 'source' = CodeMirror editor, 'pdf' = compiled PDF viewer.
+  const [viewMode, setViewMode] = useState('source') // 'source' | 'pdf'
   // Desktop split: at >=860px the editor and PDF sit side-by-side (Overleaf's
   // two-pane layout) and the file tree is a persistent rail, so the [Source|PDF]
   // toggle is unnecessary. Below that we stay single-pane + toggle (phone/tablet).
@@ -2430,19 +2431,46 @@ export default function App({ appId, token }) {
     const total = body.getBoundingClientRect().height
     if (!total) return
     const startY = event.clientY
-    const startHeight = panel.getBoundingClientRect().height
-    // Floor at composer height so the chat can be dragged all the way down to a
-    // sliver (hide-chat / full-vibe), letting the editor + PDF own the pane.
-    const minPx = Math.min(96, total * (CHAT_MIN_PCT / 100))
-    const maxPx = Math.max(minPx, total - 180)
+    const startTime = Date.now()
+    // When collapsed the CSS height is 24px (enforced by .chat-panel--collapsed),
+    // so read the CSS --chat-panel-height value for the logical start height,
+    // not the rendered 24px box.
+    const cssPanelH = total * (panel.classList.contains('chat-panel--collapsed')
+      ? 0
+      : (parseFloat(getComputedStyle(panel).height) / total))
+    const startHeight = Math.max(0, cssPanelH)
+    const minPx = 0
+    const maxPx = Math.max(0, total - 180)
+
+    // Last few pointer moves for velocity computation.
+    const moveHistory = []
 
     const onMove = (moveEvent) => {
       const nextPx = Math.min(maxPx, Math.max(minPx, startHeight + startY - moveEvent.clientY))
       setChatHeight(Math.min(CHAT_MAX_PCT, Math.max(CHAT_MIN_PCT, (nextPx / total) * 100)))
+      moveHistory.push({ y: moveEvent.clientY, t: Date.now() })
+      if (moveHistory.length > 4) moveHistory.shift()
     }
-    const onUp = () => {
+    const onUp = (upEvent) => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      const totalMove = Math.abs(upEvent.clientY - startY)
+      const duration = Date.now() - startTime
+
+      // Tap-toggle: tiny movement, fast interaction.
+      if (totalMove < 8 && duration < 300) {
+        setChatHeight((h) => h <= 2 ? CHAT_DEFAULT_PCT : CHAT_MIN_PCT)
+        return
+      }
+
+      // Velocity flick: snap to max/min on strong flick.
+      if (moveHistory.length >= 2) {
+        const last = moveHistory[moveHistory.length - 1]
+        const prev = moveHistory[0]
+        const vpy = (last.y - prev.y) / Math.max(1, last.t - prev.t)
+        if (vpy < -0.5) { setChatHeight(CHAT_MAX_PCT); return }
+        if (vpy > 0.5) { setChatHeight(CHAT_MIN_PCT); return }
+      }
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp, { once: true })
@@ -3368,12 +3396,12 @@ export default function App({ appId, token }) {
       : null
     return Promise.resolve({
       openFile: selectedPath || null,
-      viewMode: tabMode,
+      viewMode,
       buildStatus: build.buildStatus,
       buildError,
       mainFile: mainPath || null,
     })
-  }, [selectedPath, tabMode, build.buildStatus, build.buildLog, mainBuildError, mainPath])
+  }, [selectedPath, viewMode, build.buildStatus, build.buildLog, mainBuildError, mainPath])
 
   // ── Signals ──────────────────────────────────────────────────────────────
   // Fire app_ready once the file index has loaded. item_count = file count.
@@ -3631,39 +3659,17 @@ export default function App({ appId, token }) {
 
   const openName = selectedPath ? selectedPath.replace(/^files\//, '') : null
 
-  // ── Tab bar ────────────────────────────────────────────────────────────────
-  // Three tabs: Edit (CodeMirror), Read (PDF viewer), Chat (full-screen chat).
-  // On desktop (>=860px) the tab bar is hidden — the three-pane layout takes over.
-  // The tab names are intentionally short for the narrow phone bar.
-  // Build button stays in the top bar (always reachable regardless of tab).
-  // ─────────────────────────────────────────────────────────────────────────
-  const showTabBar = !isWide && hasMain && selectedIsTex
-
-  // Content to render inside the split "content" pane (or as the main content
-  // area in the fallback layout). In Read tab: PDF viewer. In Edit tab: editor.
-  // In Chat tab with split API: the chat owns the full area; no content pane.
-  function renderContentForSplit() {
-    // Read tab: PDF viewer
-    if (tabMode === 'read') return renderPdfView()
-    // Edit tab: editor
-    return renderMain()
-  }
-
   // ── Fallback layout render (no split API) ──────────────────────────────────
-  // Identical to 2.3.x: the body is a flex column with content + resizer +
-  // chat-panel stacked vertically. Chat tab in fallback just shows the chat
-  // panel at max height.
+  // The body is a flex column with content + resizer + chat-panel stacked
+  // vertically. The chat panel collapses to a 24px handle bar when
+  // chatHeight <= 2% (CHAT_MIN_PCT = 0).
   function renderFallbackBody() {
-    // In Chat tab on fallback: push the chat up to its max extent.
-    const chatPanelStyle = tabMode === 'chat'
-      ? { '--chat-panel-height': `${CHAT_MAX_PCT}%` }
-      : { '--chat-panel-height': `${chatHeight}%` }
-    const showResizer = tabMode !== 'chat'
+    const isCollapsed = chatHeight <= 2
     return (
       <div
         ref={bodyRef}
         className="body"
-        style={chatPanelStyle}
+        style={{ '--chat-panel-height': `${chatHeight}%` }}
       >
         <FileNavPanel
           open={navOpen}
@@ -3684,25 +3690,21 @@ export default function App({ appId, token }) {
           returnFocusRef={navToggleRef}
           pinned={isWide}
         />
-        {tabMode !== 'chat' && (
-          <main className="content">{renderContentForSplit()}</main>
-        )}
-        {showResizer && (
-          <div
-            className="chat-resizer"
-            role="separator"
-            aria-label="Resize chat and editor areas"
-            aria-orientation="horizontal"
-            aria-valuemin={CHAT_MIN_PCT}
-            aria-valuemax={CHAT_MAX_PCT}
-            aria-valuenow={Math.round(chatHeight)}
-            tabIndex={0}
-            onPointerDown={beginChatResize}
-            onKeyDown={handleResizeKey}
-          >
-            <span className="chat-resizer-bar" aria-hidden="true" />
-          </div>
-        )}
+        <main className="content">{renderMain()}</main>
+        <div
+          className="chat-resizer"
+          role="separator"
+          aria-label="Resize chat and editor areas"
+          aria-orientation="horizontal"
+          aria-valuemin={CHAT_MIN_PCT}
+          aria-valuemax={CHAT_MAX_PCT}
+          aria-valuenow={Math.round(chatHeight)}
+          tabIndex={0}
+          onPointerDown={beginChatResize}
+          onKeyDown={handleResizeKey}
+        >
+          <span className="chat-resizer-bar" aria-hidden="true" />
+        </div>
         <ChatPanel
           appId={appId}
           token={token}
@@ -3710,14 +3712,13 @@ export default function App({ appId, token }) {
           onFilesMaybeChanged={onFilesMaybeChanged}
           quickActions={quickActions}
           getContext={getContext}
+          collapsed={isCollapsed}
         />
       </div>
     )
   }
 
   // ── Split layout render (split API available) ─────────────────────────────
-  // In Read or Edit tabs: content pane + chat in a ChatSplitPanel.
-  // In Chat tab: the full body is the ChatSplitPanel in 'full' chat state.
   function renderSplitBody() {
     return (
       <div ref={bodyRef} className="body body--split-host">
@@ -3748,10 +3749,9 @@ export default function App({ appId, token }) {
             onFilesMaybeChanged={onFilesMaybeChanged}
             quickActions={quickActions}
             getContext={getContext}
-            viewMode={tabMode}
-            contentChildren={tabMode !== 'chat' ? (
-              <main className="content content--fill">{renderContentForSplit()}</main>
-            ) : null}
+            contentChildren={
+              <main className="content content--fill">{renderMain()}</main>
+            }
           />
         </div>
       </div>
@@ -3773,8 +3773,7 @@ export default function App({ appId, token }) {
               className="error-chip-fix"
               aria-label={`Fix: ${chip}`}
               onClick={() => {
-                // Switch to Chat tab and pre-fill via shell postMessage.
-                setTabMode('chat')
+                // Pre-fill the chat composer via shell postMessage.
                 try {
                   window.parent.postMessage(
                     { type: 'moebius:new-chat', draft: `Fix this error: ${chip}` },
@@ -3837,6 +3836,30 @@ export default function App({ appId, token }) {
             : <span className="top-path top-path--muted">No file open</span>}
         </div>
         <div className="top-actions">
+          {hasMain && selectedIsTex && !isWide && (
+            <div className="seg-toggle" role="group" aria-label="View">
+              <button
+                type="button"
+                className={`seg-btn ${viewMode === 'source' ? 'seg-btn--active' : ''}`}
+                aria-pressed={viewMode === 'source'}
+                aria-label="Source"
+                title="Source"
+                onClick={() => setViewMode('source')}
+              >
+                <ToolIcon name="source" size={20} />
+              </button>
+              <button
+                type="button"
+                className={`seg-btn ${viewMode === 'pdf' ? 'seg-btn--active' : ''}`}
+                aria-pressed={viewMode === 'pdf'}
+                aria-label="PDF"
+                title="PDF"
+                onClick={() => setViewMode('pdf')}
+              >
+                <ToolIcon name="preview" size={20} />
+              </button>
+            </div>
+          )}
           {hasMain && selectedIsTex && (
             <button
               className="toolbar-btn toolbar-btn--primary"
@@ -3854,45 +3877,6 @@ export default function App({ appId, token }) {
 
       {/* Error chips float over the content area when build fails */}
       {renderErrorChips()}
-
-      {/* Bottom tab bar — phone-form-factor navigation (hidden on desktop) */}
-      {showTabBar && (
-        <nav className="tab-bar" role="tablist" aria-label="View">
-          <button
-            type="button"
-            role="tab"
-            className={`tab-btn ${tabMode === 'read' ? 'tab-btn--active' : ''}`}
-            aria-selected={tabMode === 'read'}
-            onClick={() => setTabMode('read')}
-          >
-            <ToolIcon name="preview" size={20} />
-            <span className="tab-label">Read</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            className={`tab-btn ${tabMode === 'edit' ? 'tab-btn--active' : ''}`}
-            aria-selected={tabMode === 'edit'}
-            onClick={() => setTabMode('edit')}
-          >
-            <ToolIcon name="source" size={20} />
-            <span className="tab-label">Edit</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            className={`tab-btn ${tabMode === 'chat' ? 'tab-btn--active' : ''}`}
-            aria-selected={tabMode === 'chat'}
-            onClick={() => setTabMode('chat')}
-          >
-            {/* Chat icon: a speech-bubble glyph */}
-            <svg viewBox="0 0 24 24" width={20} height={20} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-            </svg>
-            <span className="tab-label">Chat</span>
-          </button>
-        </nav>
-      )}
 
       {/* ── Split path (window.mobius.split available) ── */}
       {hasSplit ? renderSplitBody() : renderFallbackBody()}
@@ -4621,49 +4605,20 @@ const CSS = `
   color: var(--text);
   font-size: 12px;
 }
-
-/* ---- Bottom tab bar (phone form factor) ----
-   Three equal-width tabs at the bottom: Read / Edit / Chat.
-   Hidden on desktop (>=860px) via the media query below — the three-pane
-   Overleaf layout takes over. Each tab has a 20px icon + a label. */
-.tab-bar {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: stretch;
-  justify-content: stretch;
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  /* Sit above the bottom safe area on iPhone home-indicator devices. */
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-}
-.tab-btn {
-  flex: 1 1 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+/* Collapsed chat panel: a 24px drag-handle bar. The chat embed is hidden so
+   the editor/PDF takes the full pane. The border-radius on the top corners
+   gives it the same bottom-sheet "pill" look as the split handle. */
+.chat-panel--collapsed {
+  height: 24px !important;
+  min-height: 24px !important;
+  max-height: 24px !important;
+  cursor: ns-resize;
+  border-radius: 12px 12px 0 0;
   justify-content: center;
-  gap: 3px;
-  min-height: 52px;
-  padding: 6px 4px;
-  border: none;
-  background: none;
-  color: var(--muted);
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-  touch-action: manipulation;
-  transition: color 0.12s ease;
 }
-.tab-btn--active {
-  color: var(--accent);
-  /* Subtle top-border cue, same as the Möbius shell's active tab. */
-  box-shadow: inset 0 2px 0 var(--accent);
-}
-.tab-btn:active { color: var(--text); }
-.tab-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  line-height: 1;
+.chat-panel--collapsed .chat-embed,
+.chat-panel--collapsed .chat-error {
+  display: none;
 }
 
 /* ---- Error chips (float above the main area when build fails) ----
@@ -4951,12 +4906,8 @@ const CSS = `
    split (handled in renderMain), with the chat docked below the split. The
    body switches from a vertical flex stack to a CSS grid: the rail spans all
    rows in column 1; content / resizer / chat fill column 2. The .split itself
-   caps the editor measure so source doesn't stretch edge-to-edge on a monitor.
-   The tab bar is hidden at desktop — the three-pane layout provides the same
-   navigation. */
+   caps the editor measure so source doesn't stretch edge-to-edge on a monitor. */
 @media (min-width: 860px) {
-  /* Hide the tab bar — desktop has the three-pane layout. */
-  .tab-bar { display: none; }
   .body, .body--split-host {
     display: grid;
     grid-template-columns: 264px minmax(0, 1fr);
