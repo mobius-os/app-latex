@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.5.0'
+const APP_VERSION = '2.6.0'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -947,6 +947,16 @@ function KebabIcon({ size = 18 }) {
   )
 }
 
+function ChatBubbleIcon({ size = 20 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden>
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  )
+}
+
 // Detect whether a path's leaf is a file (vs a folder we haven't
 // expanded yet). For the index-driven tree, anything in the flat
 // list IS a file; folders only exist as intermediate path segments.
@@ -1642,6 +1652,7 @@ function ChatSplitPanel({
   quickActions,
   getContext,
   contentChildren,
+  chatOpen,
   viewMode,
 }) {
   const rootRef = useRef(null)
@@ -1655,8 +1666,10 @@ function ChatSplitPanel({
   useEffect(() => { getContextRef.current = getContext }, [getContext])
   const systemPrompt = useMemo(() => bootstrapPrompt(), [])
 
-  // Mount split + chat together — both need the DOM ready. Destroy on unmount.
+  // Mount split + chat together — both need the DOM ready, and chatOpen must
+  // be true. Destroy on unmount or when chatOpen flips to false.
   useEffect(() => {
+    if (!chatOpen) return undefined
     const root = rootRef.current
     const chatMount = chatMountRef.current
     if (!root || !chatMount) return undefined
@@ -1707,7 +1720,20 @@ function ChatSplitPanel({
     }
     // systemPrompt is stable (useMemo []); only re-mount when storage identity changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storage, systemPrompt])
+  }, [storage, systemPrompt, chatOpen])
+
+  if (!chatOpen) {
+    // Chat off: render content full-screen, no split.
+    return (
+      <div className="ma-root ma-root--split">
+        <div className="ma-split-content ma-split-content--full">
+          {contentChildren}
+        </div>
+        {/* Keep chatMountRef alive so the effect can reference it when chatOpen flips */}
+        <div ref={chatMountRef} style={{ display: 'none' }} />
+      </div>
+    )
+  }
 
   return (
     <div ref={rootRef} className="ma-root ma-root--split">
@@ -2014,6 +2040,26 @@ function readChatHeight(appId) {
   const raw = Number(localStorage.getItem(chatHeightKey(appId)))
   if (!Number.isFinite(raw)) return CHAT_DEFAULT_PCT
   return Math.min(CHAT_MAX_PCT, Math.max(CHAT_MIN_PCT, raw))
+}
+
+// Chat toggle model — persisted separately from the legacy chat-height key.
+// chatOpen: boolean (panel visible); chatRatio: 0..1 (fraction of body height).
+const CHAT_OPEN_VERSION = 1
+const CHAT_RATIO_VERSION = 1
+
+function chatOpenKey(appId) { return `latex:${appId}:chat-open:v${CHAT_OPEN_VERSION}` }
+function chatRatioKey(appId) { return `latex:${appId}:chat-ratio:v${CHAT_RATIO_VERSION}` }
+
+function readChatOpen(appId) {
+  if (typeof localStorage === 'undefined') return false
+  return localStorage.getItem(chatOpenKey(appId)) === 'true'
+}
+
+function readChatRatio(appId) {
+  if (typeof localStorage === 'undefined') return 0.5
+  const raw = Number(localStorage.getItem(chatRatioKey(appId)))
+  if (!Number.isFinite(raw) || raw <= 0 || raw >= 1) return 0.5
+  return Math.max(0.05, Math.min(0.95, raw))
 }
 
 function readFileCache(appId) {
@@ -2366,7 +2412,8 @@ export default function App({ appId, token }) {
   // on every storage write (handled inline at each call site below)
   // and on a 10s background poll.
   const [pending, setPending] = useState(0)
-  const [chatHeight, setChatHeight] = useState(() => readChatHeight(appId))
+  const [chatOpen, setChatOpen] = useState(() => readChatOpen(appId))
+  const [chatRatio, setChatRatio] = useState(() => readChatRatio(appId))
   // viewMode: 'source' = CodeMirror editor, 'pdf' = compiled PDF viewer.
   const [viewMode, setViewMode] = useState('source') // 'source' | 'pdf'
   // Desktop split: at >=860px the editor and PDF sit side-by-side (Overleaf's
@@ -2411,81 +2458,49 @@ export default function App({ appId, token }) {
 
   useEffect(() => {
     if (typeof localStorage === 'undefined') return
-    try { localStorage.setItem(chatHeightKey(appId), String(chatHeight)) } catch {}
-  }, [appId, chatHeight])
+    try { localStorage.setItem(chatOpenKey(appId), String(chatOpen)) } catch {}
+  }, [appId, chatOpen])
 
-  const resizeChatBy = useCallback((deltaPct) => {
-    setChatHeight((value) => Math.min(CHAT_MAX_PCT, Math.max(CHAT_MIN_PCT, value + deltaPct)))
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return
+    try { localStorage.setItem(chatRatioKey(appId), String(chatRatio)) } catch {}
+  }, [appId, chatRatio])
+
+  const toggleChat = useCallback(() => {
+    setChatOpen((open) => {
+      if (!open) {
+        // Turning on: land at 50% if ratio is unset/minimal
+        setChatRatio((r) => (r <= 0.05 ? 0.5 : r))
+      }
+      return !open
+    })
   }, [])
 
   const beginChatResize = useCallback((event) => {
     event.preventDefault()
     const body = bodyRef.current
-    const panel = body?.querySelector?.('.chat-panel')
-    if (!body || !panel) return
+    if (!body) return
     const total = body.getBoundingClientRect().height
     if (!total) return
     const startY = event.clientY
-    const startTime = Date.now()
-    // When collapsed the CSS height is 24px (enforced by .chat-panel--collapsed),
-    // so read the CSS --chat-panel-height value for the logical start height,
-    // not the rendered 24px box.
-    const cssPanelH = total * (panel.classList.contains('chat-panel--collapsed')
-      ? 0
-      : (parseFloat(getComputedStyle(panel).height) / total))
-    const startHeight = Math.max(0, cssPanelH)
-    const minPx = 0
-    const maxPx = Math.max(0, total - 180)
-
-    // Last few pointer moves for velocity computation.
-    const moveHistory = []
-
+    const startRatioPx = total * chatRatio
+    event.currentTarget.setPointerCapture?.(event.pointerId)
     const onMove = (moveEvent) => {
-      const nextPx = Math.min(maxPx, Math.max(minPx, startHeight + startY - moveEvent.clientY))
-      setChatHeight(Math.min(CHAT_MAX_PCT, Math.max(CHAT_MIN_PCT, (nextPx / total) * 100)))
-      moveHistory.push({ y: moveEvent.clientY, t: Date.now() })
-      if (moveHistory.length > 4) moveHistory.shift()
-    }
-    const onUp = (upEvent) => {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      const totalMove = Math.abs(upEvent.clientY - startY)
-      const duration = Date.now() - startTime
-
-      // Tap-toggle: tiny movement, fast interaction.
-      if (totalMove < 8 && duration < 300) {
-        setChatHeight((h) => h <= 2 ? CHAT_DEFAULT_PCT : CHAT_MIN_PCT)
-        return
-      }
-
-      // Velocity flick: snap to max/min on strong flick.
-      if (moveHistory.length >= 2) {
-        const last = moveHistory[moveHistory.length - 1]
-        const prev = moveHistory[0]
-        const vpy = (last.y - prev.y) / Math.max(1, last.t - prev.t)
-        if (vpy < -0.5) { setChatHeight(CHAT_MAX_PCT); return }
-        if (vpy > 0.5) { setChatHeight(CHAT_MIN_PCT); return }
-      }
+      const nextPx = Math.max(total * 0.05, Math.min(total * 0.95, startRatioPx + startY - moveEvent.clientY))
+      setChatRatio(nextPx / total)
     }
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp, { once: true })
-  }, [])
+    window.addEventListener('pointerup', () => {
+      window.removeEventListener('pointermove', onMove)
+    }, { once: true })
+  }, [chatRatio])
 
   const handleResizeKey = useCallback((event) => {
-    if (event.key === 'ArrowUp') {
-      event.preventDefault()
-      resizeChatBy(4)
-    } else if (event.key === 'ArrowDown') {
-      event.preventDefault()
-      resizeChatBy(-4)
-    } else if (event.key === 'Home') {
-      event.preventDefault()
-      setChatHeight(CHAT_MIN_PCT)
-    } else if (event.key === 'End') {
-      event.preventDefault()
-      setChatHeight(CHAT_MAX_PCT)
-    }
-  }, [resizeChatBy])
+    if (event.key === 'ArrowUp') { event.preventDefault(); setChatRatio((r) => Math.min(0.95, r + 0.04)) }
+    else if (event.key === 'ArrowDown') { event.preventDefault(); setChatRatio((r) => Math.max(0.05, r - 0.04)) }
+    else if (event.key === 'Home') { event.preventDefault(); setChatRatio(0.05) }
+    else if (event.key === 'End') { event.preventDefault(); setChatRatio(0.95) }
+  }, [])
 
   // Persist the file-cache snapshot whenever the index, contents, or
   // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
@@ -3655,60 +3670,66 @@ export default function App({ appId, token }) {
   const openName = selectedPath ? selectedPath.replace(/^files\//, '') : null
 
   // ── Fallback layout render (no split API) ──────────────────────────────────
-  // The body is a flex column with content + resizer + chat-panel stacked
-  // vertically. The chat panel collapses to a 24px handle bar when
-  // chatHeight <= 2% (CHAT_MIN_PCT = 0).
+  // Chat off: content is full-screen, no panel, no handle.
+  // Chat on: content shrinks, draggable divider appears, chat panel below.
   function renderFallbackBody() {
-    const isCollapsed = chatHeight <= 2
+    const fileNav = (
+      <FileNavPanel
+        open={navOpen}
+        onClose={closeNav}
+        files={files}
+        selectedPath={selectedPath}
+        onSelect={setSelectedPath}
+        canMutate={indexLoaded}
+        onCreateFile={handleCreateFile}
+        onCreateFolder={handleCreateFolder}
+        onDeleteFile={handleDeleteFile}
+        onDeleteFolder={handleDeleteFolder}
+        onUpload={uploadFiles}
+        onMove={movePath}
+        onRename={handleRename}
+        mainPath={mainPath}
+        onSetMain={handleSetMain}
+        returnFocusRef={navToggleRef}
+        pinned={isWide}
+      />
+    )
+    if (!chatOpen) {
+      return (
+        <div ref={bodyRef} className="body">
+          {fileNav}
+          <main className="content">{renderMain()}</main>
+        </div>
+      )
+    }
     return (
-      <div
-        ref={bodyRef}
-        className="body"
-        style={{ '--chat-panel-height': `${chatHeight}%` }}
-      >
-        <FileNavPanel
-          open={navOpen}
-          onClose={closeNav}
-          files={files}
-          selectedPath={selectedPath}
-          onSelect={setSelectedPath}
-          canMutate={indexLoaded}
-          onCreateFile={handleCreateFile}
-          onCreateFolder={handleCreateFolder}
-          onDeleteFile={handleDeleteFile}
-          onDeleteFolder={handleDeleteFolder}
-          onUpload={uploadFiles}
-          onMove={movePath}
-          onRename={handleRename}
-          mainPath={mainPath}
-          onSetMain={handleSetMain}
-          returnFocusRef={navToggleRef}
-          pinned={isWide}
-        />
-        <main className="content">{renderMain()}</main>
+      <div ref={bodyRef} className="body" style={{ '--chat-ratio': chatRatio }}>
+        {fileNav}
+        <main className="content" style={{ flex: `${1 - chatRatio} 1 0`, minHeight: 0 }}>{renderMain()}</main>
         <div
-          className="chat-resizer"
+          className="chat-divider"
           role="separator"
           aria-label="Resize chat and editor areas"
           aria-orientation="horizontal"
-          aria-valuemin={CHAT_MIN_PCT}
-          aria-valuemax={CHAT_MAX_PCT}
-          aria-valuenow={Math.round(chatHeight)}
+          aria-valuemin={0} aria-valuemax={100}
+          aria-valuenow={Math.round(chatRatio * 100)}
           tabIndex={0}
           onPointerDown={beginChatResize}
           onKeyDown={handleResizeKey}
         >
-          <span className="chat-resizer-bar" aria-hidden="true" />
+          <span className="chat-divider-bar" aria-hidden="true" />
         </div>
-        <ChatPanel
-          appId={appId}
-          token={token}
-          storage={storage}
-          onFilesMaybeChanged={onFilesMaybeChanged}
-          quickActions={quickActions}
-          getContext={getContext}
-          collapsed={isCollapsed}
-        />
+        <div style={{ flex: '0 0 auto', height: `${chatRatio * 100}%`, display: 'flex', flexDirection: 'column' }}>
+          <ChatPanel
+            appId={appId}
+            token={token}
+            storage={storage}
+            onFilesMaybeChanged={onFilesMaybeChanged}
+            quickActions={quickActions}
+            getContext={getContext}
+            collapsed={false}
+          />
+        </div>
       </div>
     )
   }
@@ -3744,6 +3765,7 @@ export default function App({ appId, token }) {
             onFilesMaybeChanged={onFilesMaybeChanged}
             quickActions={quickActions}
             getContext={getContext}
+            chatOpen={chatOpen}
             contentChildren={
               <main className="content content--fill">{renderMain()}</main>
             }
@@ -3831,6 +3853,16 @@ export default function App({ appId, token }) {
             : <span className="top-path top-path--muted">No file open</span>}
         </div>
         <div className="top-actions">
+          <button
+            type="button"
+            className="toolbar-btn chat-toggle-btn"
+            aria-label="Toggle chat"
+            aria-pressed={chatOpen}
+            title={chatOpen ? 'Hide chat' : 'Show chat'}
+            onClick={toggleChat}
+          >
+            <ChatBubbleIcon size={20} />
+          </button>
           {hasMain && selectedIsTex && !isWide && (
             <div className="seg-toggle" role="group" aria-label="View">
               <button
@@ -4009,6 +4041,11 @@ const CSS = `
 @media (hover: hover) {
   .toolbar-btn:hover:not(:disabled) { background: var(--surface2, var(--surface)); }
   .toolbar-btn--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 85%, #000); }
+}
+.chat-toggle-btn[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
 }
 
 /* ---- source/preview view toggle: bare icon buttons, matching Web
@@ -4577,6 +4614,29 @@ const CSS = `
   border-radius: 999px;
   background: color-mix(in srgb, var(--muted) 65%, transparent);
 }
+/* Toggle-model drag handle — used by renderFallbackBody when chatOpen=true */
+.chat-divider {
+  flex: 0 0 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  touch-action: none;
+  position: relative;
+}
+.chat-divider:hover,
+.chat-divider:focus-visible {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+}
+.chat-divider:focus-visible { outline-offset: -2px; }
+.chat-divider-bar {
+  width: 44px;
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 65%, transparent);
+}
 .chat-embed {
   flex: 1 1 auto;
   min-height: 0;          /* the flexbox overflow fix — lets the iframe scroll internally */
@@ -4749,6 +4809,12 @@ const CSS = `
      the selector used inside the split pane to avoid specificity fights. */
   height: 100%;
 }
+/* When chatOpen=false in the split path, content fills the full container. */
+.ma-split-content--full {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
 .ma-split-chat .chat-error {
   /* Inline inside the split pane — remove absolute positioning. */
   margin: 8px 12px 0;
@@ -4917,9 +4983,10 @@ const CSS = `
     transform: none;
     border-right: 1px solid var(--border);
   }
-  /* Fallback layout: content / resizer / chat stack down the right column. */
+  /* Fallback layout: content / resizer (or divider) / chat stack down the right column. */
   .content { grid-column: 2; grid-row: 1; }
   .chat-resizer { grid-column: 2; grid-row: 2; }
+  .chat-divider { grid-column: 2; grid-row: 2; }
   .chat-panel { grid-column: 2; grid-row: 3; }
   /* Split layout: the split-body-area spans the right column. */
   .split-body-area { grid-column: 2; grid-row: 1 / -1; }
