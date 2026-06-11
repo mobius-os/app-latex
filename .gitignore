@@ -6,3 +6,5 @@ node_modules/
 *.swp
 .idea/
 .vscode/
+tests/.build/
+tests/.build-zoom/

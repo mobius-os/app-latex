@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.6.0'
+const APP_VERSION = '2.7.0'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -209,12 +209,12 @@ export function normalizeFileCacheSnapshot(parsed) {
 // ----------------------------------------------------------------------
 // LaTeX editor mini-app for Möbius — an Overleaf-style editor.
 //
-// Layout (mobile-first, VSCode-shaped):
-//   - Top bar: the app logo (toggles the left file drawer) · the open file's name
-//     (+ a "main" badge if it's the document Build compiles) · a
-//     single row of icon buttons: a source/preview view toggle and a
-//     play-triangle Build button (both for .tex only; each icon button
-//     carries an aria-label + title).
+// Layout (mobile-first, VSCode-shaped; the top bar + chat split are kept
+// structurally IDENTICAL to app-webstudio):
+//   - Top bar, three zones: LEFT = the app logo (toggles the left file
+//     drawer) + the open file's name; CENTER = the chat toggle; RIGHT = a
+//     source/PDF view toggle and a play-triangle Build button (both for
+//     .tex only; each icon button carries an aria-label + title).
 //   - Left drawer: slides in over a backdrop from the left edge — the
 //     file tree + New file/folder/Upload + per-file context actions
 //     (rename / delete / set-as-main). Each non-main .tex row also shows
@@ -225,10 +225,11 @@ export function normalizeFileCacheSnapshot(parsed) {
 //   - Main area: the SOURCE editor (CodeMirror) OR the compiled PDF
 //     (pdf.js canvas), toggled. Images render inline; a .pdf in the
 //     tree renders directly in the pdf.js viewer.
-//   - Chat: a bottom panel with a bounded height so the embedded agent
-//     conversation + composer stay fully visible and scrollable. The
-//     user describes the document in prose; the sub-agent edits files
-//     in /data/apps/<id>/files/ via the Edit and Write tools.
+//   - Chat: toggled from the top bar. Opening it splits the body 50/50 —
+//     content above, a slim draggable divider in the middle, the embedded
+//     agent chat below (composer pinned to the panel bottom). The user
+//     describes the document in prose; the sub-agent edits files in
+//     /data/apps/<id>/files/ via the Edit and Write tools.
 //
 // Storage layout (under /api/storage/apps/<id>/):
 //   files/<path>           the user's actual .tex/.md/etc. files
@@ -490,14 +491,44 @@ function ImagePreview({ storage, path, reloadKey = 0 }) {
   return <img className="img-preview" src={url} alt={path} />
 }
 
-// Zoom step ladder and helpers for the in-content PDF zoom.
-const ZOOM_STEPS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
-const ZOOM_FIT = 1.0         // fit = pages fill container width
-const ZOOM_DOUBLE_TAP = 2.0  // double-tap toggles fit <-> 2×
+/* zoom-math:begin — pure, dependency-free zoom helpers.
+   tests/zoom-math.test.mjs extracts and executes this exact block, so keep
+   it plain JS (no JSX, no imports, no references to anything outside it). */
 
-function clampZoom(z) {
-  return Math.max(ZOOM_STEPS[0], Math.min(ZOOM_STEPS[ZOOM_STEPS.length - 1], z))
+// Continuous zoom bounds for the PDF viewer. 1 = fit-width.
+export const ZOOM_MIN = 0.5
+export const ZOOM_MAX = 4
+const ZOOM_FIT = 1          // fit = pages fill container width
+const ZOOM_DOUBLE_TAP = 2   // double-tap toggles fit <-> 2×
+const ZOOM_BTN_FACTOR = 1.25 // +/- buttons multiply/divide by this
+
+export function clampScale(scale) {
+  if (!Number.isFinite(scale)) return ZOOM_MIN
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, scale))
 }
+
+// Live scale during a pinch: the scale at gesture start times the ratio of
+// the current finger distance to the starting finger distance, clamped.
+export function pinchScale(startScale, startDist, dist) {
+  if (!(startDist > 0) || !(dist > 0)) return clampScale(startScale)
+  return clampScale(startScale * (dist / startDist))
+}
+
+// After committing a zoom (re-rendering content `ratio` times larger), move
+// the scroll position so the content point that sat under the gesture anchor
+// stays under it. `originX/originY` are the anchor's offset inside the scroll
+// container's viewport; `scrollLeft/scrollTop` are the positions BEFORE the
+// re-render. Derivation: the content coordinate under the anchor is
+// (scroll + origin); after scaling it lands at (scroll + origin) * ratio, so
+// the new scroll that keeps it at `origin` is that minus origin. The browser
+// additionally clamps to the scrollable range; we only clamp the lower bound.
+export function anchoredZoomScroll({ scrollLeft, scrollTop, originX, originY, ratio }) {
+  return {
+    scrollLeft: Math.max(0, (scrollLeft + originX) * ratio - originX),
+    scrollTop: Math.max(0, (scrollTop + originY) * ratio - originY),
+  }
+}
+/* zoom-math:end */
 
 // PDF preview — a real pdf.js canvas render. Mobile browsers refuse to
 // render a blob-URL PDF inline in an <iframe> (they offer an "open
@@ -510,23 +541,48 @@ function clampZoom(z) {
 // the SAME deterministic path still refetches + re-renders the fresh
 // bytes. A .pdf opened directly from the tree passes version={undefined}
 // (no build to track). The .pdf-pages host is populated imperatively via
-// appendChild — it MUST NOT also carry React children, or React would
-// clobber the canvases on its next reconcile; that's why the loading
-// note is a SIBLING, not a child of the host.
+// appendChild/replaceChild — it MUST NOT also carry React children, or
+// React would clobber the canvases on its next reconcile; that's why the
+// loading note is a SIBLING, not a child of the host.
 //
-// In-content zoom: pinch-to-zoom + double-tap + toolbar (+/−/fit).
-// The shell locks page pinch-zoom, so we implement our own using
-// pointer events. During a live pinch a CSS transform is applied to
-// .pdf-pages for instant feedback; on gesture end we re-render the
-// canvases at the committed scale via rerenderAtScale (reuses docRef,
-// no re-fetch). renderScale is state + a ref copy so gesture closures
-// read the latest value without stale captures.
+// Zoom model — ONE committed `scale` (1 = fit-width), three gestures:
+//   pinch      — continuous; during the gesture a CSS transform (anchored at
+//                the pinch midpoint via transform-origin) previews the zoom
+//                instantly; on gesture end commitScale() makes it real.
+//   double-tap — toggles fit <-> 2× toward the tap point (dblclick on desktop).
+//   +/− / fit  — toolbar fallback, anchored at the viewport centre.
+// commitScale() resizes the existing canvases synchronously (stretched bitmap
+// — instant feedback), converts the scroll position with anchoredZoomScroll()
+// so the content under the fingers stays put, then kicks an async crisp
+// repaint that swaps each canvas for a freshly rendered one (no blanking).
+// One-finger pan is the browser's own scrolling: the viewer is overflow:auto
+// with touch-action: pan-x pan-y, so only multi-touch reaches our handlers.
+//
+// The page gap and host padding are scaled with the zoom (applyPageChrome) so
+// the WHOLE content geometry is proportional to `scale` — that's what makes
+// the anchoredZoomScroll math exact instead of drifting by the unscaled
+// chrome around the pages.
+const PDF_PAD_X = 12   // .pdf-pages horizontal padding at scale 1
+const PDF_PAD_Y = 16   // .pdf-pages vertical padding at scale 1
+const PDF_PAGE_GAP = 14 // gap between pages at scale 1
+const DOUBLE_TAP_MS = 300
+const DOUBLE_TAP_SLOP_PX = 24
+const TAP_MOVE_SLOP_PX = 10
+
+function applyPageChrome(host, scale) {
+  host.style.gap = `${Math.round(PDF_PAGE_GAP * scale)}px`
+  host.style.padding = `${Math.round(PDF_PAD_Y * scale)}px ${Math.round(PDF_PAD_X * scale)}px`
+}
+
 function PdfPreview({ storage, path, version }) {
   const scrollRef = useRef(null)  // the scrollable .pdf-viewer wrapper
   const pagesRef = useRef(null)   // the .pdf-pages canvas host
   const docRef = useRef(null)     // the loaded pdfjs document (kept for re-render)
-  const numPagesRef = useRef(0)
-  const isRenderingRef = useRef(false)  // prevents concurrent re-render races
+  // Monotonic token: every paint pass takes the next value and aborts as soon
+  // as a newer pass (or unmount) bumps it — replaces a boolean "isRendering"
+  // lock so a commit during an in-flight repaint supersedes it instead of
+  // being dropped.
+  const renderTokenRef = useRef(0)
 
   // `err` is null when fine, otherwise { message, retryable }. We keep a
   // retryable flag so the same render can show a Retry button only when
@@ -538,69 +594,107 @@ function PdfPreview({ storage, path, version }) {
   // Bumping this re-runs the load effect — the in-app Retry mechanism.
   const [retryNonce, setRetryNonce] = useState(0)
 
-  // renderScale drives crisp re-renders at the committed zoom level.
-  // renderScaleRef is a sync copy so gesture closures read the latest
-  // value without stale captures (React state reads are async).
-  const [renderScale, setRenderScale] = useState(ZOOM_FIT)
-  const renderScaleRef = useRef(ZOOM_FIT)
+  // The committed zoom. State drives the % readout; the ref is the sync copy
+  // gesture closures read (React state reads are async).
+  const [scale, setScale] = useState(ZOOM_FIT)
+  const scaleRef = useRef(ZOOM_FIT)
 
-  // Re-render all pages at a given scale using the already-loaded docRef.
-  // Does NOT re-fetch the PDF blob — reuses the pdfjs document in memory.
-  // isRenderingRef prevents two concurrent re-renders racing each other.
-  const rerenderAtScale = useCallback(async (scale) => {
-    const doc = docRef.current
+  // Synchronously re-geometry the EXISTING canvases for `targetScale` — the
+  // bitmaps stretch (blurry until the crisp repaint lands) but layout is
+  // instant, so the scroll conversion right after reads correct extents.
+  const layoutPages = useCallback((targetScale) => {
     const host = pagesRef.current
-    if (!doc || !host) return
-    if (isRenderingRef.current) return
-    isRenderingRef.current = true
-    try {
-      host.innerHTML = ''
-      const dpr = Math.min(window.devicePixelRatio || 1, 2)
-      const containerWidth = Math.max(
-        (scrollRef.current && scrollRef.current.clientWidth) || 600,
-        200,
-      )
-      for (let i = 1; i <= numPagesRef.current; i++) {
-        const page = await doc.getPage(i)
-        const base = page.getViewport({ scale: 1 })
-        const cssScale = (containerWidth / base.width) * scale
-        const vp = page.getViewport({ scale: cssScale * dpr })
-        const canvas = document.createElement('canvas')
-        canvas.className = 'pdf-page'
-        canvas.width = Math.floor(vp.width)
-        canvas.height = Math.floor(vp.height)
-        canvas.style.width = `${Math.floor(vp.width / dpr)}px`
-        canvas.style.height = `${Math.floor(vp.height / dpr)}px`
-        host.appendChild(canvas)
-        await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
-      }
-      // Clear any live-preview CSS transform applied during pinch
-      host.style.transform = ''
-      host.style.transformOrigin = ''
-    } finally {
-      isRenderingRef.current = false
+    const scroller = scrollRef.current
+    if (!host || !scroller) return
+    const fitW = Math.max(scroller.clientWidth - 2 * PDF_PAD_X, 120)
+    applyPageChrome(host, targetScale)
+    const cssW = Math.max(1, Math.round(fitW * targetScale))
+    for (const canvas of host.children) {
+      const baseW = Number(canvas.dataset.baseW)
+      const baseH = Number(canvas.dataset.baseH)
+      if (!(baseW > 0) || !(baseH > 0)) continue
+      canvas.style.width = `${cssW}px`
+      canvas.style.height = `${Math.max(1, Math.round(cssW * (baseH / baseW)))}px`
     }
   }, [])
 
-  // Re-render effect: fires when renderScale changes; skips the very first
-  // render (load effect handles that using renderScaleRef for initial paint).
-  const initialRenderDoneRef = useRef(false)
-  useEffect(() => {
-    if (!initialRenderDoneRef.current) return
-    rerenderAtScale(renderScale)
-  }, [renderScale, rerenderAtScale])
+  // Crisply repaint every page at `targetScale` using the already-loaded
+  // docRef (no blob re-fetch). Each page renders into a NEW offscreen canvas
+  // that replaces the old one only when finished, so the viewer never blanks.
+  const paintPages = useCallback(async (targetScale) => {
+    const doc = docRef.current
+    const host = pagesRef.current
+    const scroller = scrollRef.current
+    if (!doc || !host || !scroller) return
+    const token = ++renderTokenRef.current
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const fitW = Math.max(scroller.clientWidth - 2 * PDF_PAD_X, 120)
+    applyPageChrome(host, targetScale)
+    for (let i = 1; i <= doc.numPages; i++) {
+      if (token !== renderTokenRef.current) return
+      const page = await doc.getPage(i)
+      if (token !== renderTokenRef.current) return
+      const base = page.getViewport({ scale: 1 })
+      const cssW = Math.max(1, Math.round(fitW * targetScale))
+      const cssH = Math.max(1, Math.round(cssW * (base.height / base.width)))
+      const canvas = document.createElement('canvas')
+      canvas.className = 'pdf-page'
+      canvas.dataset.baseW = String(base.width)
+      canvas.dataset.baseH = String(base.height)
+      canvas.style.width = `${cssW}px`
+      canvas.style.height = `${cssH}px`
+      canvas.width = Math.max(1, Math.round(cssW * dpr))
+      canvas.height = Math.max(1, Math.round(cssH * dpr))
+      const vp = page.getViewport({ scale: (cssW * dpr) / base.width })
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
+      if (token !== renderTokenRef.current) return
+      const existing = host.children[i - 1]
+      if (existing) host.replaceChild(canvas, existing)
+      else host.appendChild(canvas)
+    }
+    while (host.children.length > doc.numPages) host.removeChild(host.lastChild)
+  }, [])
 
-  // Load effect: fetch + initial render. Runs on storage/path/version/retryNonce changes.
+  // Commit a new zoom level, keeping the content under the gesture anchor
+  // stationary. anchorX/anchorY are client coords (the pinch midpoint, the
+  // tap point, or omitted for the toolbar = viewport centre).
+  const commitScale = useCallback((next, anchorX, anchorY) => {
+    const scroller = scrollRef.current
+    const host = pagesRef.current
+    if (!scroller || !host) return
+    const prev = scaleRef.current
+    const target = clampScale(next)
+    if (target === prev) {
+      host.style.transform = ''
+      host.style.transformOrigin = ''
+      return
+    }
+    const rect = scroller.getBoundingClientRect()
+    const originX = (anchorX ?? rect.left + rect.width / 2) - rect.left
+    const originY = (anchorY ?? rect.top + rect.height / 2) - rect.top
+    const before = { scrollLeft: scroller.scrollLeft, scrollTop: scroller.scrollTop }
+    scaleRef.current = target
+    setScale(target)
+    layoutPages(target)
+    host.style.transform = ''
+    host.style.transformOrigin = ''
+    const converted = anchoredZoomScroll({
+      ...before, originX, originY, ratio: target / prev,
+    })
+    scroller.scrollLeft = converted.scrollLeft
+    scroller.scrollTop = converted.scrollTop
+    paintPages(target)
+  }, [layoutPages, paintPages])
+
+  // Load effect: fetch + initial paint. Runs on storage/path/version/retryNonce changes.
   useEffect(() => {
     let cancelled = false
-    // Reset state for a fresh load
-    initialRenderDoneRef.current = false
     setErr(null); setLoading(true)
-    // Destroy any prior document
+    // Invalidate any in-flight paint + destroy the prior document.
+    renderTokenRef.current += 1
     if (docRef.current) {
       try { docRef.current.destroy && docRef.current.destroy() } catch {}
       docRef.current = null
-      numPagesRef.current = 0
     }
     ;(async () => {
       try {
@@ -630,37 +724,11 @@ function PdfPreview({ storage, path, version }) {
         const doc = await pdfjs.getDocument({ data }).promise
         if (cancelled) { doc.destroy && doc.destroy(); return }
         docRef.current = doc
-        numPagesRef.current = doc.numPages
         const host = pagesRef.current
         if (!host) return
-        // Initial paint uses renderScaleRef (sync) so the first render
-        // uses the current zoom without triggering the re-render effect.
-        const initScale = renderScaleRef.current
         host.innerHTML = ''
-        const dpr = Math.min(window.devicePixelRatio || 1, 2)
-        const containerWidth = Math.max(
-          (scrollRef.current && scrollRef.current.clientWidth) || 600,
-          200,
-        )
-        for (let i = 1; i <= doc.numPages; i++) {
-          if (cancelled) break
-          const page = await doc.getPage(i)
-          const base = page.getViewport({ scale: 1 })
-          const cssScale = (containerWidth / base.width) * initScale
-          const vp = page.getViewport({ scale: cssScale * dpr })
-          const canvas = document.createElement('canvas')
-          canvas.className = 'pdf-page'
-          canvas.width = Math.floor(vp.width)
-          canvas.height = Math.floor(vp.height)
-          canvas.style.width = `${Math.floor(vp.width / dpr)}px`
-          canvas.style.height = `${Math.floor(vp.height / dpr)}px`
-          host.appendChild(canvas)
-          await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise
-        }
-        if (!cancelled) {
-          setLoading(false)
-          initialRenderDoneRef.current = true
-        }
+        await paintPages(scaleRef.current)
+        if (!cancelled) setLoading(false)
       } catch (e) {
         if (cancelled) return
         // A pdf.js parse failure on bytes that aren't a real PDF yet (empty
@@ -679,117 +747,135 @@ function PdfPreview({ storage, path, version }) {
     })()
     return () => {
       cancelled = true
-      // Destroy doc on cleanup
+      renderTokenRef.current += 1
       if (docRef.current) {
         try { docRef.current.destroy && docRef.current.destroy() } catch {}
         docRef.current = null
-        numPagesRef.current = 0
       }
     }
-  }, [storage, path, version, retryNonce])
+  }, [storage, path, version, retryNonce, paintPages])
 
-  // ----- Pinch-to-zoom gesture handlers -----
-  // Named onPinchStart/Move/End to avoid shadowing the double-tap touch handlers.
-  // During the gesture a CSS transform is applied to .pdf-pages for instant
-  // live preview; on gesture end we re-render at the committed scale.
-  const pinchRef = useRef(null) // { dist0, scale0 } captured at gesture start
+  // ----- Pinch + double-tap wiring -----
+  // Native listeners (not React synthetic handlers) because React attaches
+  // touchstart/touchmove passively at the root, so e.preventDefault() there
+  // is a silent no-op — and we MUST preventDefault two-finger moves or the
+  // browser treats the pinch as a two-finger pan (allowed by pan-x pan-y).
+  const pinchRef = useRef(null)     // live pinch: dist0/scale0/mid/origin/g
+  const tapRef = useRef({ t: 0, x: 0, y: 0 })     // last completed tap
+  const touchStartRef = useRef(null)               // single-touch start point
 
-  const onPinchStart = useCallback((e) => {
-    if (e.touches.length !== 2) return
-    const t0 = e.touches[0], t1 = e.touches[1]
-    const dx = t0.clientX - t1.clientX
-    const dy = t0.clientY - t1.clientY
-    pinchRef.current = {
-      dist0: Math.sqrt(dx * dx + dy * dy),
-      scale0: renderScaleRef.current,
-      midX: (t0.clientX + t1.clientX) / 2,
-      midY: (t0.clientY + t1.clientY) / 2,
+  useEffect(() => {
+    const scroller = scrollRef.current
+    if (!scroller) return undefined
+
+    const onTouchStart = (e) => {
+      if (e.touches.length === 2) {
+        const [a, b] = e.touches
+        const host = pagesRef.current
+        const hostRect = host ? host.getBoundingClientRect() : null
+        const midX = (a.clientX + b.clientX) / 2
+        const midY = (a.clientY + b.clientY) / 2
+        pinchRef.current = {
+          dist0: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+          scale0: scaleRef.current,
+          midX,
+          midY,
+          // transform-origin in host coords: the content point under the
+          // pinch midpoint, so scaling expands/contracts around the fingers.
+          originX: hostRect ? midX - hostRect.left : 0,
+          originY: hostRect ? midY - hostRect.top : 0,
+          g: 1,
+        }
+        touchStartRef.current = null
+      } else if (e.touches.length === 1) {
+        const t = e.touches[0]
+        touchStartRef.current = { x: t.clientX, y: t.clientY }
+      }
     }
-  }, [])
 
-  const onPinchMove = useCallback((e) => {
-    if (e.touches.length !== 2 || !pinchRef.current) return
-    e.preventDefault()
-    const t0 = e.touches[0], t1 = e.touches[1]
-    const dx = t0.clientX - t1.clientX
-    const dy = t0.clientY - t1.clientY
-    const dist = Math.sqrt(dx * dx + dy * dy)
-    const ratio = dist / pinchRef.current.dist0
-    const liveScale = clampZoom(pinchRef.current.scale0 * ratio)
-    const host = pagesRef.current
-    if (host) {
-      const visualScale = liveScale / renderScaleRef.current
-      // Anchor the CSS transform at the initial pinch midpoint relative to
-      // .pdf-pages so zooming feels centred on the user's fingers.
-      const hostRect = host.getBoundingClientRect()
-      const originX = pinchRef.current.midX - hostRect.left
-      const originY = pinchRef.current.midY - hostRect.top
-      host.style.transformOrigin = `${originX}px ${originY}px`
-      host.style.transform = `scale(${visualScale})`
+    const onTouchMove = (e) => {
+      const p = pinchRef.current
+      if (!p || e.touches.length !== 2) return
+      e.preventDefault()
+      const [a, b] = e.touches
+      const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)
+      const live = pinchScale(p.scale0, p.dist0, dist)
+      p.g = live / p.scale0
+      const host = pagesRef.current
+      if (host) {
+        host.style.transformOrigin = `${p.originX}px ${p.originY}px`
+        host.style.transform = `scale(${p.g})`
+      }
     }
-  }, [])
 
-  const onPinchEnd = useCallback((e) => {
-    if (!pinchRef.current) return
-    const host = pagesRef.current
-    // Compute final scale from the last two-touch state before lifting
-    let finalScale = renderScaleRef.current
-    if (e.touches.length < 2 && e.changedTouches.length > 0) {
-      // Use the scale implied by the last move's transform ratio
-      if (host && host.style.transform) {
-        const m = host.style.transform.match(/scale\(([^)]+)\)/)
-        if (m) {
-          finalScale = clampZoom(renderScaleRef.current * parseFloat(m[1]))
+    const onTouchEnd = (e) => {
+      const p = pinchRef.current
+      if (p) {
+        if (e.touches.length >= 2) return
+        pinchRef.current = null
+        tapRef.current = { t: 0, x: 0, y: 0 }
+        commitScale(p.scale0 * p.g, p.midX, p.midY)
+        return
+      }
+      // Double-tap detection: two quick stationary taps near each other.
+      if (e.changedTouches.length === 1 && e.touches.length === 0) {
+        const t = e.changedTouches[0]
+        const start = touchStartRef.current
+        touchStartRef.current = null
+        if (start && Math.hypot(t.clientX - start.x, t.clientY - start.y) > TAP_MOVE_SLOP_PX) {
+          tapRef.current = { t: 0, x: 0, y: 0 } // it was a pan, not a tap
+          return
+        }
+        const now = Date.now()
+        const last = tapRef.current
+        if (now - last.t < DOUBLE_TAP_MS
+          && Math.hypot(t.clientX - last.x, t.clientY - last.y) < DOUBLE_TAP_SLOP_PX) {
+          e.preventDefault() // suppress the synthetic dblclick that would re-fire
+          tapRef.current = { t: 0, x: 0, y: 0 }
+          const next = scaleRef.current === ZOOM_FIT ? ZOOM_DOUBLE_TAP : ZOOM_FIT
+          commitScale(next, t.clientX, t.clientY)
+        } else {
+          tapRef.current = { t: now, x: t.clientX, y: t.clientY }
         }
       }
     }
-    pinchRef.current = null
-    // Snap to nearest ZOOM_STEPS entry
-    const snapped = ZOOM_STEPS.reduce((best, s) => (
-      Math.abs(s - finalScale) < Math.abs(best - finalScale) ? s : best
-    ), ZOOM_STEPS[0])
-    renderScaleRef.current = snapped
-    setRenderScale(snapped)
-    // rerenderAtScale will clear the CSS transform after re-painting
-  }, [])
 
-  // ----- Double-tap to toggle fit <-> 2× -----
-  const lastTapRef = useRef(0)
-  const onDoubleTap = useCallback((e) => {
-    const now = Date.now()
-    if (now - lastTapRef.current < 300) {
-      e.preventDefault()
-      const next = renderScaleRef.current === ZOOM_FIT ? ZOOM_DOUBLE_TAP : ZOOM_FIT
-      renderScaleRef.current = next
-      setRenderScale(next)
+    const onTouchCancel = () => {
+      const p = pinchRef.current
+      pinchRef.current = null
+      touchStartRef.current = null
+      if (p) commitScale(p.scale0 * p.g, p.midX, p.midY)
     }
-    lastTapRef.current = now
-  }, [])
 
-  // ----- Zoom toolbar helpers -----
-  const zoomIn = useCallback(() => {
-    const cur = renderScaleRef.current
-    const next = ZOOM_STEPS.find((s) => s > cur + 0.001) ?? cur
-    renderScaleRef.current = next
-    setRenderScale(next)
-  }, [])
+    scroller.addEventListener('touchstart', onTouchStart, { passive: true })
+    scroller.addEventListener('touchmove', onTouchMove, { passive: false })
+    scroller.addEventListener('touchend', onTouchEnd, { passive: false })
+    scroller.addEventListener('touchcancel', onTouchCancel)
+    return () => {
+      scroller.removeEventListener('touchstart', onTouchStart)
+      scroller.removeEventListener('touchmove', onTouchMove)
+      scroller.removeEventListener('touchend', onTouchEnd)
+      scroller.removeEventListener('touchcancel', onTouchCancel)
+    }
+    // `err` is a dep because the viewer node is unmounted while an error
+    // shows — after Retry clears it, the listeners must attach to the NEW node.
+  }, [commitScale, err])
 
-  const zoomOut = useCallback(() => {
-    const cur = renderScaleRef.current
-    const arr = [...ZOOM_STEPS].reverse()
-    const next = arr.find((s) => s < cur - 0.001) ?? cur
-    renderScaleRef.current = next
-    setRenderScale(next)
-  }, [])
+  // Desktop equivalent of double-tap (touch double-taps preventDefault their
+  // synthetic dblclick, so this never double-fires).
+  const onDoubleClick = useCallback((e) => {
+    const next = scaleRef.current === ZOOM_FIT ? ZOOM_DOUBLE_TAP : ZOOM_FIT
+    commitScale(next, e.clientX, e.clientY)
+  }, [commitScale])
 
-  const zoomFit = useCallback(() => {
-    renderScaleRef.current = ZOOM_FIT
-    setRenderScale(ZOOM_FIT)
-  }, [])
+  // ----- Zoom toolbar (the +/− fallback) -----
+  const zoomIn = useCallback(() => { commitScale(scaleRef.current * ZOOM_BTN_FACTOR) }, [commitScale])
+  const zoomOut = useCallback(() => { commitScale(scaleRef.current / ZOOM_BTN_FACTOR) }, [commitScale])
+  const zoomFit = useCallback(() => { commitScale(ZOOM_FIT) }, [commitScale])
 
-  const zoomPct = Math.round(renderScale * 100)
-  const atMin = renderScale <= ZOOM_STEPS[0] + 0.001
-  const atMax = renderScale >= ZOOM_STEPS[ZOOM_STEPS.length - 1] - 0.001
+  const zoomPct = Math.round(scale * 100)
+  const atMin = scale <= ZOOM_MIN + 0.001
+  const atMax = scale >= ZOOM_MAX - 0.001
 
   if (err) {
     return (
@@ -806,15 +892,12 @@ function PdfPreview({ storage, path, version }) {
       </div>
     )
   }
+  // The toolbar floats OVER the scroller (absolute in .pdf-stage) instead of
+  // living inside the scroll content: scrolled content is then ONLY the
+  // pages host, whose geometry scales uniformly with the zoom — keeping the
+  // anchored-zoom scroll conversion exact.
   return (
-    <div
-      className="pdf-viewer"
-      ref={scrollRef}
-      onTouchStart={onPinchStart}
-      onTouchMove={onPinchMove}
-      onTouchEnd={onPinchEnd}
-      onTouchCancel={onPinchEnd}
-    >
+    <div className="pdf-stage">
       <div className="pdf-zoom-toolbar" aria-label="Zoom controls">
         <button
           type="button"
@@ -841,11 +924,9 @@ function PdfPreview({ storage, path, version }) {
         >+</button>
       </div>
       {loading && <div className="preview-note">Rendering PDF…</div>}
-      <div
-        className="pdf-pages"
-        ref={pagesRef}
-        onClick={onDoubleTap}
-      />
+      <div className="pdf-viewer" ref={scrollRef} onDoubleClick={onDoubleClick}>
+        <div className="pdf-pages" ref={pagesRef} />
+      </div>
     </div>
   )
 }
@@ -949,7 +1030,6 @@ function ChevronIcon({ size = 14 }) {
 // own aria-label + title), so the glyph stands in for the old text label.
 //   source  — a code/'</>' glyph (view the .tex source)
 //   preview — a document-page glyph (view the compiled PDF)
-//   build   — a play triangle (compile the main document)
 //   target  — a target/bullseye glyph (the "set as main document" affordance)
 const ICON_PATHS = {
   source: <><polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" /></>,
@@ -959,7 +1039,6 @@ const ICON_PATHS = {
       <polyline points="14 3 14 8 19 8" />
     </>
   ),
-  build: <polygon points="7 4 20 12 7 20 7 4" />,
   target: (
     <>
       <circle cx="12" cy="12" r="9" />
@@ -1005,6 +1084,34 @@ function ChatBubbleIcon({ size = 20 }) {
     </svg>
   )
 }
+
+// Play triangle for the Build action — same component as Web Studio's, so the
+// two editor-shaped apps share one primary-action icon.
+/* mobius-ui:PlayIcon v1 — keep in sync with app-webstudio */
+function PlayIcon({ size = 20 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden>
+      <path d="M6 4.5 19 12 6 19.5V4.5Z" />
+    </svg>
+  )
+}
+/* /mobius-ui:PlayIcon */
+
+// Spinner shown in the Build button while a compile runs (CSS animation on
+// .building-spin). Same component as Web Studio's.
+/* mobius-ui:BuildingIndicator v1 — keep in sync with app-webstudio */
+function BuildingIndicator({ size = 20 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden className="building-spin">
+      <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+    </svg>
+  )
+}
+/* /mobius-ui:BuildingIndicator */
 
 // Detect whether a path's leaf is a file (vs a folder we haven't
 // expanded yet). For the index-driven tree, anything in the flat
@@ -1689,118 +1796,15 @@ export function parseBuildErrorChips(log) {
 }
 
 // ---------------------------------------------------------------------------
-// ChatSplitPanel — mounts the embedded chat inside a window.mobius.split()
-// container. Requires the split API (guard is checked by the caller).
-// Renders: a root div with data-split-role="content" child + data-split-role="chat" child.
-// The split handle is injected by window.mobius.split() into the root div.
-// ---------------------------------------------------------------------------
-function ChatSplitPanel({
-  appId, token, storage,
-  onFilesMaybeChanged,
-  quickActions,
-  getContext,
-  contentChildren,
-  chatOpen,
-  viewMode,
-}) {
-  const rootRef = useRef(null)
-  const chatMountRef = useRef(null)
-  const [chatError, setChatError] = useState(null)
-  const onFilesRef = useRef(onFilesMaybeChanged)
-  useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
-  const quickActionsRef = useRef(quickActions)
-  useEffect(() => { quickActionsRef.current = quickActions }, [quickActions])
-  const getContextRef = useRef(getContext)
-  useEffect(() => { getContextRef.current = getContext }, [getContext])
-  const systemPrompt = useMemo(() => bootstrapPrompt(), [])
-
-  // Mount chat ONCE on load — independent of chatOpen so toggling the panel
-  // never tears down a streaming turn. Visibility is controlled by CSS below.
-  useEffect(() => {
-    const chatMount = chatMountRef.current
-    if (!chatMount || !window.mobius || typeof window.mobius.chat !== 'function') return undefined
-
-    let disposed = false
-    let chatHandle = null
-    setChatError(null)
-
-    window.mobius.chat({
-      mount: chatMount,
-      persist: 'chat_id.json',
-      title: 'LaTeX',
-      systemPrompt,
-      picker: true,
-      quickActions: quickActionsRef.current,
-      getContext: () => {
-        const fn = getContextRef.current
-        return fn ? fn() : null
-      },
-      onTurnDone: () => { if (onFilesRef.current) onFilesRef.current() },
-      onError: ({ error: e }) => {
-        if (!disposed) setChatError(typeof e === 'string' ? e : 'Embedded chat reported an error.')
-      },
-    }).then((h) => {
-      if (disposed) { h.destroy(); return }
-      chatHandle = h
-    }).catch((e) => {
-      if (!disposed) setChatError(e.message || 'Could not mount embedded chat.')
-    })
-
-    return () => {
-      disposed = true
-      if (chatHandle) chatHandle.destroy()
-    }
-    // systemPrompt is stable (useMemo []); only re-mount when storage identity changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storage, systemPrompt])
-
-  // Wire/destroy the split handle when chatOpen changes. The chat iframe stays
-  // mounted throughout; only the drag-bar is added/removed.
-  useEffect(() => {
-    const root = rootRef.current
-    if (!root || !chatOpen) return undefined
-    if (!window.mobius || typeof window.mobius.split !== 'function') return undefined
-
-    const split = window.mobius.split({
-      mount: root,
-      defaultRatio: 0.65,
-      minContentPx: 120,
-      minChatPx: 96,
-      persistKey: 'latex-split-v1',
-    })
-    return () => { split.destroy() }
-  }, [chatOpen])
-
-  return (
-    <div ref={rootRef} className="ma-root ma-root--split">
-      <div
-        data-split-role="content"
-        className={chatOpen ? 'ma-split-content' : 'ma-split-content ma-split-content--full'}
-      >
-        {contentChildren}
-      </div>
-      <div
-        data-split-role="chat"
-        className="ma-split-chat"
-        ref={chatMountRef}
-        style={chatOpen ? undefined : { display: 'none' }}
-      >
-        {chatError && <div className="chat-error">{chatError}</div>}
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// ChatPanel (fallback) — the original bespoke bottom-sheet used when
-// window.mobius.split is absent. Unchanged from 2.3.x behavior.
+// ChatPanel — the bottom half of the 50/50 chat split. Fills the height the
+// body allots it (via --chat-ratio) as a flex column; the embedded chat
+// iframe fills the column, so its composer is pinned to the panel's bottom.
 // ---------------------------------------------------------------------------
 function ChatPanel({
   appId, token, storage,
   onFilesMaybeChanged,
   quickActions,
   getContext,
-  collapsed = false,
 }) {
   const mountRef = useRef(null)
   const [error, setError] = useState(null)
@@ -1862,7 +1866,7 @@ function ChatPanel({
   }, [storage, systemPrompt])
 
   return (
-    <section className={`chat-panel${collapsed ? ' chat-panel--collapsed' : ''}`}>
+    <section className="chat-panel" aria-label="Agent chat">
       {error && <div className="chat-error">{error}</div>}
       <div className="chat-embed" ref={mountRef} />
     </section>
@@ -2062,31 +2066,12 @@ function ModalView({ state }) {
 // ----------------------------------------------------------------------
 const FILE_CONTENT_CACHE_LIMIT = 20
 const FILE_CACHE_VERSION = 1
-const CHAT_HEIGHT_CACHE_VERSION = 1
 
 function fileCacheKey(appId) {
   return `latex:${appId}:files-cache:v${FILE_CACHE_VERSION}`
 }
 
-function chatHeightKey(appId) {
-  return `latex:${appId}:chat-height:v${CHAT_HEIGHT_CACHE_VERSION}`
-}
-
-// The chat's min height (% of body). 0 = fully collapsed to the 24px handle
-// bar (CSS enforces the 24px minimum via .chat-panel--collapsed). The default
-// opening height stays comfortable; the keyboard shortcuts still use CHAT_MAX_PCT.
-const CHAT_MIN_PCT = 0
-const CHAT_MAX_PCT = 100
-const CHAT_DEFAULT_PCT = 36
-
-function readChatHeight(appId) {
-  if (typeof localStorage === 'undefined') return CHAT_DEFAULT_PCT
-  const raw = Number(localStorage.getItem(chatHeightKey(appId)))
-  if (!Number.isFinite(raw)) return CHAT_DEFAULT_PCT
-  return Math.min(CHAT_MAX_PCT, Math.max(CHAT_MIN_PCT, raw))
-}
-
-// Chat toggle model — persisted separately from the legacy chat-height key.
+// Chat toggle model.
 // chatOpen: boolean (panel visible); chatRatio: 0..1 (fraction of body height).
 const CHAT_OPEN_VERSION = 1
 const CHAT_RATIO_VERSION = 1
@@ -2512,10 +2497,9 @@ export default function App({ appId, token }) {
 
   const toggleChat = useCallback(() => {
     setChatOpen((open) => {
-      if (!open) {
-        // Turning on: land at 50% if ratio is unset/minimal
-        setChatRatio((r) => (r <= 0.05 ? 0.5 : r))
-      }
+      // Turning on always spawns a 50/50 split — the divider in the middle —
+      // regardless of where a previous drag left it (owner spec).
+      if (!open) setChatRatio(0.5)
       return !open
     })
   }, [])
@@ -3409,11 +3393,6 @@ export default function App({ appId, token }) {
   const mainBuilding = build.buildStatus === 'building' && build.buildDoc === mainPath
   const mainBuildError = build.buildStatus === 'error' && build.buildDoc === mainPath
 
-  // Whether the platform provides the ChatSplit API. Checked once on mount and
-  // stored so the fallback path doesn't flash in/out. If the API is absent the
-  // bespoke chatHeight panel takes over.
-  const hasSplit = typeof window !== 'undefined' && typeof window.mobius?.split === 'function'
-
   // Dismissible error chips: parsed from buildLog '! ' lines when build failed.
   const [dismissedChips, setDismissedChips] = useState([])
   const errorChips = useMemo(() => {
@@ -3713,10 +3692,13 @@ export default function App({ appId, token }) {
 
   const openName = selectedPath ? selectedPath.replace(/^files\//, '') : null
 
-  // ── Fallback layout render (no split API) ──────────────────────────────────
-  // Chat off: content is full-screen, no panel, no handle.
-  // Chat on: content shrinks, draggable divider appears, chat panel below.
-  function renderFallbackBody() {
+  // ── Body render ─────────────────────────────────────────────────────────
+  // Chat off: content is full-screen, no panel, no divider.
+  // Chat on: 50/50 split — content above, slim draggable divider, chat panel
+  // below. --chat-ratio (set inline) drives the panel height; the panel is a
+  // flex column whose embedded chat iframe fills it, so the composer is
+  // pinned to the bottom of the panel.
+  function renderBody() {
     const fileNav = (
       <FileNavPanel
         open={navOpen}
@@ -3747,9 +3729,9 @@ export default function App({ appId, token }) {
       )
     }
     return (
-      <div ref={bodyRef} className="body" style={{ '--chat-ratio': chatRatio }}>
+      <div ref={bodyRef} className="body body--chat-open" style={{ '--chat-ratio': chatRatio }}>
         {fileNav}
-        <main className="content" style={{ flex: `${1 - chatRatio} 1 0`, minHeight: 0 }}>{renderMain()}</main>
+        <main className="content">{renderMain()}</main>
         <div
           className="chat-divider"
           role="separator"
@@ -3763,58 +3745,14 @@ export default function App({ appId, token }) {
         >
           <span className="chat-divider-bar" aria-hidden="true" />
         </div>
-        <div style={{ flex: '0 0 auto', height: `${chatRatio * 100}%`, display: 'flex', flexDirection: 'column' }}>
-          <ChatPanel
-            appId={appId}
-            token={token}
-            storage={storage}
-            onFilesMaybeChanged={onFilesMaybeChanged}
-            quickActions={quickActions}
-            getContext={getContext}
-            collapsed={false}
-          />
-        </div>
-      </div>
-    )
-  }
-
-  // ── Split layout render (split API available) ─────────────────────────────
-  function renderSplitBody() {
-    return (
-      <div ref={bodyRef} className="body body--split-host">
-        <FileNavPanel
-          open={navOpen}
-          onClose={closeNav}
-          files={files}
-          selectedPath={selectedPath}
-          onSelect={setSelectedPath}
-          canMutate={indexLoaded}
-          onCreateFile={handleCreateFile}
-          onCreateFolder={handleCreateFolder}
-          onDeleteFile={handleDeleteFile}
-          onDeleteFolder={handleDeleteFolder}
-          onUpload={uploadFiles}
-          onMove={movePath}
-          onRename={handleRename}
-          mainPath={mainPath}
-          onSetMain={handleSetMain}
-          returnFocusRef={navToggleRef}
-          pinned={isWide}
+        <ChatPanel
+          appId={appId}
+          token={token}
+          storage={storage}
+          onFilesMaybeChanged={onFilesMaybeChanged}
+          quickActions={quickActions}
+          getContext={getContext}
         />
-        <div className="split-body-area">
-          <ChatSplitPanel
-            appId={appId}
-            token={token}
-            storage={storage}
-            onFilesMaybeChanged={onFilesMaybeChanged}
-            quickActions={quickActions}
-            getContext={getContext}
-            chatOpen={chatOpen}
-            contentChildren={
-              <main className="content content--fill">{renderMain()}</main>
-            }
-          />
-        </div>
       </div>
     )
   }
@@ -3862,41 +3800,47 @@ export default function App({ appId, token }) {
   return (
     <div className="latex-root">
       <style>{CSS}</style>
+      {/* Three-zone top bar: left = drawer toggle + open filename, center =
+          the chat toggle, right = view toggle + Build (+ sync pill). The grid
+          is 1fr auto 1fr so the chat toggle sits in the visual centre of the
+          bar. Identical structure in app-webstudio (ws- prefixed). */}
       <header className="top-bar">
-        {/* The app's own logo IS the file-drawer toggle (the shell pattern:
-            the brand logo, not a hamburger, opens the drawer). The icon comes
-            from the public /api/apps/<id>/icon route; if the app has no custom
-            icon (404), onError swaps in the ☰ glyph so the toggle still reads. */}
-        <button
-          ref={navToggleRef}
-          className="nav-toggle"
-          onClick={toggleNav}
-          aria-label={navOpen ? 'Close files' : 'Open files'}
-          aria-expanded={navOpen}
-          title="Toggle files"
-        >
-          <img
-            className="nav-toggle-logo"
-            src={`/api/apps/${appId}/icon`}
-            width={28}
-            height={28}
-            alt=""
-            style={{ borderRadius: 6 }}
-            onError={(e) => {
-              // No custom icon for this app — fall back to the hamburger glyph.
-              e.currentTarget.style.display = 'none'
-              const fallback = e.currentTarget.nextElementSibling
-              if (fallback) fallback.style.display = 'inline'
-            }}
-          />
-          <span className="nav-toggle-fallback" aria-hidden style={{ display: 'none' }}>☰</span>
-        </button>
-        <div className="top-title">
-          {openName
-            ? <span className="top-path" title={selectedPath}>{openName}</span>
-            : <span className="top-path top-path--muted">No file open</span>}
+        <div className="top-zone top-zone--left">
+          {/* The app's own logo IS the file-drawer toggle (the shell pattern:
+              the brand logo, not a hamburger, opens the drawer). The icon comes
+              from the public /api/apps/<id>/icon route; if the app has no custom
+              icon (404), onError swaps in the ☰ glyph so the toggle still reads. */}
+          <button
+            ref={navToggleRef}
+            className="nav-toggle"
+            onClick={toggleNav}
+            aria-label={navOpen ? 'Close files' : 'Open files'}
+            aria-expanded={navOpen}
+            title="Toggle files"
+          >
+            <img
+              className="nav-toggle-logo"
+              src={`/api/apps/${appId}/icon`}
+              width={28}
+              height={28}
+              alt=""
+              style={{ borderRadius: 6 }}
+              onError={(e) => {
+                // No custom icon for this app — fall back to the hamburger glyph.
+                e.currentTarget.style.display = 'none'
+                const fallback = e.currentTarget.nextElementSibling
+                if (fallback) fallback.style.display = 'inline'
+              }}
+            />
+            <span className="nav-toggle-fallback" aria-hidden style={{ display: 'none' }}>☰</span>
+          </button>
+          <div className="top-title">
+            {openName
+              ? <span className="top-path" title={selectedPath}>{openName}</span>
+              : <span className="top-path top-path--muted">No file open</span>}
+          </div>
         </div>
-        <div className="top-actions">
+        <div className="top-zone top-zone--center">
           <button
             type="button"
             className="toolbar-btn chat-toggle-btn"
@@ -3907,6 +3851,8 @@ export default function App({ appId, token }) {
           >
             <ChatBubbleIcon size={20} />
           </button>
+        </div>
+        <div className="top-zone top-zone--right">
           {hasMain && selectedIsTex && !isWide && (
             <div className="seg-toggle" role="group" aria-label="View">
               <button
@@ -3936,10 +3882,14 @@ export default function App({ appId, token }) {
               className="toolbar-btn toolbar-btn--primary"
               onClick={handleBuild}
               disabled={build.buildStatus === 'building'}
-              aria-label={build.buildStatus === 'building' ? 'Building the build target' : 'Build the build target'}
-              title={`Compile the build target (${mainPath.replace(/^files\//, '')})`}
+              aria-label={build.buildStatus === 'building' ? 'Building…' : 'Build'}
+              title={build.buildStatus === 'building'
+                ? 'Building…'
+                : `Build ${mainPath.replace(/^files\//, '')}`}
             >
-              <ToolIcon name="build" />
+              {build.buildStatus === 'building'
+                ? <BuildingIndicator size={20} />
+                : <PlayIcon size={20} />}
             </button>
           )}
           <SyncPill online={online} hasRuntime={storage.hasRuntime} />
@@ -3949,8 +3899,7 @@ export default function App({ appId, token }) {
       {/* Error chips float over the content area when build fails */}
       {renderErrorChips()}
 
-      {/* ── Split path (window.mobius.split available) ── */}
-      {hasSplit ? renderSplitBody() : renderFallbackBody()}
+      {renderBody()}
 
       {modal.node}
     </div>
@@ -3986,20 +3935,32 @@ const CSS = `
   text-rendering: geometricPrecision;
 }
 
-/* mobius-ui:Toolbar v1 */
+/* mobius-ui:Toolbar v1 — keep in sync with app-webstudio (ws- prefixed) */
+/* Three-zone bar: 1fr | auto | 1fr puts the centre zone (the chat toggle) in
+   the visual middle of the bar; the side zones flex + truncate. */
 .top-bar {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-height: 48px;
-  /* Top-pinned bar: grow the top pad into the device safe area (notch/status
-     bar) so the toolbar never sits under it on a full-bleed PWA. */
-  padding: max(6px, env(safe-area-inset-top)) 10px 6px;
+  /* Top-pinned bar: clear the notch / Dynamic Island and pad the sides past
+     the rounded-corner / gesture insets on a full-screen PWA. */
+  padding: max(6px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left));
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+  user-select: none;
 }
+.top-zone {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.top-zone--left { justify-content: flex-start; }
+.top-zone--center { flex: 0 0 auto; justify-content: center; }
+.top-zone--right { justify-content: flex-end; }
 /* The logo-as-toggle: a bare 44px tap target holding the app icon, so the
    logo (not a hamburger) opens the file drawer — mirroring the Möbius shell. */
 .nav-toggle {
@@ -4032,7 +3993,6 @@ const CSS = `
   min-width: 0;
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 8px;
   font-size: 13px;
   font-weight: 600;
@@ -4047,13 +4007,6 @@ const CSS = `
   text-overflow: ellipsis;
 }
 .top-path--muted { color: var(--muted); font-weight: 400; }
-.top-actions {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  min-width: 0;
-}
 /* Icon-only Build button: a square tap target with the play glyph centred. */
 .toolbar-btn {
   width: 44px;
@@ -4090,6 +4043,12 @@ const CSS = `
   background: color-mix(in srgb, var(--accent) 18%, var(--surface));
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+/* Build-button spinner (BuildingIndicator) — same recipe as app-webstudio. */
+@keyframes building-spin { to { transform: rotate(360deg); } }
+.building-spin {
+  animation: building-spin 1.1s linear infinite;
+  transform-origin: center;
 }
 
 /* ---- source/preview view toggle: bare icon buttons, matching Web
@@ -4248,33 +4207,45 @@ const CSS = `
 }
 
 /* ---- pdf.js canvas viewer ---- */
-.pdf-viewer {
+/* Stage = positioning context for the floating zoom toolbar; the scroller
+   below it holds ONLY the pages host, so all scrolled content scales
+   uniformly with the zoom (keeps the anchored-zoom scroll math exact). */
+.pdf-stage {
+  position: relative;
   height: 100%;
-  overflow-y: auto;
-  overflow-x: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pdf-viewer {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
   background: var(--surface2, var(--surface));
-  /* touch-action: none lets us intercept pinch/double-tap without the
-     browser's own page zoom interfering (shell already locks pinch-zoom,
-     this reinforces it at the component level). */
-  touch-action: none;
+  /* One-finger pan is the browser's own scrolling (both axes); only
+     multi-touch (pinch) reaches our handlers. */
+  touch-action: pan-x pan-y;
   overscroll-behavior: contain;
   position: relative;
 }
-/* Sticky zoom toolbar inside the viewer — backdrop-blurred so page content
-   doesn't visually merge with the controls while scrolling. */
+/* Floating zoom pill — overlays the top of the viewer (it must NOT live in
+   the scroll content: unscaled chrome there would skew the zoom scroll
+   conversion). Backdrop-blurred so page content reads through it. */
 .pdf-zoom-toolbar {
-  position: sticky;
-  top: 0;
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
   z-index: 5;
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 2px;
-  padding: 4px 8px;
+  padding: 2px 6px;
   background: color-mix(in srgb, var(--surface) 80%, transparent);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 999px;
   user-select: none;
   -webkit-user-select: none;
 }
@@ -4307,13 +4278,17 @@ const CSS = `
   min-width: 56px;
   font-variant-numeric: tabular-nums;
 }
+/* Pages host. gap + padding are set inline (scaled with the zoom — see
+   applyPageChrome). width: max-content + min-width: 100% so a zoomed-in host
+   grows past the viewport and stays fully reachable by scrolling (a centered
+   flex child wider than its scroller would clip its left edge). */
 .pdf-pages {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
-  padding: 16px 12px 28px;
-  transform-origin: top center;
+  width: max-content;
+  min-width: 100%;
+  box-sizing: border-box;
 }
 .pdf-page {
   display: block;
@@ -4610,30 +4585,36 @@ const CSS = `
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-/* mobius-ui:ChatEmbed v1 */
-/* ---- Fallback chat panel (bottom sheet, bounded height) ----
-   Used when window.mobius.split is absent (older shell). The embedded
-   shell chat runs inside an iframe (window.mobius.chat). The classic
-   flexbox overflow trap is what cut the conversation off: the panel
-   needs a BOUNDED height and the embed needs min-height:0 so the iframe
-   (which has its own internal scroll + a sticky composer) can shrink to
-   fit and scroll internally instead of overflowing the container and
-   pushing its own composer off-screen. The panel is a fixed-height
-   bottom sheet (about 42vh) so the messages + composer are always fully
-   visible; flex-shrink keeps it from eating the editor. */
+/* mobius-ui:ChatEmbed v1 — keep in sync with app-webstudio (ws- prefixed) */
+/* ---- chat panel (bottom half of the 50/50 split) ----
+   The embedded shell chat runs inside an iframe (window.mobius.chat). The
+   panel takes EXACTLY the height --chat-ratio allots it (no internal
+   min/max fighting the divider) and is a flex column; the embed fills it
+   (flex:1 + min-height:0) and the iframe fills the embed, so the chat's
+   composer is pinned to the bottom of the panel. */
 .chat-panel {
   flex: 0 0 auto;
-  height: var(--chat-panel-height, 36%);
-  min-height: 88px;
-  max-height: calc(100% - 180px);
+  height: calc(var(--chat-ratio, 0.5) * 100%);
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--surface);
-  border-top: 1px solid var(--border);
+  overflow: hidden;
   overscroll-behavior: contain;
+  /* Bottom-pinned sheet: lift the embedded chat composer above the iPhone
+     home-indicator / Android gesture bar on a full-screen PWA. */
+  padding-bottom: env(safe-area-inset-bottom);
 }
-.chat-resizer {
-  flex: 0 0 9px;
+/* The draggable divider ("glider") between content and chat: a SLIM 10px
+   visual bar; the ::before overlay extends the pointer hit area to ~26px
+   without adding visual weight. z-index keeps the overlay above the
+   adjacent panes so the extra hit area actually receives the pointer. */
+.chat-divider {
+  flex: 0 0 10px;
+  height: 10px; /* explicit: the desktop grid ignores flex-basis */
+  box-sizing: border-box;
+  position: relative;
+  z-index: 5;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4642,28 +4623,15 @@ const CSS = `
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   touch-action: none;
+  user-select: none;
 }
-.chat-resizer:hover,
-.chat-resizer:focus-visible {
-  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
-}
-.chat-resizer-bar {
-  width: 44px;
-  height: 3px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--muted) 65%, transparent);
-}
-/* Toggle-model drag handle — used by renderFallbackBody when chatOpen=true */
-.chat-divider {
-  flex: 0 0 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: ns-resize;
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  touch-action: none;
-  position: relative;
+.chat-divider::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -8px;
+  bottom: -8px;
 }
 .chat-divider:hover,
 .chat-divider:focus-visible {
@@ -4672,9 +4640,10 @@ const CSS = `
 .chat-divider:focus-visible { outline-offset: -2px; }
 .chat-divider-bar {
   width: 44px;
-  height: 3px;
+  height: 4px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--muted) 65%, transparent);
+  pointer-events: none;
 }
 .chat-embed {
   flex: 1 1 auto;
@@ -4698,22 +4667,6 @@ const CSS = `
   color: var(--text);
   font-size: 12px;
 }
-/* Collapsed chat panel: a 24px drag-handle bar. The chat embed is hidden so
-   the editor/PDF takes the full pane. The border-radius on the top corners
-   gives it the same bottom-sheet "pill" look as the split handle. */
-.chat-panel--collapsed {
-  height: 24px !important;
-  min-height: 24px !important;
-  max-height: 24px !important;
-  cursor: ns-resize;
-  border-radius: 12px 12px 0 0;
-  justify-content: center;
-}
-.chat-panel--collapsed .chat-embed,
-.chat-panel--collapsed .chat-error {
-  display: none;
-}
-
 /* ---- Error chips (float above the main area when build fails) ----
    Up to 3 dismissible chips float at the top of the content area; tapping
    "Fix" switches to Chat and pre-fills the composer. */
@@ -4783,81 +4736,6 @@ const CSS = `
 }
 .error-chip-dismiss:hover { color: var(--text); }
 .error-chip-dismiss:active { background: var(--surface2, var(--surface)); }
-
-/* ---- ChatSplit layout (window.mobius.split path) ----
-   The body area contains a FileNavPanel + a split-body-area that fills the
-   rest. When the file tree is pinned (desktop), it occupies the left column
-   via CSS grid (same as before). The split-body-area is the mount for
-   ChatSplitPanel: position:relative is required by window.mobius.split. */
-.body--split-host {
-  /* Same as .body: flex column, fills remaining height */
-}
-.split-body-area {
-  flex: 1 1 auto;
-  min-height: 0;
-  position: relative;
-  overflow: hidden;
-}
-
-/* mobius-ui:ChatSplit v1 — keep in sync with app-component-shapes.md §9 */
-.ma-root--split {
-  position: relative;
-  overflow: hidden;
-  width: 100%;
-  height: 100%;
-}
-/* Portrait (stacked): content on top, chat panel below */
-.ma-root--split[data-orientation="portrait"] .ma-split-content {
-  position: absolute; top: 0; left: 0; right: 0;
-  height: var(--cs-content-h, 100%);
-  overflow: hidden;
-  transition: height 0.18s ease;
-}
-.ma-root--split[data-orientation="portrait"] .ma-split-chat {
-  position: absolute; bottom: 0; left: 0; right: 0;
-  top: var(--cs-content-h, 100%);
-  overflow: hidden;
-  transition: top 0.18s ease;
-}
-/* Pill state: a fixed-height pill anchor at bottom */
-.ma-root--split[data-split-state="pill"][data-orientation="portrait"] .ma-split-chat {
-  top: auto;
-  height: 36px;
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  border-radius: 12px 12px 0 0;
-  display: flex; align-items: center; justify-content: center;
-}
-/* Side-by-side (wide): content left, chat right */
-.ma-root--split[data-orientation="side"] .ma-split-content {
-  position: absolute; top: 0; left: 0; bottom: 0;
-  width: var(--cs-content-w, 65%);
-  overflow: hidden;
-  transition: width 0.18s ease;
-}
-.ma-root--split[data-orientation="side"] .ma-split-chat {
-  position: absolute; top: 0; right: 0; bottom: 0;
-  left: var(--cs-content-w, 65%);
-  overflow: hidden;
-  transition: left 0.18s ease;
-}
-/* /mobius-ui:ChatSplit */
-.content--fill {
-  /* Inside the content pane the main must also stretch; .content itself
-     already sets flex:1 1 auto and min-height:0. This rule just matches
-     the selector used inside the split pane to avoid specificity fights. */
-  height: 100%;
-}
-/* When chatOpen=false in the split path, content fills the full container. */
-.ma-split-content--full {
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-}
-.ma-split-chat .chat-error {
-  /* Inline inside the split pane — remove absolute positioning. */
-  margin: 8px 12px 0;
-}
 
 /* mobius-ui:Sheet v1 */
 /* ---- modal ---- */
@@ -4991,7 +4869,7 @@ const CSS = `
 /* The SyncPill component defaults to a floating bottom-right pill (its
    absolute position is shared with other apps). Here it lives inline in
    the header, so un-float it. */
-.top-actions .sync-pill {
+.top-zone--right .sync-pill {
   position: static;
   right: auto;
   bottom: auto;
@@ -5004,13 +4882,19 @@ const CSS = `
    three-pane layout: a persistent file-tree rail, then a two-pane editor/PDF
    split (handled in renderMain), with the chat docked below the split. The
    body switches from a vertical flex stack to a CSS grid: the rail spans all
-   rows in column 1; content / resizer / chat fill column 2. The .split itself
+   rows in column 1; content / divider / chat fill column 2. The .split itself
    caps the editor measure so source doesn't stretch edge-to-edge on a monitor. */
 @media (min-width: 860px) {
-  .body, .body--split-host {
+  .body {
     display: grid;
     grid-template-columns: 264px minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto auto;
+  }
+  /* Chat open: row 3 takes the --chat-ratio share of the body height (the
+     panel's own %-height rule is neutralised below — the grid row IS the
+     height in this layout). */
+  .body--chat-open {
+    grid-template-rows: minmax(0, 1fr) auto calc(var(--chat-ratio, 0.5) * 100%);
   }
   /* The pinned rail: a static left column, not an overlay. Spans all rows. */
   .file-drawer--pinned {
@@ -5022,13 +4906,10 @@ const CSS = `
     transform: none;
     border-right: 1px solid var(--border);
   }
-  /* Fallback layout: content / resizer (or divider) / chat stack down the right column. */
+  /* Content / divider / chat stack down the right column. */
   .content { grid-column: 2; grid-row: 1; }
-  .chat-resizer { grid-column: 2; grid-row: 2; }
   .chat-divider { grid-column: 2; grid-row: 2; }
-  .chat-panel { grid-column: 2; grid-row: 3; }
-  /* Split layout: the split-body-area spans the right column. */
-  .split-body-area { grid-column: 2; grid-row: 1 / -1; }
+  .chat-panel { grid-column: 2; grid-row: 3; height: auto; }
   /* Two-pane editor/PDF split. The editor measure is capped so long source
      lines stay readable; the PDF pane takes the remaining width. */
   .split { display: flex; flex: 1 1 auto; height: 100%; min-height: 0; }
