@@ -2070,27 +2070,22 @@ function writeFileCache(appId, index, contents, lastPath) {
 // writes go straight to the server with no outbox to surface; we
 // hide the pill in that mode rather than fabricate a queue depth.
 // ----------------------------------------------------------------------
-function SyncPill({ online, pending, hasRuntime }) {
+function SyncPill({ online, hasRuntime }) {
   if (!hasRuntime) return null
-  let label = null
-  let variant = null
-  if (pending > 0) {
-    label = online ? `Saving · ${pending} pending` : `Offline · ${pending} pending`
-    variant = online ? 'pending' : 'offline'
-  } else if (!online) {
-    label = 'Offline'
-    variant = 'offline'
-  }
-  if (!label) return null
+  // Only surface the genuinely actionable state: offline. Local saves are
+  // instant and reliable, so an outbox count ("Saving · N pending") is
+  // internal plumbing the owner shouldn't have to read — and it flickered on
+  // every keystroke. A clean, online editor shows nothing.
+  if (online) return null
   return (
     <div
-      className={`sync-pill sync-pill--${variant}`}
+      className="sync-pill sync-pill--offline"
       role="status"
       aria-live="polite"
       title="Changes save locally and sync when you're back online."
     >
       <span className="sync-pill-dot" aria-hidden="true" />
-      {label}
+      Offline
     </div>
   )
 }
@@ -3871,7 +3866,7 @@ export default function App({ appId, token }) {
               <ToolIcon name="build" />
             </button>
           )}
-          <SyncPill online={online} pending={pending} hasRuntime={storage.hasRuntime} />
+          <SyncPill online={online} hasRuntime={storage.hasRuntime} />
         </div>
       </header>
 
