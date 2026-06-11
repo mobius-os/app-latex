@@ -4016,34 +4016,33 @@ const CSS = `
   .toolbar-btn--primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 85%, #000); }
 }
 
-/* ---- segmented source/preview toggle (icon-only) ---- */
+/* ---- source/preview view toggle: bare icon buttons, matching Web
+   Studio's top bar (no pill container — the active button carries the
+   accent tint, same recipe as .ws-icon-btn[aria-pressed=true]). ---- */
 .seg-toggle {
   display: inline-flex;
   flex: 0 0 auto;
-  padding: 2px;
-  border-radius: 9px;
-  border: 1px solid var(--border);
-  background: var(--bg);
+  gap: 6px;
 }
 .seg-btn {
-  width: 40px;
-  height: 40px;
-  min-height: 40px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 0;
-  border-radius: 7px;
-  background: none;
-  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
   touch-action: manipulation;
 }
 .seg-btn--active {
-  background: var(--surface2, var(--surface));
-  color: var(--text);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--accent);
 }
 .seg-btn:active { background: var(--surface2, var(--surface)); }
 @media (hover: hover) {
