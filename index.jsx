@@ -4227,6 +4227,10 @@ const CSS = `
   touch-action: pan-x pan-y;
   overscroll-behavior: contain;
   position: relative;
+  /* Classic (non-overlay) scrollbars shrink clientWidth after the first
+     paint, so fit-width computed pre-scrollbar overflows ~15px. Reserving
+     the gutter keeps clientWidth stable from the start. */
+  scrollbar-gutter: stable;
 }
 /* Floating zoom pill — overlays the top of the viewer (it must NOT live in
    the scroll content: unscaled chrome there would skew the zoom scroll
