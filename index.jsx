@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.7.0'
+const APP_VERSION = '2.7.2'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -1113,6 +1113,33 @@ function BuildingIndicator({ size = 20 }) {
 }
 /* /mobius-ui:BuildingIndicator */
 
+// The app's brand mark, drawn inline so the top-bar logo paints instantly with
+// zero network — the previous <img src="/api/apps/<id>/icon"> fetched the
+// full-res PNG at runtime just to fill a 28px slot. A document sheet (folded
+// corner) with the canonical lowered-E "LaTeX" descender stroke reads as
+// "a LaTeX document" at toolbar size. Currentcolor + the same stroke style as
+// the other toolbar glyphs so it inherits the theme. Filled sheet (var(--bg))
+// keeps the lettering legible against the surface.
+function LatexLogoIcon({ size = 28 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size}
+      role="img" aria-hidden focusable="false">
+      <path
+        d="M6 2.5h7L18.5 8v13a.5.5 0 0 1-.5.5H6a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5Z"
+        fill="var(--bg)" stroke="currentColor" strokeWidth="1.4"
+        strokeLinejoin="round" />
+      {/* Folded corner of the sheet. */}
+      <path d="M13 2.5V8h5.5" fill="none" stroke="currentColor"
+        strokeWidth="1.4" strokeLinejoin="round" strokeLinecap="round" />
+      {/* "LaTeX" wordmark cue: an upper E with a dropped middle bar — the
+          lowered-E that gives the logo its signature look — sized to the sheet. */}
+      <path d="M8.4 11.6h5M8.4 14.2h3.4M8.4 16.8h5"
+        fill="none" stroke="currentColor" strokeWidth="1.4"
+        strokeLinecap="round" />
+    </svg>
+  )
+}
+
 // Detect whether a path's leaf is a file (vs a folder we haven't
 // expanded yet). For the index-driven tree, anything in the flat
 // list IS a file; folders only exist as intermediate path segments.
@@ -2076,6 +2103,32 @@ function fileCacheKey(appId) {
 const CHAT_OPEN_VERSION = 1
 const CHAT_RATIO_VERSION = 1
 
+// The chat pane must never collapse smaller than the embedded composer's input
+// pill — the owner spec is "down to the top of the input pill but not more and
+// not less". The embed runs the real ChatView in an opaque iframe and publishes
+// no composer-height var, so we floor the pane at the standard Möbius composer
+// pill height (~64px) plus the divider (10px). The message list above the pill
+// can collapse to zero; the pill itself always stays fully visible and usable.
+// The same floor caps the OTHER end so the editor never fully eats the chat.
+const CHAT_PILL_MIN_PX = 64
+const CHAT_DIVIDER_PX = 10
+const CHAT_PANE_MIN_PX = CHAT_PILL_MIN_PX + CHAT_DIVIDER_PX
+
+// Clamp a desired chat-pane height (px) into [pill, total - pill] and return it
+// as a 0..1 ratio of the body. When the body is shorter than two pills, fall
+// back to a 50/50 split so neither pane vanishes. Pure — unit-testable.
+/* chat-bounds:begin (kept pure + dependency-free so a test can extract it) */
+export function clampChatRatio(desiredPx, total, minPx) {
+  if (!(total > 0)) return 0.5
+  const floor = minPx
+  const ceil = total - minPx
+  // Body too short to honor both floors: split evenly rather than clip a pill.
+  if (ceil <= floor) return 0.5
+  const px = Math.max(floor, Math.min(ceil, desiredPx))
+  return px / total
+}
+/* chat-bounds:end */
+
 function chatOpenKey(appId) { return `latex:${appId}:chat-open:v${CHAT_OPEN_VERSION}` }
 function chatRatioKey(appId) { return `latex:${appId}:chat-ratio:v${CHAT_RATIO_VERSION}` }
 
@@ -2516,8 +2569,11 @@ export default function App({ appId, token }) {
     const pointerId = event.pointerId
     divider.setPointerCapture?.(pointerId)
     const onMove = (moveEvent) => {
-      const nextPx = Math.max(total * 0.05, Math.min(total * 0.95, startRatioPx + startY - moveEvent.clientY))
-      setChatRatio(nextPx / total)
+      // Px-bounded, not fractional: dragging all the way down collapses the
+      // chat to exactly the composer pill (CHAT_PANE_MIN_PX) and no smaller;
+      // dragging all the way up leaves at least one pill of editor visible.
+      const desiredPx = startRatioPx + startY - moveEvent.clientY
+      setChatRatio(clampChatRatio(desiredPx, total, CHAT_PANE_MIN_PX))
     }
     // One teardown for every way the drag can end. pointerup is the normal
     // case, but an interrupted drag (incoming notification, system gesture
@@ -2540,10 +2596,25 @@ export default function App({ appId, token }) {
   }, [chatRatio])
 
   const handleResizeKey = useCallback((event) => {
-    if (event.key === 'ArrowUp') { event.preventDefault(); setChatRatio((r) => Math.min(0.95, r + 0.04)) }
-    else if (event.key === 'ArrowDown') { event.preventDefault(); setChatRatio((r) => Math.max(0.05, r - 0.04)) }
-    else if (event.key === 'Home') { event.preventDefault(); setChatRatio(0.05) }
-    else if (event.key === 'End') { event.preventDefault(); setChatRatio(0.95) }
+    const total = bodyRef.current?.getBoundingClientRect().height || 0
+    if (!total) return
+    // Same px floor as the drag path: Home collapses the chat to exactly the
+    // composer pill, End leaves one pill of editor; Arrows step by ~6% but can
+    // never cross either floor (clampChatRatio enforces both ends).
+    const step = total * 0.06
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setChatRatio((r) => clampChatRatio(r * total + step, total, CHAT_PANE_MIN_PX))
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setChatRatio((r) => clampChatRatio(r * total - step, total, CHAT_PANE_MIN_PX))
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setChatRatio(clampChatRatio(0, total, CHAT_PANE_MIN_PX))
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setChatRatio(clampChatRatio(total, total, CHAT_PANE_MIN_PX))
+    }
   }, [])
 
   // Persist the file-cache snapshot whenever the index, contents, or
@@ -3745,7 +3816,11 @@ export default function App({ appId, token }) {
       )
     }
     return (
-      <div ref={bodyRef} className="body body--chat-open" style={{ '--chat-ratio': chatRatio }}>
+      <div
+        ref={bodyRef}
+        className="body body--chat-open"
+        style={{ '--chat-ratio': chatRatio, '--chat-pane-min': `${CHAT_PANE_MIN_PX}px` }}
+      >
         {fileNav}
         <main className="content">{renderMain()}</main>
         <div
@@ -3823,9 +3898,10 @@ export default function App({ appId, token }) {
       <header className="top-bar">
         <div className="top-zone top-zone--left">
           {/* The app's own logo IS the file-drawer toggle (the shell pattern:
-              the brand logo, not a hamburger, opens the drawer). The icon comes
-              from the public /api/apps/<id>/icon route; if the app has no custom
-              icon (404), onError swaps in the ☰ glyph so the toggle still reads. */}
+              the brand logo, not a hamburger, opens the drawer). Drawn as an
+              inline SVG so it paints instantly with zero network — the old
+              <img src="/api/apps/<id>/icon"> fetched the full-res PNG at runtime
+              just for this 28px slot. */}
           <button
             ref={navToggleRef}
             className="nav-toggle"
@@ -3834,21 +3910,7 @@ export default function App({ appId, token }) {
             aria-expanded={navOpen}
             title="Toggle files"
           >
-            <img
-              className="nav-toggle-logo"
-              src={`/api/apps/${appId}/icon`}
-              width={28}
-              height={28}
-              alt=""
-              style={{ borderRadius: 6 }}
-              onError={(e) => {
-                // No custom icon for this app — fall back to the hamburger glyph.
-                e.currentTarget.style.display = 'none'
-                const fallback = e.currentTarget.nextElementSibling
-                if (fallback) fallback.style.display = 'inline'
-              }}
-            />
-            <span className="nav-toggle-fallback" aria-hidden style={{ display: 'none' }}>☰</span>
+            <LatexLogoIcon size={28} />
           </button>
           <div className="top-title">
             {openName
@@ -4004,7 +4066,6 @@ const CSS = `
    on either :focus or :focus-visible. */
 .nav-toggle:focus,
 .nav-toggle:focus-visible { outline: none; }
-.nav-toggle-logo { display: block; object-fit: cover; }
 .top-title {
   min-width: 0;
   display: flex;
@@ -4608,14 +4669,19 @@ const CSS = `
 /* mobius-ui:ChatEmbed v1 — keep in sync with app-webstudio (ws- prefixed) */
 /* ---- chat panel (bottom half of the 50/50 split) ----
    The embedded shell chat runs inside an iframe (window.mobius.chat). The
-   panel takes EXACTLY the height --chat-ratio allots it (no internal
-   min/max fighting the divider) and is a flex column; the embed fills it
-   (flex:1 + min-height:0) and the iframe fills the embed, so the chat's
-   composer is pinned to the bottom of the panel. */
+   panel takes the height --chat-ratio allots it, floored at --chat-pane-min
+   (= composer pill + divider, the 74px CHAT_PANE_MIN_PX constant) so the
+   embed's input pill is never clipped, and capped at the same floor from the
+   other end so the editor never fully eats the chat. The drag/keyboard ratio
+   math already honors these bounds; the CSS floor also covers the persisted /
+   default ratio on a short viewport before any drag. It's a flex column; the
+   embed fills it (flex:1 + min-height:0) and the iframe fills the embed, so
+   the chat's composer is pinned to the bottom of the panel. */
 .chat-panel {
   flex: 0 0 auto;
   height: calc(var(--chat-ratio, 0.5) * 100%);
-  min-height: 0;
+  min-height: min(var(--chat-pane-min, 74px), 100%);
+  max-height: calc(100% - var(--chat-pane-min, 74px));
   display: flex;
   flex-direction: column;
   background: var(--surface);
@@ -4912,9 +4978,15 @@ const CSS = `
   }
   /* Chat open: row 3 takes the --chat-ratio share of the body height (the
      panel's own %-height rule is neutralised below — the grid row IS the
-     height in this layout). */
+     height in this layout), clamped between --chat-pane-min (pill + divider)
+     and (100% - that) so the embed's input pill is never clipped at either end. */
   .body--chat-open {
-    grid-template-rows: minmax(0, 1fr) auto calc(var(--chat-ratio, 0.5) * 100%);
+    grid-template-rows: minmax(0, 1fr) auto
+      clamp(
+        var(--chat-pane-min, 74px),
+        calc(var(--chat-ratio, 0.5) * 100%),
+        calc(100% - var(--chat-pane-min, 74px))
+      );
   }
   /* The pinned rail: a static left column, not an overlay. Spans all rows. */
   .file-drawer--pinned {

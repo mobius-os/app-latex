@@ -8,3 +8,4 @@ node_modules/
 .vscode/
 tests/.build/
 tests/.build-zoom/
+tests/.build-chat-bounds/
