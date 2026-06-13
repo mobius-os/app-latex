@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.7.2'
+const APP_VERSION = '2.7.3'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -1112,33 +1112,6 @@ function BuildingIndicator({ size = 20 }) {
   )
 }
 /* /mobius-ui:BuildingIndicator */
-
-// The app's brand mark, drawn inline so the top-bar logo paints instantly with
-// zero network — the previous <img src="/api/apps/<id>/icon"> fetched the
-// full-res PNG at runtime just to fill a 28px slot. A document sheet (folded
-// corner) with the canonical lowered-E "LaTeX" descender stroke reads as
-// "a LaTeX document" at toolbar size. Currentcolor + the same stroke style as
-// the other toolbar glyphs so it inherits the theme. Filled sheet (var(--bg))
-// keeps the lettering legible against the surface.
-function LatexLogoIcon({ size = 28 }) {
-  return (
-    <svg viewBox="0 0 24 24" width={size} height={size}
-      role="img" aria-hidden focusable="false">
-      <path
-        d="M6 2.5h7L18.5 8v13a.5.5 0 0 1-.5.5H6a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5Z"
-        fill="var(--bg)" stroke="currentColor" strokeWidth="1.4"
-        strokeLinejoin="round" />
-      {/* Folded corner of the sheet. */}
-      <path d="M13 2.5V8h5.5" fill="none" stroke="currentColor"
-        strokeWidth="1.4" strokeLinejoin="round" strokeLinecap="round" />
-      {/* "LaTeX" wordmark cue: an upper E with a dropped middle bar — the
-          lowered-E that gives the logo its signature look — sized to the sheet. */}
-      <path d="M8.4 11.6h5M8.4 14.2h3.4M8.4 16.8h5"
-        fill="none" stroke="currentColor" strokeWidth="1.4"
-        strokeLinecap="round" />
-    </svg>
-  )
-}
 
 // Detect whether a path's leaf is a file (vs a folder we haven't
 // expanded yet). For the index-driven tree, anything in the flat
@@ -3897,11 +3870,12 @@ export default function App({ appId, token }) {
           bar. Identical structure in app-webstudio (ws- prefixed). */}
       <header className="top-bar">
         <div className="top-zone top-zone--left">
-          {/* The app's own logo IS the file-drawer toggle (the shell pattern:
-              the brand logo, not a hamburger, opens the drawer). Drawn as an
-              inline SVG so it paints instantly with zero network — the old
-              <img src="/api/apps/<id>/icon"> fetched the full-res PNG at runtime
-              just for this 28px slot. */}
+          {/* The app's own glossy icon IS the file-drawer toggle (the shell
+              pattern: the brand logo, not a hamburger, opens the drawer). The
+              real icon image — the backend serves a downscaled ~6KB copy at
+              ?size=64 (cached 1h), so it paints fast without the old full-res
+              PNG cost; the accent-dot fallback shows when an install has no
+              custom icon (the route 404s). */}
           <button
             ref={navToggleRef}
             className="nav-toggle"
@@ -3910,7 +3884,19 @@ export default function App({ appId, token }) {
             aria-expanded={navOpen}
             title="Toggle files"
           >
-            <LatexLogoIcon size={28} />
+            <img
+              src={`/api/apps/${appId}/icon?size=64`}
+              alt=""
+              width={26}
+              height={26}
+              className="latex-brand-icon"
+              onError={(e) => {
+                e.currentTarget.style.display = 'none'
+                const f = e.currentTarget.nextElementSibling
+                if (f) f.style.display = 'flex'
+              }}
+            />
+            <span className="latex-brand-fallback" style={{ display: 'none' }} aria-hidden="true" />
           </button>
           <div className="top-title">
             {openName
@@ -4066,6 +4052,25 @@ const CSS = `
    on either :focus or :focus-visible. */
 .nav-toggle:focus,
 .nav-toggle:focus-visible { outline: none; }
+/* The real app icon as the brand mark inside the drawer toggle. */
+.latex-brand-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
+  display: block;
+}
+/* Accent-dot fallback shown when the install has no custom icon (route 404s). */
+.latex-brand-fallback {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent, var(--text));
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
 .top-title {
   min-width: 0;
   display: flex;
