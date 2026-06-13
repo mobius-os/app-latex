@@ -2512,15 +2512,31 @@ export default function App({ appId, token }) {
     if (!total) return
     const startY = event.clientY
     const startRatioPx = total * chatRatio
-    event.currentTarget.setPointerCapture?.(event.pointerId)
+    const divider = event.currentTarget
+    const pointerId = event.pointerId
+    divider.setPointerCapture?.(pointerId)
     const onMove = (moveEvent) => {
       const nextPx = Math.max(total * 0.05, Math.min(total * 0.95, startRatioPx + startY - moveEvent.clientY))
       setChatRatio(nextPx / total)
     }
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', () => {
+    // One teardown for every way the drag can end. pointerup is the normal
+    // case, but an interrupted drag (incoming notification, system gesture
+    // cancel, focus steal) fires pointercancel / lostpointercapture INSTEAD —
+    // without handling those the move listener and the pointer capture leak,
+    // leaving the divider stuck "grabbing" the pointer. releasePointerCapture
+    // throws if the id is no longer captured (e.g. lostpointercapture already
+    // released it), so it's guarded.
+    const endDrag = () => {
       window.removeEventListener('pointermove', onMove)
-    }, { once: true })
+      window.removeEventListener('pointerup', endDrag)
+      window.removeEventListener('pointercancel', endDrag)
+      divider.removeEventListener('lostpointercapture', endDrag)
+      try { divider.releasePointerCapture?.(pointerId) } catch {}
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', endDrag)
+    window.addEventListener('pointercancel', endDrag)
+    divider.addEventListener('lostpointercapture', endDrag)
   }, [chatRatio])
 
   const handleResizeKey = useCallback((event) => {
