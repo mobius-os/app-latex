@@ -1,7 +1,7 @@
 {
   "id": "latex",
   "name": "LaTeX",
-  "version": "2.8.0",
+  "version": "2.9.0",
   "description": "Write and compile LaTeX with live PDF preview and an agent that drafts your .tex.",
   "author": "mobius-os",
   "license": "MIT",

@@ -574,7 +574,7 @@ function applyPageChrome(host, scale) {
   host.style.padding = `${Math.round(PDF_PAD_Y * scale)}px ${Math.round(PDF_PAD_X * scale)}px`
 }
 
-function PdfPreview({ storage, path, version }) {
+function PdfPreview({ storage, path, version, appId, token }) {
   const scrollRef = useRef(null)  // the scrollable .pdf-viewer wrapper
   const pagesRef = useRef(null)   // the .pdf-pages canvas host
   const docRef = useRef(null)     // the loaded pdfjs document (kept for re-render)
@@ -873,6 +873,19 @@ function PdfPreview({ storage, path, version }) {
   const zoomOut = useCallback(() => { commitScale(scaleRef.current / ZOOM_BTN_FACTOR) }, [commitScale])
   const zoomFit = useCallback(() => { commitScale(ZOOM_FIT) }, [commitScale])
 
+  // Download / open the PDF in a new tab. The download lives HERE — inside the
+  // preview pane, not the main app toolbar — so it travels with the PDF and
+  // never disturbs the toolbar icon layout. Same-origin storage URL with the
+  // ?token= query: a window.open()ed tab can't carry an Authorization header,
+  // and the storage route serves application/pdf inline, so the browser shows
+  // it and offers its own Save. Gated on having appId+token (the tree-opened
+  // .pdf path passes them too).
+  const canDownload = !!(appId && token && path)
+  const onDownload = useCallback(() => {
+    if (!canDownload) return
+    window.open(`/api/storage/apps/${appId}/${path}?token=${encodeURIComponent(token)}`)
+  }, [canDownload, appId, token, path])
+
   const zoomPct = Math.round(scale * 100)
   const atMin = scale <= ZOOM_MIN + 0.001
   const atMax = scale >= ZOOM_MAX - 0.001
@@ -892,40 +905,56 @@ function PdfPreview({ storage, path, version }) {
       </div>
     )
   }
-  // The toolbar floats OVER the scroller (absolute in .pdf-stage) instead of
-  // living inside the scroll content: scrolled content is then ONLY the
-  // pages host, whose geometry scales uniformly with the zoom — keeping the
-  // anchored-zoom scroll conversion exact.
+  // The control bar is a SIBLING below the scroller (a normal flex row in the
+  // .pdf-stage column), not an overlay floating over the pages — so it never
+  // covers the PDF (owner feedback #5). It also keeps the scroller’s content
+  // as ONLY the pages host, whose geometry scales uniformly with the zoom,
+  // which is what keeps the anchored-zoom scroll conversion exact. The
+  // download affordance lives in this bar too (owner feedback #4): inside the
+  // preview pane, out of the main app toolbar.
   return (
     <div className="pdf-stage">
-      <div className="pdf-zoom-toolbar" aria-label="Zoom controls">
-        <button
-          type="button"
-          className="pdf-zoom-btn"
-          aria-label="Zoom out"
-          title="Zoom out"
-          onClick={zoomOut}
-          disabled={atMin}
-        >−</button>
-        <button
-          type="button"
-          className="pdf-zoom-btn pdf-zoom-pct"
-          aria-label={`Zoom level: ${zoomPct}%`}
-          title="Reset to fit width"
-          onClick={zoomFit}
-        >{zoomPct}%</button>
-        <button
-          type="button"
-          className="pdf-zoom-btn"
-          aria-label="Zoom in"
-          title="Zoom in"
-          onClick={zoomIn}
-          disabled={atMax}
-        >+</button>
-      </div>
       {loading && <div className="preview-note">Rendering PDF…</div>}
       <div className="pdf-viewer" ref={scrollRef} onDoubleClick={onDoubleClick}>
         <div className="pdf-pages" ref={pagesRef} />
+      </div>
+      <div className="pdf-controlbar">
+        <div className="pdf-zoom-group" aria-label="Zoom controls">
+          <button
+            type="button"
+            className="pdf-ctl-btn"
+            aria-label="Zoom out"
+            title="Zoom out"
+            onClick={zoomOut}
+            disabled={atMin}
+          >−</button>
+          <button
+            type="button"
+            className="pdf-ctl-btn pdf-zoom-pct"
+            aria-label={`Zoom level: ${zoomPct}%`}
+            title="Reset to fit width"
+            onClick={zoomFit}
+          >{zoomPct}%</button>
+          <button
+            type="button"
+            className="pdf-ctl-btn"
+            aria-label="Zoom in"
+            title="Zoom in"
+            onClick={zoomIn}
+            disabled={atMax}
+          >+</button>
+        </div>
+        {canDownload && (
+          <button
+            type="button"
+            className="pdf-ctl-btn pdf-download-btn"
+            aria-label="Download PDF"
+            title="Download PDF"
+            onClick={onDownload}
+          >
+            <ToolIcon name="download" size={18} />
+          </button>
+        )}
       </div>
     </div>
   )
@@ -3670,7 +3699,7 @@ export default function App({ appId, token }) {
       )
     }
     if (pdfForMain) {
-      return <PdfPreview storage={storage} path={pdfForMain.pdf} version={pdfForMain.ver} />
+      return <PdfPreview storage={storage} path={pdfForMain.pdf} version={pdfForMain.ver} appId={appId} token={token} />
     }
     return (
       <div className="preview-note build-note">
@@ -3701,7 +3730,7 @@ export default function App({ appId, token }) {
       return <ImagePreview storage={storage} path={selectedPath} reloadKey={previewReloadKey} />
     }
     if (selectedExt === 'pdf') {
-      return <PdfPreview storage={storage} path={selectedPath} version={previewReloadKey} />
+      return <PdfPreview storage={storage} path={selectedPath} version={previewReloadKey} appId={appId} token={token} />
     }
     // Desktop (>=860px): a .tex with a build target shows the Overleaf-style
     // two-pane split — editable source on the left, the main doc's PDF on the
@@ -3962,19 +3991,6 @@ export default function App({ appId, token }) {
               {build.buildStatus === 'building'
                 ? <BuildingIndicator size={20} />
                 : <PlayIcon size={20} />}
-            </button>
-          )}
-          {hasMain && selectedIsTex && pdfForMain && (
-            <button
-              type="button"
-              className="toolbar-btn"
-              onClick={() => window.open(
-                `/api/storage/apps/${appId}/${pdfForMain.pdf}?token=${encodeURIComponent(token)}`
-              )}
-              aria-label="Download PDF"
-              title="Download PDF"
-            >
-              <ToolIcon name="download" size={20} />
             </button>
           )}
           <SyncPill online={online} hasRuntime={storage.hasRuntime} />
@@ -4335,31 +4351,32 @@ const CSS = `
      the gutter keeps clientWidth stable from the start. */
   scrollbar-gutter: stable;
 }
-/* Floating zoom pill — overlays the top of the viewer (it must NOT live in
-   the scroll content: unscaled chrome there would skew the zoom scroll
-   conversion). Backdrop-blurred so page content reads through it. */
-.pdf-zoom-toolbar {
-  position: absolute;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 5;
+/* Control bar — a SOLID row that sits BELOW the scroller as its own flex
+   line, so it never covers the PDF (owner feedback #5). It's outside the
+   scroll content too, so the pages host stays the only scrolled element and
+   the anchored-zoom scroll conversion stays exact. Zoom group on the left,
+   download pushed to the right. */
+.pdf-controlbar {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 2px 6px;
-  background: color-mix(in srgb, var(--surface) 80%, transparent);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid var(--border);
-  border-radius: 999px;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
   user-select: none;
   -webkit-user-select: none;
 }
-.pdf-zoom-btn {
-  min-height: 44px;
-  min-width: 44px;
-  padding: 6px 10px;
+.pdf-zoom-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.pdf-ctl-btn {
+  min-height: 40px;
+  min-width: 40px;
+  padding: 4px 10px;
   border-radius: 7px;
   border: none;
   background: none;
@@ -4374,10 +4391,10 @@ const CSS = `
   -webkit-tap-highlight-color: transparent;
   touch-action: manipulation;
 }
-.pdf-zoom-btn:disabled { opacity: 0.35; cursor: default; }
-.pdf-zoom-btn:active:not(:disabled) { background: var(--surface2, var(--surface)); }
+.pdf-ctl-btn:disabled { opacity: 0.35; cursor: default; }
+.pdf-ctl-btn:active:not(:disabled) { background: var(--surface2, var(--surface)); }
 @media (hover: hover) {
-  .pdf-zoom-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .pdf-ctl-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 }
 /* The % readout button is slightly wider to fit the text. */
 .pdf-zoom-pct {
