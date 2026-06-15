@@ -4560,19 +4560,33 @@ const CSS = `
 	  color: var(--muted);
 	  cursor: pointer;
 	  opacity: 0.5;
-	  transition: opacity 0.12s ease, color 0.12s ease;
+	  transition: opacity 0.12s, color 0.12s, background 0.12s, transform 0.08s;
 	}
 	.tree-row:hover .tree-menu-btn,
 	.tree-menu-btn:focus-visible { opacity: 1; }
-	.tree-menu-btn:hover { color: var(--text); }
-	.tree-menu-btn:active { color: var(--accent); }
-	/* Pressed/open state — while this row's action menu is open the kebab stays
-	   lit and accent-tinted (accent text + a subtle --accent-dim wash), the same
-	   treatment the shell drawer's kebab gets via data-state="open". It overrides
-	   the touch opacity reveal so the open menu visibly belongs to this row, and
-	   :active gives the same feedback on the press itself (touch has no hover). */
-	.tree-menu-btn[data-state="open"],
+	/* Hover is a NEUTRAL grey wash (same family as the press), not an accent
+	   tint — accent is reserved for the open state below. */
+	.tree-menu-btn:hover {
+	  background: var(--surface);
+	}
+	/* Pressed — NEUTRAL feedback. The press must not re-assert the open-state
+	   accent; it acknowledges the tap with a grey wash + scale (touch has no
+	   hover, and tap-highlight is suppressed), matching the shell kebab. */
 	.tree-menu-btn:active {
+	  background: var(--surface);
+	  transform: scale(0.92);
+	}
+	.tree-menu-btn:focus-visible {
+	  outline: 2px solid var(--accent);
+	  outline-offset: 2px;
+	}
+	/* Open trigger — accent is reserved for the open menu only. While this row's
+	   action menu is open the kebab stays lit and accent-tinted, the same
+	   treatment the shell drawer's kebab gets via data-state="open". It overrides
+	   the touch opacity reveal so the open menu visibly belongs to this row.
+	   Because background is now in the transition, the wash fades in lockstep
+	   with the color instead of snapping (the #6 flash fix). */
+	.tree-menu-btn[data-state="open"] {
 	  opacity: 1;
 	  color: var(--accent);
 	  background: var(--accent-dim, color-mix(in srgb, var(--accent) 12%, transparent));
