@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.7.3'
+const APP_VERSION = '2.10.1'
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -4146,7 +4146,7 @@ const CSS = `
 .toolbar-btn--primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #062016;
+  color: var(--accent-fg);
 }
 .toolbar-btn:disabled {
   opacity: 0.5;
@@ -4854,7 +4854,7 @@ const CSS = `
   border-radius: 5px;
   border: none;
   background: var(--accent);
-  color: #062016;
+  color: var(--accent-fg);
   font-size: 11px;
   font-weight: 700;
   cursor: pointer;
@@ -4953,12 +4953,12 @@ const CSS = `
 .modal-btn:active { filter: brightness(0.92); }
 .modal-btn--primary {
   background: var(--accent);
-  color: #062016;
+  color: var(--accent-fg);
   border-color: var(--accent);
 }
 .modal-btn--danger {
   background: var(--danger);
-  color: #fff;
+  color: var(--accent-fg);
   border-color: var(--danger);
 }
 .modal-btn--secondary { background: var(--surface); }
