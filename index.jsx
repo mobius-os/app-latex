@@ -883,7 +883,12 @@ function PdfPreview({ storage, path, version, appId, token }) {
   const canDownload = !!(appId && token && path)
   const onDownload = useCallback(() => {
     if (!canDownload) return
-    window.open(`/api/storage/apps/${appId}/${path}?token=${encodeURIComponent(token)}`)
+    // Segment-encode the path so a filename containing #, ?, spaces, etc.
+    // survives the URL: encode each segment but keep the '/' separators (the
+    // storage route is a {path:path} matcher). encodeURIComponent on the whole
+    // string would turn '/' into %2F and break the route.
+    const encPath = String(path).split('/').map(encodeURIComponent).join('/')
+    window.open(`/api/storage/apps/${appId}/${encPath}?token=${encodeURIComponent(token)}`)
   }, [canDownload, appId, token, path])
 
   const zoomPct = Math.round(scale * 100)
