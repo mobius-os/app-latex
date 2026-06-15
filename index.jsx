@@ -1031,6 +1031,7 @@ function ChevronIcon({ size = 14 }) {
 //   source  — a code/'</>' glyph (view the .tex source)
 //   preview — a document-page glyph (view the compiled PDF)
 //   target  — a target/bullseye glyph (the "set as main document" affordance)
+//   download — a tray-with-down-arrow glyph (open/save the built PDF)
 const ICON_PATHS = {
   source: <><polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" /></>,
   preview: (
@@ -1043,6 +1044,13 @@ const ICON_PATHS = {
     <>
       <circle cx="12" cy="12" r="9" />
       <circle cx="12" cy="12" r="4" />
+    </>
+  ),
+  download: (
+    <>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
     </>
   ),
 }
@@ -3954,6 +3962,19 @@ export default function App({ appId, token }) {
               {build.buildStatus === 'building'
                 ? <BuildingIndicator size={20} />
                 : <PlayIcon size={20} />}
+            </button>
+          )}
+          {hasMain && selectedIsTex && pdfForMain && (
+            <button
+              type="button"
+              className="toolbar-btn"
+              onClick={() => window.open(
+                `/api/storage/apps/${appId}/${pdfForMain.pdf}?token=${encodeURIComponent(token)}`
+              )}
+              aria-label="Download PDF"
+              title="Download PDF"
+            >
+              <ToolIcon name="download" size={20} />
             </button>
           )}
           <SyncPill online={online} hasRuntime={storage.hasRuntime} />
