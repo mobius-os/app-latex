@@ -1,5 +1,5 @@
 import React, {
-  useState, useEffect, useCallback, useMemo, useRef,
+  useState, useEffect, useCallback, useMemo, useRef, useId,
 } from 'react'
 import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
@@ -2024,22 +2024,70 @@ function useModal() {
 function ModalView({ state }) {
   const [value, setValue] = useState(state.kind === 'prompt' ? (state.defaultValue || '') : '')
   const inputRef = useRef(null)
+  // The dialog box itself. role/aria-modal/aria-labelledby live here so AT
+  // announces it as a modal dialog, and it scopes the Tab focus-trap below.
+  const dialogRef = useRef(null)
+  // The element focused before the modal opened, captured once at mount so
+  // closing the modal returns focus exactly where it was (keyboard/AT users
+  // don't get dumped at the top of the document).
+  const openerRef = useRef(null)
+  const titleId = useId()
+
+  // Cancel resolves the modal the same way clicking Cancel / the scrim does:
+  // alert has no "no" answer, confirm answers false, prompt answers null.
+  const cancel = useCallback(() => {
+    if (state.kind === 'alert') state.resolve()
+    else state.resolve(state.kind === 'prompt' ? null : false)
+  }, [state])
+
   useEffect(() => {
+    openerRef.current = document.activeElement
     if (state.kind === 'prompt' && inputRef.current) {
       // Autofocus + select-all so the user can replace any prefilled
       // value with a single keypress.
       inputRef.current.focus()
       inputRef.current.select()
+    } else {
+      // No input to land on: focus the dialog box so the first Tab stays
+      // trapped inside and AT reads the dialog from its labelled title.
+      dialogRef.current?.focus()
     }
     const onKey = (e) => {
       if (e.key === 'Escape') {
-        if (state.kind === 'alert') state.resolve()
-        else state.resolve(state.kind === 'prompt' ? null : false)
+        cancel()
+        return
+      }
+      if (e.key !== 'Tab') return
+      // Trap Tab within the dialog. The focusable set is recomputed per
+      // keydown rather than cached because the prompt input and the action
+      // buttons that make it up vary by modal kind.
+      const focusable = dialogRef.current?.querySelectorAll(
+        'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      )
+      if (!focusable || focusable.length === 0) {
+        e.preventDefault()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      const active = document.activeElement
+      if (e.shiftKey && active === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault()
+        first.focus()
       }
     }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [state])
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      const opener = openerRef.current
+      if (opener && typeof opener.focus === 'function' && document.contains(opener)) {
+        opener.focus()
+      }
+    }
+  }, [state, cancel])
   function onSubmit(e) {
     e.preventDefault()
     if (state.kind === 'prompt') state.resolve(value)
@@ -2049,12 +2097,19 @@ function ModalView({ state }) {
   return (
     <div className="modal-scrim" onClick={() => {
       // Click outside cancels (except for alert, which only has OK).
-      if (state.kind === 'alert') state.resolve()
-      else state.resolve(state.kind === 'prompt' ? null : false)
+      cancel()
     }}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="modal"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         <form onSubmit={onSubmit}>
-          <div className="modal-title">{state.title}</div>
+          <div className="modal-title" id={titleId}>{state.title}</div>
           <div className="modal-body">{state.body}</div>
           {state.kind === 'prompt' && (
             <input
@@ -2071,7 +2126,7 @@ function ModalView({ state }) {
               <button
                 type="button"
                 className="modal-btn modal-btn--secondary"
-                onClick={() => state.resolve(state.kind === 'prompt' ? null : false)}
+                onClick={cancel}
               >
                 Cancel
               </button>
@@ -4319,6 +4374,8 @@ const CSS = `
 .build-log {
   max-height: 60vh;
   overflow: auto;
+  /* Keep flick-scroll inside the log; do not chain to the page behind it. */
+  overscroll-behavior: contain;
   margin: 0;
   padding: 12px;
   border: 1px solid var(--border);
@@ -4520,6 +4577,8 @@ const CSS = `
 .drawer-tree {
   flex: 1 1 auto;
   overflow-y: auto;
+  /* Keep flick-scroll inside the drawer; do not chain to the page behind it. */
+  overscroll-behavior: contain;
   /* Side gutter so the rounded rows float as pills inset from the panel
      edge, matching the Möbius shell drawer (.drawer__body's 8px side
      padding) rather than sitting full-bleed against the border. */
