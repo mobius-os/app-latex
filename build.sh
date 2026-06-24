@@ -1,11 +1,43 @@
 #!/bin/bash
 # On-demand LaTeX build, invoked by POST /api/apps/{id}/run-job (app_id is $1).
-# Reads the selected file from build/target.txt, compiles it with tectonic,
-# and writes the verdict to build/status.json. A stray scheduled run with no
-# target is a harmless no-op (writes an error status the app ignores).
+# Reads the selected file from the active project's build/target.txt, compiles
+# it with tectonic, and writes the verdict to that same project's
+# build/status.json. A stray scheduled run with no target is a harmless no-op
+# (writes an error status the app ignores).
 set -uo pipefail
 APP_ID="${1:-}"
-STORAGE_DIR="/data/apps/${APP_ID}"
+BASE_STORAGE_DIR="/data/apps/${APP_ID}"
+PROJECT_ID="${APP_PROJECT_ID:-${MOBIUS_PROJECT_ID:-${2:-}}}"
+project_storage_dir() {
+  if [ -z "$1" ] || [ "$1" = "default" ]; then
+    printf '%s\n' "$BASE_STORAGE_DIR"
+  elif [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    printf '%s/projects/%s\n' "$BASE_STORAGE_DIR" "$1"
+  else
+    return 1
+  fi
+}
+if ! STORAGE_DIR="$(project_storage_dir "$PROJECT_ID")"; then
+  STORAGE_DIR="$BASE_STORAGE_DIR"
+fi
+
+# Current platform run-job invokes build.sh with only APP_ID. When no project
+# id is passed, pick the newest target file across the default root and project
+# subtrees; the UI writes its target immediately before POSTing run-job, so this
+# selects the project that requested the build while preserving legacy default
+# behavior.
+if [ -z "$PROJECT_ID" ]; then
+  newest=""
+  for candidate in "$BASE_STORAGE_DIR/build/target.txt" "$BASE_STORAGE_DIR"/projects/*/build/target.txt; do
+    [ -f "$candidate" ] || continue
+    if [ -z "$newest" ] || [ "$candidate" -nt "$newest" ]; then
+      newest="$candidate"
+    fi
+  done
+  if [ -n "$newest" ]; then
+    STORAGE_DIR="$(dirname "$(dirname "$newest")")"
+  fi
+fi
 mkdir -p "$STORAGE_DIR/build" "$STORAGE_DIR/tectonic-cache"
 TARGET="$(cat "$STORAGE_DIR/build/target.txt" 2>/dev/null || echo "")"
 write_status() {  # $1=status $2=pdf(or empty) $3=log

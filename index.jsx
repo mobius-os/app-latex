@@ -5,7 +5,14 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.10.1'
+const APP_VERSION = '2.11.0'
+const DEFAULT_PROJECT_ID = 'default'
+const PROJECTS_KEY = 'projects.json'
+const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+
+export function projectPrefix(activeProjectId) {
+  return activeProjectId === DEFAULT_PROJECT_ID ? '' : `projects/${activeProjectId}/`
+}
 
 // No HTML-injection surfaces remain: the live KaTeX/Tex preview and the
 // markdown preview (the only `dangerouslySetInnerHTML` users) were removed
@@ -389,6 +396,24 @@ function makeStorage(appId, token) {
     if (!r.ok && r.status !== 404) throw new Error(`remove ${path} → ${r.status}`)
     return { synced: true }
   }
+  async function list(prefix = '') {
+    if (ms && typeof ms.list === 'function') return ms.list(prefix)
+    const norm = String(prefix || '').replace(/^\/+|\/+$/g, '')
+    const entries = []
+    let cursor = null
+    for (let guard = 0; guard < 10000; guard++) {
+      const q = `?limit=500${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`
+      const r = await fetch(`/api/storage/apps-list/${appId}/${norm}${q}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!r.ok) throw new Error(`list ${norm} → ${r.status}`)
+      const body = await r.json()
+      entries.push(...(Array.isArray(body.entries) ? body.entries : []))
+      cursor = body.next_cursor
+      if (!cursor) break
+    }
+    return entries
+  }
   async function pendingCount() {
     if (ms && typeof ms.pendingCount === 'function') {
       try { return await ms.pendingCount() } catch { return 0 }
@@ -402,9 +427,30 @@ function makeStorage(appId, token) {
   return {
     get, getFresh, getBlob, getBlobFresh,
     setText, setBlob, setJSON, remove,
+    list,
     subscribeText,
     pendingCount,
     hasRuntime,
+  }
+}
+
+function makeProjectStorage(storage, activeProjectId) {
+  const prefix = projectPrefix(activeProjectId)
+  const key = (path) => `${prefix}${path}`
+  return {
+    ...storage,
+    prefix,
+    key,
+    get: (path) => storage.get(key(path)),
+    getFresh: (path) => storage.getFresh(key(path)),
+    getBlob: (path) => storage.getBlob(key(path)),
+    getBlobFresh: (path) => storage.getBlobFresh(key(path)),
+    setText: (path, text) => storage.setText(key(path), text),
+    setBlob: (path, blob, options) => storage.setBlob(key(path), blob, options),
+    setJSON: (path, obj) => storage.setJSON(key(path), obj),
+    remove: (path) => storage.remove(key(path)),
+    list: (path = '') => storage.list(key(path)),
+    subscribeText: (path, cb) => storage.subscribeText(key(path), cb),
   }
 }
 
@@ -574,7 +620,7 @@ function applyPageChrome(host, scale) {
   host.style.padding = `${Math.round(PDF_PAD_Y * scale)}px ${Math.round(PDF_PAD_X * scale)}px`
 }
 
-function PdfPreview({ storage, path, version, appId, token }) {
+function PdfPreview({ storage, path, version, appId, token, storagePrefix = '' }) {
   const scrollRef = useRef(null)  // the scrollable .pdf-viewer wrapper
   const pagesRef = useRef(null)   // the .pdf-pages canvas host
   const docRef = useRef(null)     // the loaded pdfjs document (kept for re-render)
@@ -887,9 +933,12 @@ function PdfPreview({ storage, path, version, appId, token }) {
     // survives the URL: encode each segment but keep the '/' separators (the
     // storage route is a {path:path} matcher). encodeURIComponent on the whole
     // string would turn '/' into %2F and break the route.
-    const encPath = String(path).split('/').map(encodeURIComponent).join('/')
+    const encPath = `${storagePrefix}${String(path)}`
+      .split('/')
+      .map(encodeURIComponent)
+      .join('/')
     window.open(`/api/storage/apps/${appId}/${encPath}?token=${encodeURIComponent(token)}`)
-  }, [canDownload, appId, token, path])
+  }, [canDownload, appId, token, path, storagePrefix])
 
   const zoomPct = Math.round(scale * 100)
   const atMin = scale <= ZOOM_MIN + 0.001
@@ -1487,6 +1536,85 @@ function FileNode({
   )
 }
 
+function ProjectSelector({
+  projects, activeProjectId,
+  onSwitchProject, onNewProject, onRenameProject, onDeleteProject,
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  const active = projects.find((p) => p.id === activeProjectId) || projects[0]
+    || { id: DEFAULT_PROJECT_ID, name: 'Project 1' }
+  const canDelete = active.id !== DEFAULT_PROJECT_ID && projects.length > 1
+
+  useEffect(() => {
+    if (!open) return undefined
+    const onDown = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false) }
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  return (
+    <div className="project-picker" ref={ref}>
+      <button
+        type="button"
+        className="project-trigger"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title="Switch project"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="project-trigger-name">{active.name}</span>
+        <ChevronIcon size={13} />
+      </button>
+      {open && (
+        <div className="project-menu" role="menu">
+          <div className="project-list" role="group" aria-label="Projects">
+            {projects.map((project) => (
+              <button
+                key={project.id}
+                type="button"
+                role="menuitemradio"
+                aria-checked={project.id === activeProjectId}
+                className={`project-item ${project.id === activeProjectId ? 'project-item--active' : ''}`}
+                onClick={() => {
+                  setOpen(false)
+                  if (project.id !== activeProjectId) onSwitchProject(project.id)
+                }}
+              >
+                <span className="project-item-name">{project.name}</span>
+              </button>
+            ))}
+          </div>
+          <div className="project-actions" role="group" aria-label="Project actions">
+            <button type="button" role="menuitem" className="project-action" onClick={() => { setOpen(false); onNewProject() }}>
+              New Project
+            </button>
+            <button type="button" role="menuitem" className="project-action" onClick={() => { setOpen(false); onRenameProject(active.id) }}>
+              Rename
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="project-action project-action--danger"
+              disabled={!canDelete}
+              onClick={() => { setOpen(false); onDeleteProject(active.id) }}
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // Left slide-in file drawer (VSCode explorer shape): a panel that
 // transforms in from the left edge over a dimming backdrop, opened by
 // the app-logo toggle in the top bar. It is ALWAYS mounted (the `--open` class
@@ -1502,6 +1630,7 @@ function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
   onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
+  projects, activeProjectId, onSwitchProject, onNewProject, onRenameProject, onDeleteProject,
   pinned = false,
 }) {
   // On desktop (>=860px) the panel is a persistent left rail, never an overlay:
@@ -1716,6 +1845,14 @@ function FileNavPanel({
           <div className="drawer-head-text">
             <span className="drawer-title">Files</span>
           </div>
+          <ProjectSelector
+            projects={projects}
+            activeProjectId={activeProjectId}
+            onSwitchProject={onSwitchProject}
+            onNewProject={onNewProject}
+            onRenameProject={onRenameProject}
+            onDeleteProject={onDeleteProject}
+          />
         </div>
         <div className="drawer-actions">
           <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>New file</button>
@@ -1847,6 +1984,7 @@ function ChatPanel({
   onFilesMaybeChanged,
   quickActions,
   getContext,
+  activeProjectId,
 }) {
   const mountRef = useRef(null)
   const [error, setError] = useState(null)
@@ -1880,7 +2018,8 @@ function ChatPanel({
 
     window.mobius.chat({
       mount,
-      persist: 'chat_id.json',
+      projectId: activeProjectId === DEFAULT_PROJECT_ID ? undefined : activeProjectId,
+      persist: `${projectPrefix(activeProjectId)}chat_id.json`,
       title: 'LaTeX',
       systemPrompt,
       picker: true,
@@ -1905,7 +2044,7 @@ function ChatPanel({
       disposed = true
       if (handle) handle.destroy()
     }
-  }, [storage, systemPrompt])
+  }, [activeProjectId, storage, systemPrompt])
 
   return (
     <section className="chat-panel" aria-label="Agent chat">
@@ -2168,6 +2307,73 @@ function fileCacheKey(appId) {
   return `latex:${appId}:files-cache:v${FILE_CACHE_VERSION}`
 }
 
+function projectFileCacheKey(appId, projectId) {
+  if (projectId === DEFAULT_PROJECT_ID) return fileCacheKey(appId)
+  return `latex:${appId}:project:${projectId}:files-cache:v${FILE_CACHE_VERSION}`
+}
+
+function activeProjectKey(appId) {
+  return `latex:${appId}:activeProject`
+}
+
+function readActiveProject(appId) {
+  if (typeof localStorage === 'undefined') return DEFAULT_PROJECT_ID
+  const stored = localStorage.getItem(activeProjectKey(appId))
+  return PROJECT_ID_RE.test(stored || '') ? stored : DEFAULT_PROJECT_ID
+}
+
+function writeActiveProject(appId, projectId) {
+  if (typeof localStorage === 'undefined') return
+  try { localStorage.setItem(activeProjectKey(appId), projectId || DEFAULT_PROJECT_ID) } catch {}
+}
+
+function normalizeProjects(value) {
+  if (!Array.isArray(value)) return []
+  const seen = new Set()
+  const out = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const id = typeof item.id === 'string' ? item.id : ''
+    if (!PROJECT_ID_RE.test(id) || seen.has(id)) continue
+    seen.add(id)
+    const name = typeof item.name === 'string' && item.name.trim()
+      ? item.name.trim()
+      : (id === DEFAULT_PROJECT_ID ? 'Project 1' : id)
+    const createdAt = Number.isFinite(Number(item.createdAt)) ? Number(item.createdAt) : Date.now()
+    out.push({ id, name, createdAt })
+  }
+  return out
+}
+
+function slugifyProjectId(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+}
+
+function uniqueProjectId(name, projects) {
+  const used = new Set((projects || []).map((p) => p.id))
+  let base = slugifyProjectId(name)
+  if (!base || !PROJECT_ID_RE.test(base) || used.has(base)) {
+    base = base || 'project'
+    for (let i = 0; i < 20; i++) {
+      const suffix = Math.random().toString(36).slice(2, 8)
+      const id = `${base}-${suffix}`.slice(0, 64)
+      if (PROJECT_ID_RE.test(id) && !used.has(id)) return id
+    }
+  }
+  let id = base
+  let n = 2
+  while (used.has(id) || !PROJECT_ID_RE.test(id)) {
+    const suffix = `-${n++}`
+    id = `${base.slice(0, 64 - suffix.length)}${suffix}`
+  }
+  return id
+}
+
 // Chat toggle model.
 // chatOpen: boolean (panel visible); chatRatio: 0..1 (fraction of body height).
 const CHAT_OPEN_VERSION = 1
@@ -2214,10 +2420,10 @@ function readChatRatio(appId) {
   return Math.max(0.05, Math.min(0.95, raw))
 }
 
-function readFileCache(appId) {
+function readFileCache(appId, projectId = DEFAULT_PROJECT_ID) {
   if (typeof localStorage === 'undefined') return null
   try {
-    const raw = localStorage.getItem(fileCacheKey(appId))
+    const raw = localStorage.getItem(projectFileCacheKey(appId, projectId))
     if (!raw) return null
     const parsed = JSON.parse(raw)
     return normalizeFileCacheSnapshot(parsed)
@@ -2226,7 +2432,7 @@ function readFileCache(appId) {
   }
 }
 
-function writeFileCache(appId, index, contents, lastPath) {
+function writeFileCache(appId, projectId, index, contents, lastPath) {
   if (typeof localStorage === 'undefined') return
   try {
     const safeIndex = cleanIndexPaths(index)
@@ -2240,7 +2446,7 @@ function writeFileCache(appId, index, contents, lastPath) {
       .slice(-FILE_CONTENT_CACHE_LIMIT)
     for (const [p, v] of entries) trimmed[p] = v
     localStorage.setItem(
-      fileCacheKey(appId),
+      projectFileCacheKey(appId, projectId),
       JSON.stringify({
         index: safeIndex,
         contents: trimmed,
@@ -2313,7 +2519,7 @@ const SOURCE_AUTOSAVE_MS = 700
 const SOURCE_SYNC_MS = 3500
 const PROJECT_SYNC_MS = 5000
 
-function useBuild({ appId, token, storage, online }) {
+function useBuild({ appId, token, storage, online, activeProjectId }) {
   const [buildStatus, setBuildStatus] = useState('idle') // idle|building|done|error
   const [buildLog, setBuildLog] = useState('')
   // Which .tex the current/last build is FOR. The hook tracks one build at a
@@ -2346,6 +2552,17 @@ function useBuild({ appId, token, storage, online }) {
 
   // Clear the timer on unmount so a poll can't fire into a dead component.
   useEffect(() => clearPoll, [clearPoll])
+
+  useEffect(() => {
+    clearPoll()
+    buildingRef.current = false
+    deadlineRef.current = 0
+    buildSeqRef.current = 0
+    setBuildStatus('idle')
+    setBuildLog('')
+    setBuildDoc(null)
+    setPdfByDoc({})
+  }, [clearPoll, storage])
 
   const finishDone = useCallback((doc, pdf) => {
     clearPoll()
@@ -2444,7 +2661,10 @@ function useBuild({ appId, token, storage, online }) {
       // 1. Tell the build script which file to compile.
       await storage.setText('build/target.txt', doc)
       // 2. Kick the server-side job. 202 = accepted; anything else is fatal.
-      const r = await fetch(`/api/apps/${appId}/run-job`, {
+      const runJobUrl = activeProjectId === DEFAULT_PROJECT_ID
+        ? `/api/apps/${appId}/run-job`
+        : `/api/apps/${appId}/run-job?projectId=${encodeURIComponent(activeProjectId)}`
+      const r = await fetch(runJobUrl, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       })
@@ -2462,7 +2682,7 @@ function useBuild({ appId, token, storage, online }) {
     } catch (e) {
       finishError((e && e.message) ? e.message : 'Build failed to start.')
     }
-  }, [appId, token, storage, online, clearPoll, finishError, poll])
+  }, [activeProjectId, appId, token, storage, online, clearPoll, finishError, poll])
 
   const rememberPdf = useCallback((doc, pdf) => {
     if (buildingRef.current) return
@@ -2517,7 +2737,12 @@ function useBuild({ appId, token, storage, online }) {
 // Top-level app.
 // ----------------------------------------------------------------------
 export default function App({ appId, token }) {
-  const storage = useMemo(() => makeStorage(appId, token), [appId, token])
+  const rawStorage = useMemo(() => makeStorage(appId, token), [appId, token])
+  const [projects, setProjects] = useState([])
+  const [projectsReady, setProjectsReady] = useState(false)
+  const [activeProjectId, setActiveProjectId] = useState(() => readActiveProject(appId))
+  const storage = useMemo(() => makeProjectStorage(rawStorage, activeProjectId), [rawStorage, activeProjectId])
+  const storagePrefix = storage.prefix
   const online = useOnline()
   const modal = useModal()
   const bodyRef = useRef(null)
@@ -2526,7 +2751,7 @@ export default function App({ appId, token }) {
   // to paint before any storage.get() resolves (or returns null
   // offline). The server still gets fetched on mount and overwrites
   // this with the canonical state when online.
-  const cached = useMemo(() => readFileCache(appId), [appId])
+  const cached = useMemo(() => readFileCache(appId, activeProjectId), [appId, activeProjectId])
   const [files, setFiles] = useState(() => cached?.index || [])
   // Mirror of `files` for reads inside long-lived async callbacks (the build
   // poll can resolve up to 120s after it captured its closure). Kept in sync
@@ -2597,8 +2822,9 @@ export default function App({ appId, token }) {
   const [mainPath, setMainPath] = useState(null)
   const mainPathRef = useRef(null)
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
-  const build = useBuild({ appId, token, storage, online })
+  const build = useBuild({ appId, token, storage, online, activeProjectId })
   const seenBuildStatusRef = useRef('')
+  const signalReadySentRef = useRef(false)
   // Bumped on signals that the open file's bytes may have changed underneath us
   // (a chat turn finished — the agent likely rewrote files — or the window
   // regained focus after another device edited them). Binary previews
@@ -2617,6 +2843,31 @@ export default function App({ appId, token }) {
     if (typeof localStorage === 'undefined') return
     try { localStorage.setItem(chatRatioKey(appId), String(chatRatio)) } catch {}
   }, [appId, chatRatio])
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      let next = []
+      try {
+        next = normalizeProjects(await rawStorage.getFresh(PROJECTS_KEY))
+      } catch {
+        try { next = normalizeProjects(await rawStorage.get(PROJECTS_KEY)) } catch { next = [] }
+      }
+      if (next.length === 0) {
+        next = [{ id: DEFAULT_PROJECT_ID, name: 'Project 1', createdAt: Date.now() }]
+        rawStorage.setJSON(PROJECTS_KEY, next).catch(() => {})
+      }
+      if (cancelled) return
+      setProjects(next)
+      setProjectsReady(true)
+      setActiveProjectId((current) => {
+        const valid = next.some((project) => project.id === current) ? current : DEFAULT_PROJECT_ID
+        writeActiveProject(appId, valid)
+        return valid
+      })
+    })()
+    return () => { cancelled = true }
+  }, [appId, rawStorage])
 
   const toggleChat = useCallback(() => {
     setChatOpen((open) => {
@@ -2693,8 +2944,8 @@ export default function App({ appId, token }) {
   // on the file the user was last editing instead of bouncing to the
   // first tree entry.
   useEffect(() => {
-    writeFileCache(appId, files, fileCache, selectedPath)
-  }, [appId, files, fileCache, selectedPath])
+    writeFileCache(appId, activeProjectId, files, fileCache, selectedPath)
+  }, [appId, activeProjectId, files, fileCache, selectedPath])
 
   // Keep the ref in lock-step with `files` so async callbacks read the latest.
   useEffect(() => { filesRef.current = files }, [files])
@@ -2821,9 +3072,10 @@ export default function App({ appId, token }) {
   }, [storage, selectedPath, online])
 
   useEffect(() => {
+    if (!projectsReady) return
     refreshFiles()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [projectsReady, activeProjectId])
 
   // Auto-select the first file once we have one, so the preview pane
   // isn't blank on first open. Skip `.keep` placeholders — those are
@@ -2859,6 +3111,33 @@ export default function App({ appId, token }) {
   // the state unblocks the maintenance pass.
   const mainResolvedRef = useRef(false)
   const [mainReady, setMainReady] = useState(false)
+
+  useEffect(() => {
+    const snapshot = readFileCache(appId, activeProjectId)
+    const nextFiles = snapshot?.index || []
+    filesRef.current = nextFiles
+    selectedPathRef.current = snapshot?.lastPath || null
+    fileContentRef.current = ''
+    fileDirtyRef.current = false
+    fileSavingRef.current = false
+    mainPathRef.current = null
+    mainResolvedRef.current = false
+    seenBuildStatusRef.current = ''
+    signalReadySentRef.current = false
+    setFiles(nextFiles)
+    setFileCache(snapshot?.contents || {})
+    setIndexLoaded(false)
+    setSelectedPath(snapshot?.lastPath || null)
+    setFileContent('')
+    setFileLoading(false)
+    setFileError(null)
+    setFileDirty(false)
+    setFileSaving(false)
+    setMainPath(null)
+    setMainReady(false)
+    setPreviewReloadKey((n) => n + 1)
+  }, [appId, activeProjectId])
+
   useEffect(() => {
     if (!indexLoaded || mainResolvedRef.current) return
     mainResolvedRef.current = true
@@ -3410,7 +3689,7 @@ export default function App({ appId, token }) {
       const r = await fetch(`/api/storage/apps/${appId}/move`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from, to }),
+        body: JSON.stringify({ from: storage.key(from), to: storage.key(to) }),
       })
       if (!r.ok) {
         let detail = ''
@@ -3499,7 +3778,7 @@ export default function App({ appId, token }) {
     // folderPath is "files/<sub...>"; the recursive route wants the path
     // relative to the app root, which is exactly that string.
     try {
-      const r = await fetch(`/api/storage/apps/${appId}/folder/${folderPath}`, {
+      const r = await fetch(`/api/storage/apps/${appId}/folder/${storage.key(folderPath)}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       })
@@ -3595,7 +3874,6 @@ export default function App({ appId, token }) {
 
   // ── Signals ──────────────────────────────────────────────────────────────
   // Fire app_ready once the file index has loaded. item_count = file count.
-  const signalReadySentRef = useRef(false)
   useEffect(() => {
     if (!indexLoaded || signalReadySentRef.current) return
     signalReadySentRef.current = true
@@ -3712,6 +3990,93 @@ export default function App({ appId, token }) {
     }
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
 
+  const switchProject = useCallback((projectId) => {
+    const next = projects.some((project) => project.id === projectId) ? projectId : DEFAULT_PROJECT_ID
+    writeActiveProject(appId, next)
+    closeNav()
+    setActiveProjectId(next)
+  }, [appId, closeNav, projects])
+
+  const saveProjects = useCallback(async (next) => {
+    setProjects(next)
+    await rawStorage.setJSON(PROJECTS_KEY, next)
+  }, [rawStorage])
+
+  const deleteProjectTree = useCallback(async (projectId) => {
+    const prefix = projectPrefix(projectId)
+    if (!prefix) return
+    const removeUnder = async (dir) => {
+      const entries = await rawStorage.list(dir)
+      for (const entry of entries) {
+        if (!entry || typeof entry.path !== 'string') continue
+        if (entry.type === 'directory') await removeUnder(`${entry.path}/`)
+        else await rawStorage.remove(entry.path)
+      }
+    }
+    await removeUnder(prefix)
+  }, [rawStorage])
+
+  const handleNewProject = useCallback(async () => {
+    const name = await modal.prompt(
+      'Project name',
+      { title: 'New project', placeholder: `Project ${projects.length + 1}` },
+    )
+    if (!name || !name.trim()) return
+    const id = uniqueProjectId(name, projects)
+    const nextProject = { id, name: name.trim(), createdAt: Date.now() }
+    const next = [...projects, nextProject]
+    try {
+      await saveProjects(next)
+      writeActiveProject(appId, id)
+      setActiveProjectId(id)
+      closeNav()
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Could not create project' })
+    }
+  }, [appId, closeNav, modal, projects, saveProjects])
+
+  const handleRenameProject = useCallback(async (projectId) => {
+    const project = projects.find((p) => p.id === projectId)
+    if (!project) return
+    const name = await modal.prompt(
+      'Project name',
+      { title: 'Rename project', placeholder: project.name, defaultValue: project.name },
+    )
+    if (!name || !name.trim() || name.trim() === project.name) return
+    const next = projects.map((p) => (p.id === projectId ? { ...p, name: name.trim() } : p))
+    try {
+      await saveProjects(next)
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Could not rename project' })
+    }
+  }, [modal, projects, saveProjects])
+
+  const handleDeleteProject = useCallback(async (projectId) => {
+    const project = projects.find((p) => p.id === projectId)
+    if (!project) return
+    if (project.id === DEFAULT_PROJECT_ID || projects.length <= 1) {
+      await modal.alert('The default project and the last remaining project cannot be deleted.', { title: 'Cannot delete project' })
+      return
+    }
+    const ok = await modal.confirm(
+      `Delete “${project.name}” and all of its files and chat? This cannot be undone.`,
+      { title: 'Delete project', danger: true },
+    )
+    if (!ok) return
+    const next = projects.filter((p) => p.id !== project.id)
+    const fallback = next.some((p) => p.id === DEFAULT_PROJECT_ID) ? DEFAULT_PROJECT_ID : next[0].id
+    try {
+      await deleteProjectTree(project.id)
+      await saveProjects(next)
+      if (activeProjectId === project.id) {
+        writeActiveProject(appId, fallback)
+        setActiveProjectId(fallback)
+      }
+    } catch (e) {
+      await modal.alert(e.message || String(e), { title: 'Could not delete project' })
+    }
+  }, [activeProjectId, appId, deleteProjectTree, modal, projects, saveProjects])
+
   const handleBuild = useCallback(() => {
     // Build always compiles the MAIN document, regardless of which file is
     // open (Overleaf-style). useBuild writes build/target.txt = mainPath so
@@ -3759,7 +4124,7 @@ export default function App({ appId, token }) {
       )
     }
     if (pdfForMain) {
-      return <PdfPreview storage={storage} path={pdfForMain.pdf} version={pdfForMain.ver} appId={appId} token={token} />
+      return <PdfPreview storage={storage} path={pdfForMain.pdf} version={pdfForMain.ver} appId={appId} token={token} storagePrefix={storagePrefix} />
     }
     return (
       <div className="preview-note build-note">
@@ -3790,7 +4155,7 @@ export default function App({ appId, token }) {
       return <ImagePreview storage={storage} path={selectedPath} reloadKey={previewReloadKey} />
     }
     if (selectedExt === 'pdf') {
-      return <PdfPreview storage={storage} path={selectedPath} version={previewReloadKey} appId={appId} token={token} />
+      return <PdfPreview storage={storage} path={selectedPath} version={previewReloadKey} appId={appId} token={token} storagePrefix={storagePrefix} />
     }
     // Desktop (>=860px): a .tex with a build target shows the Overleaf-style
     // two-pane split — editable source on the left, the main doc's PDF on the
@@ -3874,6 +4239,12 @@ export default function App({ appId, token }) {
         mainPath={mainPath}
         onSetMain={handleSetMain}
         returnFocusRef={navToggleRef}
+        projects={projects}
+        activeProjectId={activeProjectId}
+        onSwitchProject={switchProject}
+        onNewProject={handleNewProject}
+        onRenameProject={handleRenameProject}
+        onDeleteProject={handleDeleteProject}
         pinned={isWide}
       />
     )
@@ -3907,12 +4278,14 @@ export default function App({ appId, token }) {
           <span className="chat-divider-bar" aria-hidden="true" />
         </div>
         <ChatPanel
+          key={activeProjectId}
           appId={appId}
           token={token}
           storage={storage}
           onFilesMaybeChanged={onFilesMaybeChanged}
           quickActions={quickActions}
           getContext={getContext}
+          activeProjectId={activeProjectId}
         />
       </div>
     )
@@ -4544,6 +4917,93 @@ const CSS = `
   font-weight: 700;
   color: var(--text);
   line-height: 1.2;
+}
+.project-picker {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.project-trigger {
+  max-width: 170px;
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: 650 12px/1.2 var(--font);
+  cursor: pointer;
+}
+.project-trigger svg {
+  flex: 0 0 auto;
+  transform: rotate(90deg);
+  color: var(--muted);
+}
+.project-trigger-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.project-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 65;
+  width: min(230px, 78vw);
+  max-height: min(420px, 70vh);
+  overflow: auto;
+  padding: 5px;
+  border: 1px solid var(--border-light, var(--border));
+  border-radius: 12px;
+  background: var(--bg);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+.project-list,
+.project-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.project-actions {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border);
+}
+.project-item,
+.project-action {
+  width: 100%;
+  min-height: 40px;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  font: 550 13px/1.2 var(--font);
+  cursor: pointer;
+}
+.project-item-name {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.project-item--active {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.project-action--danger { color: var(--danger); }
+.project-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.project-item:active,
+.project-action:active:not(:disabled) {
+  background: var(--surface2, var(--surface));
 }
 .drawer-actions {
   display: flex;
