@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.11.2'
+const APP_VERSION = '2.12.0'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -2462,6 +2462,11 @@ function writeFileCache(appId, projectId, index, contents, lastPath) {
   }
 }
 
+function removeFileCache(appId, projectId) {
+  if (typeof localStorage === 'undefined') return
+  try { localStorage.removeItem(projectFileCacheKey(appId, projectId)) } catch {}
+}
+
 // ----------------------------------------------------------------------
 // Sync pill. Three observable states, in priority order:
 //   pending > 0 + offline  → "Offline · N pending"
@@ -3111,9 +3116,12 @@ export default function App({ appId, token }) {
   // the state unblocks the maintenance pass.
   const mainResolvedRef = useRef(false)
   const [mainReady, setMainReady] = useState(false)
+  const hydratedProjectRef = useRef(activeProjectId)
 
   useEffect(() => {
-    const snapshot = readFileCache(appId, activeProjectId)
+    const switchingProject = hydratedProjectRef.current !== activeProjectId
+    hydratedProjectRef.current = activeProjectId
+    const snapshot = switchingProject ? null : readFileCache(appId, activeProjectId)
     const nextFiles = snapshot?.index || []
     filesRef.current = nextFiles
     selectedPathRef.current = snapshot?.lastPath || null
@@ -3990,12 +3998,38 @@ export default function App({ appId, token }) {
     }
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
 
+  const resetFileUi = useCallback(() => {
+    filesRef.current = []
+    selectedPathRef.current = null
+    fileContentRef.current = ''
+    fileDirtyRef.current = false
+    fileSavingRef.current = false
+    mainPathRef.current = null
+    mainResolvedRef.current = false
+    seenBuildStatusRef.current = ''
+    signalReadySentRef.current = false
+    setFiles([])
+    setFileCache({})
+    setIndexLoaded(false)
+    setSelectedPath(null)
+    setFileContent('')
+    setFileLoading(false)
+    setFileError(null)
+    setFileDirty(false)
+    setFileSaving(false)
+    setMainPath(null)
+    setMainReady(false)
+    setPreviewReloadKey((n) => n + 1)
+  }, [])
+
   const switchProject = useCallback((projectId) => {
     const next = projects.some((project) => project.id === projectId) ? projectId : DEFAULT_PROJECT_ID
+    if (next === activeProjectId) return
+    resetFileUi()
     writeActiveProject(appId, next)
     closeNav()
     setActiveProjectId(next)
-  }, [appId, closeNav, projects])
+  }, [activeProjectId, appId, closeNav, projects, resetFileUi])
 
   const saveProjects = useCallback(async (next) => {
     setProjects(next)
@@ -4080,14 +4114,17 @@ export default function App({ appId, token }) {
     try {
       await deleteProjectTree(project.id)
       await saveProjects(next)
+      removeFileCache(appId, project.id)
       if (activeProjectId === project.id) {
+        resetFileUi()
         writeActiveProject(appId, fallback)
         setActiveProjectId(fallback)
+        removeFileCache(appId, project.id)
       }
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete project' })
     }
-  }, [activeProjectId, appId, deleteProjectTree, modal, readFreshProjects, saveProjects])
+  }, [activeProjectId, appId, deleteProjectTree, modal, readFreshProjects, resetFileUi, saveProjects])
 
   const handleBuild = useCallback(() => {
     // Build always compiles the MAIN document, regardless of which file is
