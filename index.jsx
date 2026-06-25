@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.11.0'
+const APP_VERSION = '2.11.1'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -4518,12 +4518,25 @@ const CSS = `
   -webkit-tap-highlight-color: transparent;
   -webkit-user-select: none;
   user-select: none;
+  transition: background 0.14s ease, color 0.14s ease, transform 0.08s ease;
 }
-/* Bare like the Möbius shell's .shell__brand: closing the drawer must leave
-   NO highlight or bounding box, so no :active background and no focus ring
-   on either :focus or :focus-visible. */
+/* Brand drawer-toggle feedback: neutral wash on hover/focus, accent wash
+   while the file drawer is open. Keep the focus outline suppressed here
+   because the rounded background is the intentional toggle affordance. */
 .nav-toggle:focus,
 .nav-toggle:focus-visible { outline: none; }
+@media (hover: hover) {
+  .nav-toggle:hover {
+    background: var(--surface2, var(--bg-alt, var(--surface)));
+  }
+}
+.nav-toggle:focus-visible {
+  background: var(--surface2, var(--bg-alt, var(--surface)));
+}
+.nav-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  background: var(--accent-dim, color-mix(in srgb, var(--accent) 12%, transparent));
+}
 /* The real app icon as the brand mark inside the drawer toggle. */
 .latex-brand-icon {
   width: 26px;
