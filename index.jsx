@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.11.1'
+const APP_VERSION = '2.11.2'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -4002,9 +4002,18 @@ export default function App({ appId, token }) {
     await rawStorage.setJSON(PROJECTS_KEY, next)
   }, [rawStorage])
 
+  const readFreshProjects = useCallback(async () => {
+    let fetched = null
+    try { fetched = await rawStorage.getFresh(PROJECTS_KEY) } catch {}
+    const fresh = normalizeProjects(fetched)
+    if (fresh.length) return fresh
+    if (projects.length) return projects
+    return [{ id: DEFAULT_PROJECT_ID, name: 'Project 1', createdAt: Date.now() }]
+  }, [projects, rawStorage])
+
   const deleteProjectTree = useCallback(async (projectId) => {
     const prefix = projectPrefix(projectId)
-    if (!prefix) return
+    if (!prefix) throw new Error('deleteProjectTree: refusing empty prefix (would wipe app root)')
     const removeUnder = async (dir) => {
       const entries = await rawStorage.list(dir)
       for (const entry of entries) {
@@ -4017,14 +4026,15 @@ export default function App({ appId, token }) {
   }, [rawStorage])
 
   const handleNewProject = useCallback(async () => {
+    const base = await readFreshProjects()
     const name = await modal.prompt(
       'Project name',
       { title: 'New project', placeholder: `Project ${projects.length + 1}` },
     )
     if (!name || !name.trim()) return
-    const id = uniqueProjectId(name, projects)
+    const id = uniqueProjectId(name, base)
     const nextProject = { id, name: name.trim(), createdAt: Date.now() }
-    const next = [...projects, nextProject]
+    const next = [...base, nextProject]
     try {
       await saveProjects(next)
       writeActiveProject(appId, id)
@@ -4033,28 +4043,30 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create project' })
     }
-  }, [appId, closeNav, modal, projects, saveProjects])
+  }, [appId, closeNav, modal, projects, readFreshProjects, saveProjects])
 
   const handleRenameProject = useCallback(async (projectId) => {
-    const project = projects.find((p) => p.id === projectId)
+    const base = await readFreshProjects()
+    const project = base.find((p) => p.id === projectId)
     if (!project) return
     const name = await modal.prompt(
       'Project name',
       { title: 'Rename project', placeholder: project.name, defaultValue: project.name },
     )
     if (!name || !name.trim() || name.trim() === project.name) return
-    const next = projects.map((p) => (p.id === projectId ? { ...p, name: name.trim() } : p))
+    const next = base.map((p) => (p.id === projectId ? { ...p, name: name.trim() } : p))
     try {
       await saveProjects(next)
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not rename project' })
     }
-  }, [modal, projects, saveProjects])
+  }, [modal, readFreshProjects, saveProjects])
 
   const handleDeleteProject = useCallback(async (projectId) => {
-    const project = projects.find((p) => p.id === projectId)
+    const base = await readFreshProjects()
+    const project = base.find((p) => p.id === projectId)
     if (!project) return
-    if (project.id === DEFAULT_PROJECT_ID || projects.length <= 1) {
+    if (project.id === DEFAULT_PROJECT_ID || base.length <= 1) {
       await modal.alert('The default project and the last remaining project cannot be deleted.', { title: 'Cannot delete project' })
       return
     }
@@ -4063,7 +4075,7 @@ export default function App({ appId, token }) {
       { title: 'Delete project', danger: true },
     )
     if (!ok) return
-    const next = projects.filter((p) => p.id !== project.id)
+    const next = base.filter((p) => p.id !== project.id)
     const fallback = next.some((p) => p.id === DEFAULT_PROJECT_ID) ? DEFAULT_PROJECT_ID : next[0].id
     try {
       await deleteProjectTree(project.id)
@@ -4075,7 +4087,7 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete project' })
     }
-  }, [activeProjectId, appId, deleteProjectTree, modal, projects, saveProjects])
+  }, [activeProjectId, appId, deleteProjectTree, modal, readFreshProjects, saveProjects])
 
   const handleBuild = useCallback(() => {
     // Build always compiles the MAIN document, regardless of which file is
