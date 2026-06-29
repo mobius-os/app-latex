@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.12.0'
+const APP_VERSION = '2.12.2'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1914,7 +1914,7 @@ function FileNavPanel({
           {files.length === 0 ? (
             canMutate ? (
               <div className="drawer-empty">
-                No files yet. Tap “New file” or Upload to make one.
+                Upload a file, or open the project chat to tell the agent what to build.
               </div>
             ) : null
           ) : (
@@ -2541,6 +2541,7 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
   const [pdfByDoc, setPdfByDoc] = useState({})
   const pollRef = useRef(null)
   const deadlineRef = useRef(0)
+  const buildGenerationRef = useRef(0)
   // Monotonic build counter — sources the `ver` token in pdfByDoc.
   const buildSeqRef = useRef(0)
   // Synchronous in-flight guard. buildStatus lags a render, so it can't gate
@@ -2549,10 +2550,16 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
   const buildingRef = useRef(false)
 
   const clearPoll = useCallback(() => {
+    buildGenerationRef.current += 1
     if (pollRef.current) {
       clearTimeout(pollRef.current)
       pollRef.current = null
     }
+    deadlineRef.current = 0
+    // An orphaned in-flight build's poll will never reach finishDone/Error
+    // (its generation is now stale), so its buildingRef would stay stuck true
+    // and block all future builds. Release it here.
+    buildingRef.current = false
   }, [])
 
   // Clear the timer on unmount so a poll can't fire into a dead component.
@@ -2601,7 +2608,8 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
   // One poll tick: read build/status.json. 404/null → still building (or the
   // cap elapsed → error). A verdict object → done/error. onDone is called
   // with the built pdf path so the caller can flip the viewer + register it.
-  const poll = useCallback(async (doc, onDone) => {
+  const poll = useCallback(async (doc, onDone, generation) => {
+    if (generation !== buildGenerationRef.current) return
     if (Date.now() > deadlineRef.current) {
       finishError('Build timed out (over 2 minutes). The first build downloads '
         + 'LaTeX packages and can be slow — try again, or check the .tex compiles.')
@@ -2614,6 +2622,7 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
       // Transient read failure — keep polling; the deadline still bounds us.
       status = null
     }
+    if (generation !== buildGenerationRef.current) return
     if (status && typeof status === 'object' && status.status) {
       // The verdict echoes the target it was built FROM. build/target.txt +
       // build/status.json are one shared pair per app, so a build kicked from
@@ -2622,7 +2631,7 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
       // ours — otherwise we'd map a sibling's PDF onto this doc. (Verdicts
       // predating the `target` field have none and are accepted as before.)
       if (status.target && status.target !== doc) {
-        pollRef.current = setTimeout(() => poll(doc, onDone), BUILD_POLL_MS)
+        pollRef.current = setTimeout(() => poll(doc, onDone, generation), BUILD_POLL_MS)
         return
       }
       if (status.status === 'done') {
@@ -2634,7 +2643,7 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
       return
     }
     // Not ready yet (404 → null). Schedule the next tick.
-    pollRef.current = setTimeout(() => poll(doc, onDone), BUILD_POLL_MS)
+    pollRef.current = setTimeout(() => poll(doc, onDone, generation), BUILD_POLL_MS)
   }, [storage, finishDone, finishError])
 
   // Kick a build for `doc` (a "files/<name>.tex" path). onDone fires once the
@@ -2650,8 +2659,9 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
       finishError('You are offline. Building needs a connection — reconnect and try again.')
       return
     }
-    buildingRef.current = true
     clearPoll()
+    buildingRef.current = true
+    const generation = buildGenerationRef.current
     setBuildDoc(doc)
     setBuildStatus('building')
     setBuildLog('')
@@ -2683,7 +2693,7 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
       }
       // 3. Poll status.json until the script writes its verdict.
       deadlineRef.current = Date.now() + BUILD_TIMEOUT_MS
-      pollRef.current = setTimeout(() => poll(doc, onDone), BUILD_POLL_MS)
+      pollRef.current = setTimeout(() => poll(doc, onDone, generation), BUILD_POLL_MS)
     } catch (e) {
       finishError((e && e.message) ? e.message : 'Build failed to start.')
     }
@@ -2698,6 +2708,7 @@ function useBuild({ appId, token, storage, online, activeProjectId }) {
 
   return {
     buildStatus, buildLog, buildDoc, pdfByDoc, build, rememberPdf,
+    clearPoll,
     // Surfaced so the App can drop a doc's PDF mapping when the file is
     // deleted/renamed (the pdf path itself is just another tree entry).
     forgetDoc: useCallback((doc) => {
@@ -2828,6 +2839,7 @@ export default function App({ appId, token }) {
   const mainPathRef = useRef(null)
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
   const build = useBuild({ appId, token, storage, online, activeProjectId })
+  const clearBuildPoll = build.clearPoll
   const seenBuildStatusRef = useRef('')
   const signalReadySentRef = useRef(false)
   // Bumped on signals that the open file's bytes may have changed underneath us
@@ -3119,6 +3131,7 @@ export default function App({ appId, token }) {
   const hydratedProjectRef = useRef(activeProjectId)
 
   useEffect(() => {
+    clearBuildPoll()
     const switchingProject = hydratedProjectRef.current !== activeProjectId
     hydratedProjectRef.current = activeProjectId
     const snapshot = switchingProject ? null : readFileCache(appId, activeProjectId)
@@ -3144,7 +3157,7 @@ export default function App({ appId, token }) {
     setMainPath(null)
     setMainReady(false)
     setPreviewReloadKey((n) => n + 1)
-  }, [appId, activeProjectId])
+  }, [appId, activeProjectId, clearBuildPoll])
 
   useEffect(() => {
     if (!indexLoaded || mainResolvedRef.current) return
@@ -3999,6 +4012,7 @@ export default function App({ appId, token }) {
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
 
   const resetFileUi = useCallback(() => {
+    clearBuildPoll()
     filesRef.current = []
     selectedPathRef.current = null
     fileContentRef.current = ''
@@ -4020,7 +4034,7 @@ export default function App({ appId, token }) {
     setMainPath(null)
     setMainReady(false)
     setPreviewReloadKey((n) => n + 1)
-  }, [])
+  }, [clearBuildPoll])
 
   const switchProject = useCallback((projectId) => {
     const next = projects.some((project) => project.id === projectId) ? projectId : DEFAULT_PROJECT_ID
@@ -4060,12 +4074,12 @@ export default function App({ appId, token }) {
   }, [rawStorage])
 
   const handleNewProject = useCallback(async () => {
-    const base = await readFreshProjects()
     const name = await modal.prompt(
       'Project name',
       { title: 'New project', placeholder: `Project ${projects.length + 1}` },
     )
     if (!name || !name.trim()) return
+    const base = await readFreshProjects()
     const id = uniqueProjectId(name, base)
     const nextProject = { id, name: name.trim(), createdAt: Date.now() }
     const next = [...base, nextProject]
@@ -4088,7 +4102,13 @@ export default function App({ appId, token }) {
       { title: 'Rename project', placeholder: project.name, defaultValue: project.name },
     )
     if (!name || !name.trim() || name.trim() === project.name) return
-    const next = base.map((p) => (p.id === projectId ? { ...p, name: name.trim() } : p))
+    const fresh = await readFreshProjects()
+    const current = fresh.find((p) => p.id === projectId)
+    if (!current) {
+      await modal.alert('That project no longer exists.', { title: 'Could not rename project' })
+      return
+    }
+    const next = fresh.map((p) => (p.id === projectId ? { ...p, name: name.trim() } : p))
     try {
       await saveProjects(next)
     } catch (e) {
@@ -4109,17 +4129,26 @@ export default function App({ appId, token }) {
       { title: 'Delete project', danger: true },
     )
     if (!ok) return
-    const next = base.filter((p) => p.id !== project.id)
+    const fresh = await readFreshProjects()
+    const current = fresh.find((p) => p.id === project.id)
+    if (!current) {
+      await modal.alert('That project no longer exists.', { title: 'Could not delete project' })
+      return
+    }
+    if (current.id === DEFAULT_PROJECT_ID || fresh.length <= 1) {
+      await modal.alert('The default project and the last remaining project cannot be deleted.', { title: 'Cannot delete project' })
+      return
+    }
+    const next = fresh.filter((p) => p.id !== current.id)
     const fallback = next.some((p) => p.id === DEFAULT_PROJECT_ID) ? DEFAULT_PROJECT_ID : next[0].id
     try {
-      await deleteProjectTree(project.id)
+      await deleteProjectTree(current.id)
       await saveProjects(next)
-      removeFileCache(appId, project.id)
-      if (activeProjectId === project.id) {
+      removeFileCache(appId, current.id)
+      if (activeProjectId === current.id) {
         resetFileUi()
         writeActiveProject(appId, fallback)
         setActiveProjectId(fallback)
-        removeFileCache(appId, project.id)
       }
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not delete project' })
@@ -5009,6 +5038,14 @@ const CSS = `
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+.project-trigger[aria-expanded="true"] {
+  color: var(--accent);
+  background: var(--accent-dim, color-mix(in srgb, var(--accent) 12%, transparent));
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+.project-trigger[aria-expanded="true"] svg {
+  color: var(--accent);
 }
 .project-menu {
   position: absolute;
