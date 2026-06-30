@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.13.1'
+const APP_VERSION = '2.13.2'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1506,7 +1506,7 @@ function FileNode({
         className={`tree-root ${dropActive ? 'tree-drop-active' : ''}`}
         onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropActive(true) }}
         onDragLeave={() => setDropActive(false)}
-        onDrop={(e) => dropMove(e, '')}
+        onDrop={(e) => dropMove(e, node.path)}
       >
         {sortedChildren.map((c) => (
           <FileNode
@@ -1903,9 +1903,12 @@ function FileNavPanel({
           </div>
         </div>
         <div className="drawer-actions">
-          <button className="icon-btn" onClick={onCreateFile} disabled={!canMutate} title="New file" aria-label="New file"><NewFileIcon size={17} /></button>
-          <button className="icon-btn" onClick={onCreateFolder} disabled={!canMutate} title="New folder" aria-label="New folder"><NewFolderIcon size={17} /></button>
-          <button className="icon-btn" onClick={() => fileInputRef.current && fileInputRef.current.click()} disabled={!canMutate} title="Upload" aria-label="Upload"><UploadIcon size={17} /></button>
+          <span className="files-label">Files</span>
+          <div className="files-actions">
+            <button className="icon-btn" onClick={onCreateFile} disabled={!canMutate} title="New file" aria-label="New file"><NewFileIcon size={17} /></button>
+            <button className="icon-btn" onClick={onCreateFolder} disabled={!canMutate} title="New folder" aria-label="New folder"><NewFolderIcon size={17} /></button>
+            <button className="icon-btn" onClick={() => fileInputRef.current && fileInputRef.current.click()} disabled={!canMutate} title="Upload" aria-label="Upload"><UploadIcon size={17} /></button>
+          </div>
           {/* Hidden file/folder pickers. Materialise the FileList into a real
               array SYNCHRONOUSLY before resetting input.value: onUpload is async
               (it awaits before reading the list), and `e.target.value = ''`
@@ -1961,7 +1964,7 @@ function FileNavPanel({
             ) : null
           ) : (
             <FileNode
-              node={root}
+              node={root.children.get('files') || root}
               selectedPath={selectedPath}
               onSelect={(p) => { onSelect(p); onClose() }}
               depth={-1}
@@ -5112,7 +5115,7 @@ const CSS = `
   top: calc(100% + 6px);
   left: 0;
   z-index: 65;
-  width: min(230px, 78vw);
+  width: min(264px, 82vw);
   max-height: min(420px, 70vh);
   overflow: auto;
   padding: 5px;
@@ -5140,9 +5143,9 @@ const CSS = `
 }
 .project-item-name {
   display: block;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.3;
 }
 .project-item--active {
   background: var(--accent-dim);
@@ -5153,10 +5156,20 @@ const CSS = `
 }
 .drawer-actions {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 2px;
-  padding: 6px 8px;
+  padding: 4px 6px 4px 12px;
   border-bottom: 1px solid var(--border);
 }
+.files-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.files-actions { display: flex; gap: 2px; }
 .drawer-btn {
   flex: 1 1 0;
   min-height: 44px;
