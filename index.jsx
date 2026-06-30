@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.13.2'
+const APP_VERSION = '2.13.3'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1964,7 +1964,7 @@ function FileNavPanel({
             ) : null
           ) : (
             <FileNode
-              node={root.children.get('files') || root}
+              node={(root.children.size === 1 && root.children.has('files')) ? root.children.get('files') : root}
               selectedPath={selectedPath}
               onSelect={(p) => { onSelect(p); onClose() }}
               depth={-1}
