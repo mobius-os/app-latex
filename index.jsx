@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.12.2'
+const APP_VERSION = '2.13.0'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1107,6 +1107,66 @@ function ChevronIcon({ size = 14 }) {
 }
 /* mobius-ui:ChevronIcon end */
 
+function PencilIcon({ size = 16 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  )
+}
+function PlusIcon({ size = 18 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  )
+}
+function NewFileIcon({ size = 17 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z" />
+      <path d="M14 3v6h6" />
+      <path d="M12 12v6M9 15h6" />
+    </svg>
+  )
+}
+function NewFolderIcon({ size = 17 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3 7a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.6.8l.9 1.2H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+      <path d="M12 11v5M9.5 13.5h5" />
+    </svg>
+  )
+}
+function UploadIcon({ size = 17 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 15V4" />
+      <path d="M8 8l4-4 4 4" />
+      <path d="M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" />
+    </svg>
+  )
+}
+function TrashIcon({ size = 16 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden>
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 11v6M14 11v6" />
+    </svg>
+  )
+}
+
 // Inline 24x24 line icons for the top-bar controls, in the same
 // stroke=currentColor / strokeWidth=2 / round-cap style as Workout's
 // <SportIcon>. The toolbar shows them in icon-only buttons (each with its
@@ -1223,6 +1283,7 @@ function ContextMenu({ x, y, items, onClose }) {
   const ref = useRef(null)
   useEffect(() => {
     const onDown = (e) => {
+      if (e.target && e.target.closest && e.target.closest('[data-popover-trigger]')) return
       if (ref.current && !ref.current.contains(e.target)) onClose()
     }
     const onKey = (e) => { if (e.key === 'Escape') onClose() }
@@ -1318,9 +1379,10 @@ function FileNode({
   const openMenuFromButton = useCallback((e, isFolderItem) => {
     e.preventDefault()
     e.stopPropagation()
+    if (openMenuPath === node.path) { onContextMenu(null); return }
     const r = e.currentTarget.getBoundingClientRect()
     onContextMenu({ x: r.right, y: r.bottom, path: node.path, isFolder: isFolderItem })
-  }, [node.path, onContextMenu])
+  }, [openMenuPath, node.path, onContextMenu])
   if (node.children.size === 0 && node.isFile) {
     const selected = node.path === selectedPath
     const isMain = node.path === mainPath
@@ -1389,6 +1451,7 @@ function FileNode({
         <button
           type="button"
           className="tree-menu-btn"
+          data-popover-trigger=""
           data-state={menuOpen ? 'open' : undefined}
           aria-haspopup="menu"
           aria-expanded={menuOpen}
@@ -1503,6 +1566,7 @@ function FileNode({
         <button
           type="button"
           className="tree-menu-btn"
+          data-popover-trigger=""
           data-state={menuOpen ? 'open' : undefined}
           aria-haspopup="menu"
           aria-expanded={menuOpen}
@@ -1537,14 +1601,13 @@ function FileNode({
 }
 
 function ProjectSelector({
-  projects, activeProjectId,
-  onSwitchProject, onNewProject, onRenameProject, onDeleteProject,
+  projects, projectsLoaded, activeProjectId,
+  onSwitchProject,
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
   const active = projects.find((p) => p.id === activeProjectId) || projects[0]
     || { id: DEFAULT_PROJECT_ID, name: 'Project 1' }
-  const canDelete = active.id !== DEFAULT_PROJECT_ID && projects.length > 1
 
   useEffect(() => {
     if (!open) return undefined
@@ -1576,7 +1639,9 @@ function ProjectSelector({
       {open && (
         <div className="project-menu" role="menu">
           <div className="project-list" role="group" aria-label="Projects">
-            {projects.map((project) => (
+            {!projectsLoaded ? (
+              <div className="project-loading">Loading projects…</div>
+            ) : projects.map((project) => (
               <button
                 key={project.id}
                 type="button"
@@ -1591,23 +1656,6 @@ function ProjectSelector({
                 <span className="project-item-name">{project.name}</span>
               </button>
             ))}
-          </div>
-          <div className="project-actions" role="group" aria-label="Project actions">
-            <button type="button" role="menuitem" className="project-action" onClick={() => { setOpen(false); onNewProject() }}>
-              New Project
-            </button>
-            <button type="button" role="menuitem" className="project-action" onClick={() => { setOpen(false); onRenameProject(active.id) }}>
-              Rename
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              className="project-action project-action--danger"
-              disabled={!canDelete}
-              onClick={() => { setOpen(false); onDeleteProject(active.id) }}
-            >
-              Delete
-            </button>
           </div>
         </div>
       )}
@@ -1630,7 +1678,7 @@ function FileNavPanel({
   open, onClose, files, selectedPath, onSelect, canMutate,
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
   onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
-  projects, activeProjectId, onSwitchProject, onNewProject, onRenameProject, onDeleteProject,
+  projects, projectsLoaded, activeProjectId, onSwitchProject, onNewProject, onRenameProject, onDeleteProject,
   pinned = false,
 }) {
   // On desktop (>=860px) the panel is a persistent left rail, never an overlay:
@@ -1841,29 +1889,23 @@ function FileNavPanel({
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
       >
-        <div className="drawer-head">
-          <div className="drawer-head-text">
-            <span className="drawer-title">Files</span>
-          </div>
+        <div className="project-row">
           <ProjectSelector
             projects={projects}
+            projectsLoaded={projectsLoaded}
             activeProjectId={activeProjectId}
             onSwitchProject={onSwitchProject}
-            onNewProject={onNewProject}
-            onRenameProject={onRenameProject}
-            onDeleteProject={onDeleteProject}
           />
+          <div className="project-row-actions">
+            <button className="icon-btn" onClick={onNewProject} disabled={!projectsLoaded} title="New project" aria-label="New project"><PlusIcon size={18} /></button>
+            <button className="icon-btn" onClick={() => onRenameProject(activeProjectId)} disabled={!projectsLoaded} title="Rename project" aria-label="Rename project"><PencilIcon size={15} /></button>
+            <button className="icon-btn icon-btn--danger" onClick={() => onDeleteProject(activeProjectId)} disabled={!projectsLoaded || activeProjectId === DEFAULT_PROJECT_ID || projects.length <= 1} title="Delete project" aria-label="Delete project"><TrashIcon size={15} /></button>
+          </div>
         </div>
         <div className="drawer-actions">
-          <button className="drawer-btn" onClick={onCreateFile} disabled={!canMutate}>New file</button>
-          <button className="drawer-btn" onClick={onCreateFolder} disabled={!canMutate}>New folder</button>
-          <button
-            className="drawer-btn"
-            onClick={() => fileInputRef.current && fileInputRef.current.click()}
-            disabled={!canMutate}
-          >
-            Upload
-          </button>
+          <button className="icon-btn" onClick={onCreateFile} disabled={!canMutate} title="New file" aria-label="New file"><NewFileIcon size={17} /></button>
+          <button className="icon-btn" onClick={onCreateFolder} disabled={!canMutate} title="New folder" aria-label="New folder"><NewFolderIcon size={17} /></button>
+          <button className="icon-btn" onClick={() => fileInputRef.current && fileInputRef.current.click()} disabled={!canMutate} title="Upload" aria-label="Upload"><UploadIcon size={17} /></button>
           {/* Hidden file/folder pickers. Materialise the FileList into a real
               array SYNCHRONOUSLY before resetting input.value: onUpload is async
               (it awaits before reading the list), and `e.target.value = ''`
@@ -3540,6 +3582,10 @@ export default function App({ appId, token }) {
       await modal.alert(`“${path}” already exists.`, { title: 'Name taken' })
       return
     }
+    if (filesRef.current.some((p) => p.startsWith(`${path}/`))) {
+      await modal.alert(`A folder named "${clean.split('/').pop()}" already exists here — a file and a folder can't share a name.`, { title: 'Name taken' })
+      return
+    }
     try {
       await storage.setText(path, '')
       const next = [...filesRef.current, path].sort()
@@ -4318,6 +4364,7 @@ export default function App({ appId, token }) {
         onSetMain={handleSetMain}
         returnFocusRef={navToggleRef}
         projects={projects}
+        projectsLoaded={projectsReady}
         activeProjectId={activeProjectId}
         onSwitchProject={switchProject}
         onNewProject={handleNewProject}
@@ -4598,8 +4645,7 @@ const CSS = `
   user-select: none;
   transition: background 0.14s ease, color 0.14s ease, transform 0.08s ease;
 }
-/* Brand drawer-toggle feedback: neutral wash on hover/focus, accent wash
-   while the file drawer is open. Keep the focus outline suppressed here
+/* Brand drawer-toggle feedback: neutral wash on hover/focus. Keep the focus outline suppressed here
    because the rounded background is the intentional toggle affordance. */
 .nav-toggle:focus,
 .nav-toggle:focus-visible { outline: none; }
@@ -4610,10 +4656,6 @@ const CSS = `
 }
 .nav-toggle:focus-visible {
   background: var(--surface2, var(--bg-alt, var(--surface)));
-}
-.nav-toggle[aria-expanded="true"] {
-  color: var(--accent);
-  background: var(--accent-dim, color-mix(in srgb, var(--accent) 12%, transparent));
 }
 /* The real app icon as the brand mark inside the drawer toggle. */
 .latex-brand-icon {
@@ -5061,19 +5103,12 @@ const CSS = `
   background: var(--bg);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
 }
-.project-list,
-.project-actions {
+.project-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
-.project-actions {
-  margin-top: 5px;
-  padding-top: 5px;
-  border-top: 1px solid var(--border);
-}
-.project-item,
-.project-action {
+.project-item {
   width: 100%;
   min-height: 40px;
   padding: 7px 9px;
@@ -5095,19 +5130,13 @@ const CSS = `
   background: var(--accent-dim);
   color: var(--accent);
 }
-.project-action--danger { color: var(--danger); }
-.project-action:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.project-item:active,
-.project-action:active:not(:disabled) {
+.project-item:active {
   background: var(--surface2, var(--surface));
 }
 .drawer-actions {
   display: flex;
-  gap: 6px;
-  padding: 8px 10px;
+  gap: 2px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--border);
 }
 .drawer-btn {
@@ -5127,6 +5156,25 @@ const CSS = `
 .drawer-btn:active { background: var(--surface2, var(--surface)); }
 .drawer-btn--danger { color: var(--danger); border-color: var(--danger); }
 .drawer-btn:disabled { opacity: 0.45; cursor: default; }
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px; padding: 0;
+  border-radius: 7px; border: 1px solid transparent;
+  background: transparent; color: var(--muted);
+  cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+}
+.icon-btn:hover { background: var(--surface2, var(--surface)); color: var(--text); }
+.icon-btn:active:not(:disabled) { background: var(--surface3, var(--surface2)); transform: scale(0.94); }
+.icon-btn:disabled { opacity: 0.3; cursor: default; }
+.icon-btn--danger:hover { color: var(--danger, #f87171); }
+.project-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 7px 8px 7px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.project-row .project-picker { flex: 1 1 auto; min-width: 0; }
+.project-row .project-trigger { width: 100%; max-width: none; justify-content: space-between; }
+.project-row-actions { display: flex; gap: 0; flex: 0 0 auto; }
 .drawer-syncing {
   padding: 8px 14px;
   font-size: 12px;
@@ -5156,6 +5204,7 @@ const CSS = `
 	  display: flex;
 	  align-items: stretch;
 	  width: 100%;
+	  gap: 2px;
 	}
 	.tree-file, .tree-folder {
   display: flex;
