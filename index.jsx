@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.13.3'
+const APP_VERSION = '2.14.0'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1602,12 +1602,26 @@ function FileNode({
 
 function ProjectSelector({
   projects, projectsLoaded, activeProjectId,
-  onSwitchProject,
+  onSwitchProject, renamingId, onCommitRename, onCancelRename,
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
+  const inputRef = useRef(null)
+  // Set when Enter/Escape already resolved the edit, so the blur that fires as
+  // the input unmounts does not commit a second (or, on Escape, a cancelled) value.
+  const skipBlurRef = useRef(false)
   const active = projects.find((p) => p.id === activeProjectId) || projects[0]
     || { id: DEFAULT_PROJECT_ID, name: 'Project 1' }
+
+  useEffect(() => {
+    if (renamingId !== active.id) return
+    skipBlurRef.current = false
+    const raf = requestAnimationFrame(() => {
+      inputRef.current?.focus()
+      inputRef.current?.select()
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [active.id, renamingId])
 
   useEffect(() => {
     if (!open) return undefined
@@ -1625,17 +1639,36 @@ function ProjectSelector({
 
   return (
     <div className="project-picker" ref={ref}>
-      <button
-        type="button"
-        className="project-trigger"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        title="Switch project"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="project-trigger-name">{active.name}</span>
-        <ChevronIcon size={13} />
-      </button>
+      {renamingId === active.id ? (
+        <input
+          ref={inputRef}
+          className="project-rename-input"
+          defaultValue={active.name}
+          aria-label="Project name"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { skipBlurRef.current = true; onCommitRename(active.id, e.currentTarget.value) }
+            else if (e.key === 'Escape') { skipBlurRef.current = true; onCancelRename() }
+          }}
+          onBlur={(e) => {
+            if (skipBlurRef.current) { skipBlurRef.current = false; return }
+            onCommitRename(active.id, e.currentTarget.value)
+          }}
+        />
+      ) : (
+        <button
+          type="button"
+          className="project-trigger"
+          aria-haspopup="menu"
+          aria-expanded={open}
+          title="Switch project"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <span className="project-trigger-name">{active.name}</span>
+          <ChevronIcon size={13} />
+        </button>
+      )}
       {open && (
         <div className="project-menu" role="menu">
           <div className="project-list" role="group" aria-label="Projects">
@@ -1679,6 +1712,7 @@ function FileNavPanel({
   onCreateFile, onCreateFolder, onDeleteFile, onDeleteFolder,
   onUpload, onMove, onRename, mainPath, onSetMain, returnFocusRef,
   projects, projectsLoaded, activeProjectId, onSwitchProject, onNewProject, onRenameProject, onDeleteProject,
+  renamingId, onCommitProjectRename, onCancelProjectRename,
   pinned = false,
 }) {
   // On desktop (>=860px) the panel is a persistent left rail, never an overlay:
@@ -1895,6 +1929,9 @@ function FileNavPanel({
             projectsLoaded={projectsLoaded}
             activeProjectId={activeProjectId}
             onSwitchProject={onSwitchProject}
+            renamingId={renamingId}
+            onCommitRename={onCommitProjectRename}
+            onCancelRename={onCancelProjectRename}
           />
           <div className="project-row-actions">
             <button className="icon-btn" onClick={onNewProject} disabled={!projectsLoaded} title="New project" aria-label="New project"><PlusIcon size={18} /></button>
@@ -2801,6 +2838,7 @@ export default function App({ appId, token }) {
   const rawStorage = useMemo(() => makeStorage(appId, token), [appId, token])
   const [projects, setProjects] = useState([])
   const [projectsReady, setProjectsReady] = useState(false)
+  const [renamingId, setRenamingId] = useState(null)
   const [activeProjectId, setActiveProjectId] = useState(() => readActiveProject(appId))
   const storage = useMemo(() => makeProjectStorage(rawStorage, activeProjectId), [rawStorage, activeProjectId])
   const storagePrefix = storage.prefix
@@ -4140,46 +4178,38 @@ export default function App({ appId, token }) {
     await removeUnder(prefix)
   }, [rawStorage])
 
+  const startRenameProject = useCallback((projectId) => setRenamingId(projectId), [])
+  const cancelRenameProject = useCallback(() => setRenamingId(null), [])
+
   const handleNewProject = useCallback(async () => {
-    const name = await modal.prompt(
-      'Project name',
-      { title: 'New project', placeholder: `Project ${projects.length + 1}` },
-    )
-    if (!name || !name.trim()) return
+    const name = `Project ${projects.length + 1}`
     const base = await readFreshProjects()
     const id = uniqueProjectId(name, base)
-    const nextProject = { id, name: name.trim(), createdAt: Date.now() }
+    const nextProject = { id, name, createdAt: Date.now() }
     const next = [...base, nextProject]
     try {
       await saveProjects(next)
       writeActiveProject(appId, id)
       setActiveProjectId(id)
-      closeNav()
+      setRenamingId(id)
+      openNavRef.current?.()
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create project' })
     }
-  }, [appId, closeNav, modal, projects, readFreshProjects, saveProjects])
+  }, [appId, modal, projects.length, readFreshProjects, saveProjects])
 
-  const handleRenameProject = useCallback(async (projectId) => {
-    const base = await readFreshProjects()
-    const project = base.find((p) => p.id === projectId)
-    if (!project) return
-    const name = await modal.prompt(
-      'Project name',
-      { title: 'Rename project', placeholder: project.name, defaultValue: project.name },
-    )
-    if (!name || !name.trim() || name.trim() === project.name) return
-    const fresh = await readFreshProjects()
-    const current = fresh.find((p) => p.id === projectId)
-    if (!current) {
-      await modal.alert('That project no longer exists.', { title: 'Could not rename project' })
-      return
-    }
-    const next = fresh.map((p) => (p.id === projectId ? { ...p, name: name.trim() } : p))
+  const commitRenameProject = useCallback(async (projectId, rawName) => {
+    const clean = String(rawName || '').trim()
     try {
+      const fresh = await readFreshProjects()
+      const current = fresh.find((p) => p.id === projectId)
+      if (!current || !clean || clean === current.name) return
+      const next = fresh.map((p) => (p.id === projectId ? { ...p, name: clean } : p))
       await saveProjects(next)
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not rename project' })
+    } finally {
+      setRenamingId(null)
     }
   }, [modal, readFreshProjects, saveProjects])
 
@@ -4389,8 +4419,11 @@ export default function App({ appId, token }) {
         activeProjectId={activeProjectId}
         onSwitchProject={switchProject}
         onNewProject={handleNewProject}
-        onRenameProject={handleRenameProject}
+        onRenameProject={startRenameProject}
         onDeleteProject={handleDeleteProject}
+        renamingId={renamingId}
+        onCommitProjectRename={commitRenameProject}
+        onCancelProjectRename={cancelRenameProject}
         pinned={isWide}
       />
     )
@@ -5110,6 +5143,21 @@ const CSS = `
 .project-trigger[aria-expanded="true"] svg {
   color: var(--accent);
 }
+.project-rename-input {
+  max-width: 170px;
+  min-height: 36px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: 650 12px/1.2 var(--font);
+  outline: none;
+}
+.project-rename-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
 .project-menu {
   position: absolute;
   top: calc(100% + 6px);
@@ -5205,6 +5253,7 @@ const CSS = `
 }
 .project-row .project-picker { flex: 1 1 auto; min-width: 0; }
 .project-row .project-trigger { width: 100%; max-width: none; justify-content: space-between; }
+.project-row .project-rename-input { width: 100%; max-width: none; }
 .project-row-actions { display: flex; gap: 0; flex: 0 0 auto; }
 .drawer-syncing {
   padding: 8px 14px;
