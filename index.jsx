@@ -4503,8 +4503,8 @@ export default function App({ appId, token }) {
             <img
               src={`/api/apps/${appId}/icon?size=64`}
               alt=""
-              width={26}
-              height={26}
+              width={34}
+              height={34}
               className="latex-brand-icon"
               onError={(e) => {
                 e.currentTarget.style.display = 'none'
@@ -4680,8 +4680,8 @@ const CSS = `
 }
 /* The real app icon as the brand mark inside the drawer toggle. */
 .latex-brand-icon {
-  width: 26px;
-  height: 26px;
+  width: 34px;
+  height: 34px;
   border-radius: 6px;
   object-fit: cover;
   flex-shrink: 0;
