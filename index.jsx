@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.13.0'
+const APP_VERSION = '2.13.1'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -2802,7 +2802,7 @@ export default function App({ appId, token }) {
   const storage = useMemo(() => makeProjectStorage(rawStorage, activeProjectId), [rawStorage, activeProjectId])
   const storagePrefix = storage.prefix
   const online = useOnline()
-  const modal = useModal()
+  const rawModal = useModal()
   const bodyRef = useRef(null)
   // Hydrate files + recent contents from the localStorage snapshot
   // synchronously on first render so an offline reload has SOMETHING
@@ -2827,6 +2827,22 @@ export default function App({ appId, token }) {
   const [indexLoaded, setIndexLoaded] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const navHandleRef = useRef(null)
+  const navOpenRef = useRef(false)
+  useEffect(() => { navOpenRef.current = navOpen }, [navOpen])
+  const openNavRef = useRef(null)
+  // Modals ride the shell's single-surface nav, which closes the drawer when a
+  // modal opens. Wrap the modal API once so any prompt/confirm/alert re-opens
+  // the drawer afterward if it was open — e.g. cancelling a rename returns to
+  // the drawer instead of leaving it closed.
+  const modal = useMemo(() => {
+    const wrap = (name) => (...args) => {
+      const wasOpen = navOpenRef.current
+      return Promise.resolve(rawModal[name](...args)).finally(() => {
+        if (wasOpen && openNavRef.current) openNavRef.current()
+      })
+    }
+    return { node: rawModal.node, alert: wrap('alert'), confirm: wrap('confirm'), prompt: wrap('prompt') }
+  }, [rawModal])
   const navToggleRef = useRef(null)
   // Restore the file the user was viewing last session so an offline
   // reload opens straight into their work-in-progress (assuming we
@@ -3042,7 +3058,8 @@ export default function App({ appId, token }) {
   }, [])
 
   const openNav = useCallback(async () => {
-    if (navOpen) return
+    if (navOpenRef.current) return
+    navOpenRef.current = true
     if (window.mobius?.nav?.open) {
       const handle = window.mobius.nav.open('latex-drawer', () => {
         navHandleRef.current = null
@@ -3053,7 +3070,8 @@ export default function App({ appId, token }) {
       if (navHandleRef.current !== handle) return
     }
     setNavOpen(true)
-  }, [navOpen])
+  }, [])
+  useEffect(() => { openNavRef.current = openNav }, [openNav])
 
   const toggleNav = useCallback(() => {
     if (navOpen) closeNav()
@@ -5092,7 +5110,7 @@ const CSS = `
 .project-menu {
   position: absolute;
   top: calc(100% + 6px);
-  right: 0;
+  left: 0;
   z-index: 65;
   width: min(230px, 78vw);
   max-height: min(420px, 70vh);
