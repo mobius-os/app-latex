@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.14.1'
+const APP_VERSION = '2.14.2'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1391,10 +1391,11 @@ function FileNode({
     // on every .tex that isn't already the build target, alongside the existing
     // right-click / long-press context-menu path (which still works). The
     // current target is marked instead with a single compact accent glyph (the
-    // bullseye) — no text chip. We render the control as a role="button" span
-    // (not a nested <button>, which is invalid inside the row's own <button>)
-    // and stop propagation so tapping it sets the target without also
-    // selecting/opening the file.
+    // bullseye) — no text chip. It is a SIBLING of the row <button> (next to the
+    // kebab), not nested inside it: focusable content inside a <button> is
+    // invalid HTML and pollutes the tree's roving-tabindex (the row buttons are
+    // tabIndex={-1}). We stop propagation so tapping it sets the target without
+    // also selecting/opening the file.
     const activateSetMain = (e) => {
       e.preventDefault()
       e.stopPropagation()
@@ -1434,20 +1435,19 @@ function FileNode({
               <ToolIcon name="target" size={15} />
             </span>
           )}
-          {isTex && !isMain && onSetMain && (
-            <span
-              className="tree-set-main"
-              role="button"
-              tabIndex={0}
-              aria-label="Set as build target"
-              title="Set as build target (Build will compile this file)"
-              onClick={activateSetMain}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') activateSetMain(e) }}
-            >
-              <ToolIcon name="target" size={16} />
-            </span>
-          )}
         </button>
+        {isTex && !isMain && onSetMain && (
+          <button
+            type="button"
+            className="tree-set-main"
+            aria-label="Set as build target"
+            title="Set as build target (Build will compile this file)"
+            onClick={activateSetMain}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') activateSetMain(e) }}
+          >
+            <ToolIcon name="target" size={16} />
+          </button>
+        )}
         <button
           type="button"
           className="tree-menu-btn"
@@ -3651,9 +3651,28 @@ export default function App({ appId, token }) {
       await modal.alert(`A folder named "${clean.split('/').pop()}" already exists here — a file and a folder can't share a name.`, { title: 'Name taken' })
       return
     }
+    // Reject when an INTERMEDIATE segment is itself an existing FILE: with a file
+    // at "files/css", creating "css/icons.tex" would write it BEHIND the file
+    // node (orphaned). Walk every ancestor prefix (excluding the leaf, already
+    // checked above) and refuse if it's an exact file entry.
+    const segs = path.split('/')
+    const fileSet = new Set(filesRef.current)
+    for (let i = 2; i < segs.length; i++) {
+      const ancestor = segs.slice(0, i).join('/')
+      if (fileSet.has(ancestor)) {
+        await modal.alert(`A file named "${segs[i - 1]}" already exists here — a file and a folder can't share a name.`, { title: 'Name taken' })
+        return
+      }
+    }
     try {
       await storage.setText(path, '')
-      const next = [...filesRef.current, path].sort()
+      // Merge into the SERVER's current index, not the in-memory snapshot: a
+      // concurrent create/delete (another device, or this app's own rapid
+      // second mutation before filesRef syncs) could otherwise be clobbered by
+      // a whole-array PUT derived from a stale list.
+      const fresh = await storage.getFresh('files-index.json')
+      const base = Array.isArray(fresh) ? fresh : filesRef.current
+      const next = [...new Set([...base, path])].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       // Seed the cache with the empty body so a subsequent offline
@@ -3699,10 +3718,26 @@ export default function App({ appId, token }) {
       await modal.alert(`A folder named "${clean.split('/').pop()}" already exists here.`, { title: 'Name taken' })
       return
     }
+    // Reject when an INTERMEDIATE segment is itself an existing FILE: with a file
+    // at "files/css", creating folder "css/icons" would write "files/css/icons/
+    // .keep" BEHIND the file node (orphaned). Walk every ancestor prefix
+    // (excluding `dir` itself, already checked) and refuse if it's a file entry.
+    const dirSegs = dir.split('/')
+    const dirFileSet = new Set(filesRef.current)
+    for (let i = 2; i < dirSegs.length; i++) {
+      const ancestor = dirSegs.slice(0, i).join('/')
+      if (dirFileSet.has(ancestor)) {
+        await modal.alert(`A file named "${dirSegs[i - 1]}" already exists here — a file and a folder can't share a name.`, { title: 'Name taken' })
+        return
+      }
+    }
     const path = `${dir}/.keep`
     try {
       await storage.setText(path, '')
-      const next = [...filesRef.current, path].sort()
+      // Merge into the server's current index, not the stale in-memory list.
+      const fresh = await storage.getFresh('files-index.json')
+      const base = Array.isArray(fresh) ? fresh : filesRef.current
+      const next = [...new Set([...base, path])].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       refreshPending()
@@ -3724,7 +3759,11 @@ export default function App({ appId, token }) {
     if (!ok) return
     try {
       await storage.remove(path)
-      const next = filesRef.current.filter((p) => p !== path)
+      // Remove from the server's current index, not the stale in-memory list, so
+      // a concurrent mutation isn't clobbered by a whole-array PUT.
+      const fresh = await storage.getFresh('files-index.json')
+      const base = Array.isArray(fresh) ? fresh : filesRef.current
+      const next = base.filter((p) => p !== path)
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       // Drop the cached body so a future offline reload doesn't
@@ -3795,8 +3834,12 @@ export default function App({ appId, token }) {
       }
     }
     if (added.length) {
-      const next = [...new Set([...filesRef.current, ...added])].sort()
       try {
+        // Merge the uploaded paths into the server's current index, not the
+        // stale in-memory list, so a concurrent mutation isn't clobbered.
+        const fresh = await storage.getFresh('files-index.json')
+        const base = Array.isArray(fresh) ? fresh : filesRef.current
+        const next = [...new Set([...base, ...added])].sort()
         await storage.setJSON('files-index.json', next)
         setFiles(next)
       } catch (e) {
@@ -3853,7 +3896,11 @@ export default function App({ appId, token }) {
         if (p.startsWith(`${from}/`)) return to + p.slice(from.length)
         return p
       }
-      const next = [...new Set(filesRef.current.map(rewrite))].sort()
+      // Apply the rename to the server's current index, not the stale in-memory
+      // list, so a concurrent mutation isn't clobbered by a whole-array PUT.
+      const fresh = await storage.getFresh('files-index.json')
+      const base = Array.isArray(fresh) ? fresh : filesRef.current
+      const next = [...new Set(base.map(rewrite))].sort()
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       // Carry the cached body + selection + pdf mapping across the rename.
@@ -3935,7 +3982,11 @@ export default function App({ appId, token }) {
       }
       // Drop every index entry under the folder, plus the cache + selection.
       const under = (p) => p === folderPath || p.startsWith(`${folderPath}/`)
-      const next = filesRef.current.filter((p) => !under(p))
+      // Remove from the server's current index, not the stale in-memory list, so
+      // a concurrent mutation isn't clobbered by a whole-array PUT.
+      const fresh = await storage.getFresh('files-index.json')
+      const base = Array.isArray(fresh) ? fresh : filesRef.current
+      const next = base.filter((p) => !under(p))
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       setFileCache((prev) => {
@@ -4094,7 +4145,11 @@ export default function App({ appId, token }) {
     const timer = setTimeout(() => {
       if (selectedPathRef.current !== path) return
       setFileSaving(true)
-      storage.setText(path, body).then(() => {
+      // Publish the in-flight write so flushDirtyEdits can await it before a
+      // project switch/create resets the buffer — otherwise keystrokes typed
+      // during this 700ms-debounced write are lost (the flush would resolve
+      // against a stale snapshot).
+      const p = storage.setText(path, body).then(() => {
         if (selectedPathRef.current !== path) return
         setFileCache((prev) => ({ ...prev, [path]: body }))
         if (fileContentRef.current === body) setFileDirty(false)
@@ -4105,7 +4160,9 @@ export default function App({ appId, token }) {
         }
       }).finally(() => {
         if (selectedPathRef.current === path) setFileSaving(false)
+        if (savePromiseRef.current === p) savePromiseRef.current = null
       })
+      savePromiseRef.current = p
     }, SOURCE_AUTOSAVE_MS)
     return () => clearTimeout(timer)
   }, [
@@ -4142,20 +4199,25 @@ export default function App({ appId, token }) {
     return p
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
 
-  // Persist the editor's latest text before a reset (project switch/create)
-  // throws away the dirty buffer. The debounced autosave may have a write in
-  // flight when this fires; handleSaveFile no-ops while fileSaving is true, so
-  // we first wait for that in-flight write to settle, then call handleSaveFile
-  // — which writes fileContentRef.current/fileContent, i.e. the LATEST text,
-  // not the (possibly stale) snapshot the in-flight autosave was persisting.
+  // Persist the editor's LATEST text before a reset (project switch/create)
+  // throws away the dirty buffer. A debounced autosave may have a write in
+  // flight; BOTH it and handleSaveFile publish their write to savePromiseRef,
+  // so we await that, THEN write fileContentRef.current DIRECTLY. We do not
+  // route through handleSaveFile here: it no-ops while fileSaving and captures a
+  // possibly-stale fileContent closure, whereas the in-flight autosave only
+  // persisted its 700ms-old snapshot — anything typed since lives in
+  // fileContentRef.current and must be saved before resetFileUi wipes it.
   const flushDirtyEdits = useCallback(async () => {
-    if (!fileDirtyRef.current && !fileSavingRef.current) return
     if (!canEditSelected) return
-    // Await any in-flight autosave (so handleSaveFile won't early-return on it),
-    // then persist the latest editor text if it is still dirty.
-    if (savePromiseRef.current) await savePromiseRef.current
-    if (fileDirtyRef.current) await handleSaveFile()
-  }, [canEditSelected, handleSaveFile])
+    const path = selectedPathRef.current
+    if (!path || selectedIsBinary || isManagedJsonPath(path)) return
+    if (savePromiseRef.current) { try { await savePromiseRef.current } catch { /* error surfaced by the in-flight write */ } }
+    if (fileDirtyRef.current) {
+      await storage.setText(path, fileContentRef.current)
+      setFileCache((prev) => ({ ...prev, [path]: fileContentRef.current }))
+      setFileDirty(false)
+    }
+  }, [canEditSelected, selectedIsBinary, storage])
 
   const resetFileUi = useCallback(() => {
     clearBuildPoll()
@@ -5455,25 +5517,34 @@ const CSS = `
 }
 /* Discoverable "set as main document" affordance: a muted target icon on
    the right of every non-main .tex row, brightening on hover/focus. It's the
-   visible twin of the context-menu's "Set as main document" item. */
+   visible twin of the context-menu's "Set as main document" item. A real
+   <button> sibling of the row (next to the kebab), so it resets the UA button
+   chrome the same way .tree-menu-btn does. */
 .tree-set-main {
-  margin-left: auto;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 28px;
   height: 28px;
+  border: none;
   border-radius: 7px;
+  background: none;
   color: var(--muted);
   opacity: 0.65;
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 .tree-set-main:hover,
 .tree-set-main:focus-visible {
   color: var(--accent);
   opacity: 1;
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.tree-set-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .tree-file[draggable="true"] { cursor: grab; }
 /* Drop-target highlight while a drag hovers a folder or the root. */
