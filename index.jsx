@@ -5,7 +5,7 @@ import { EditorState, Compartment } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
 
-const APP_VERSION = '2.14.0'
+const APP_VERSION = '2.14.1'
 const DEFAULT_PROJECT_ID = 'default'
 const PROJECTS_KEY = 'projects.json'
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -1486,6 +1486,10 @@ function FileNode({
   // folder's own path ("files/sub").
   const dropMove = (e, destDir) => {
     e.preventDefault()
+    // The folder onDrop is a DOM descendant of the root container's onDrop, so a
+    // drop onto a folder would otherwise bubble up and run the root move too —
+    // targeting the already-moved source path and 404ing. Stop propagation here.
+    e.stopPropagation()
     setDropActive(false)
     const from = e.dataTransfer.getData('text/mobius-path')
     if (!from) return
@@ -2897,6 +2901,8 @@ export default function App({ appId, token }) {
   const fileContentRef = useRef(fileContent)
   const fileDirtyRef = useRef(fileDirty)
   const fileSavingRef = useRef(fileSaving)
+  // The in-flight autosave write, so flushDirtyEdits can AWAIT it (not poll a flag).
+  const savePromiseRef = useRef(null)
   useEffect(() => { fileContentRef.current = fileContent }, [fileContent])
   useEffect(() => { fileDirtyRef.current = fileDirty }, [fileDirty])
   useEffect(() => { fileSavingRef.current = fileSaving }, [fileSaving])
@@ -3623,7 +3629,7 @@ export default function App({ appId, token }) {
   const handleCreateFile = useCallback(async () => {
     if (!(await ensureIndexWritable())) return
     const name = await modal.prompt(
-      'Path under files/ — e.g. chapter1.tex or notes/draft.md',
+      'File path — e.g. chapter1.tex or notes/draft.md',
       { title: 'New file', placeholder: 'chapter1.tex' },
     )
     if (!name) return
@@ -3671,7 +3677,7 @@ export default function App({ appId, token }) {
     // placeholder .keep file inside the new folder — it shows in the
     // tree and ensures the path exists.
     const name = await modal.prompt(
-      'Folder name under files/ — e.g. chapter1 or notes/2026',
+      'Folder name — e.g. chapter1 or notes/2026',
       { title: 'New folder', placeholder: 'chapter1' },
     )
     if (!name) return
@@ -3680,7 +3686,20 @@ export default function App({ appId, token }) {
       await modal.alert('Use letters, digits, . - _ / only.', { title: 'Invalid name' })
       return
     }
-    const path = `files/${clean}/.keep`
+    const dir = `files/${clean}`
+    // A path can't be both a file and a folder. Mirror handleCreateFile's guard:
+    // if a file already uses this name, refuse instead of letting the backend
+    // reject the .keep write with an opaque error.
+    if (filesRef.current.includes(dir)) {
+      await modal.alert(`A file named "${clean.split('/').pop()}" already exists here — a file and a folder can't share a name.`, { title: 'Name taken' })
+      return
+    }
+    // If the folder already exists (its .keep, or any file under it), say so.
+    if (filesRef.current.some((p) => p === `${dir}/.keep` || p.startsWith(`${dir}/`))) {
+      await modal.alert(`A folder named "${clean.split('/').pop()}" already exists here.`, { title: 'Name taken' })
+      return
+    }
+    const path = `${dir}/.keep`
     try {
       await storage.setText(path, '')
       const next = [...filesRef.current, path].sort()
@@ -4101,20 +4120,42 @@ export default function App({ appId, token }) {
   const handleSaveFile = useCallback(async () => {
     // Managed .json paths are read-only in the editor — skip the text/plain
     // write that would corrupt them for typed-JSON readers.
-    if (!selectedPath || selectedIsBinary || isManagedJsonPath(selectedPath) || fileSaving) return
+    if (!selectedPath || selectedIsBinary || isManagedJsonPath(selectedPath) || fileSaving) {
+      return savePromiseRef.current
+    }
     setFileSaving(true)
     setFileError(null)
-    try {
-      await storage.setText(selectedPath, fileContent)
-      setFileDirty(false)
-      setFileCache((prev) => ({ ...prev, [selectedPath]: fileContent }))
-      refreshPending()
-    } catch (e) {
-      setFileError(e.message || 'Could not save file.')
-    } finally {
-      setFileSaving(false)
-    }
+    const p = (async () => {
+      try {
+        await storage.setText(selectedPath, fileContent)
+        setFileDirty(false)
+        setFileCache((prev) => ({ ...prev, [selectedPath]: fileContent }))
+        refreshPending()
+      } catch (e) {
+        setFileError(e.message || 'Could not save file.')
+      } finally {
+        setFileSaving(false)
+        savePromiseRef.current = null
+      }
+    })()
+    savePromiseRef.current = p
+    return p
   }, [selectedPath, selectedIsBinary, fileSaving, storage, fileContent, refreshPending])
+
+  // Persist the editor's latest text before a reset (project switch/create)
+  // throws away the dirty buffer. The debounced autosave may have a write in
+  // flight when this fires; handleSaveFile no-ops while fileSaving is true, so
+  // we first wait for that in-flight write to settle, then call handleSaveFile
+  // — which writes fileContentRef.current/fileContent, i.e. the LATEST text,
+  // not the (possibly stale) snapshot the in-flight autosave was persisting.
+  const flushDirtyEdits = useCallback(async () => {
+    if (!fileDirtyRef.current && !fileSavingRef.current) return
+    if (!canEditSelected) return
+    // Await any in-flight autosave (so handleSaveFile won't early-return on it),
+    // then persist the latest editor text if it is still dirty.
+    if (savePromiseRef.current) await savePromiseRef.current
+    if (fileDirtyRef.current) await handleSaveFile()
+  }, [canEditSelected, handleSaveFile])
 
   const resetFileUi = useCallback(() => {
     clearBuildPoll()
@@ -4141,14 +4182,17 @@ export default function App({ appId, token }) {
     setPreviewReloadKey((n) => n + 1)
   }, [clearBuildPoll])
 
-  const switchProject = useCallback((projectId) => {
+  const switchProject = useCallback(async (projectId) => {
     const next = projects.some((project) => project.id === projectId) ? projectId : DEFAULT_PROJECT_ID
     if (next === activeProjectId) return
+    // Flush dirty edits (awaiting any in-flight autosave) before resetFileUi
+    // discards the buffer — otherwise unsaved keystrokes are lost on switch.
+    await flushDirtyEdits()
     resetFileUi()
     writeActiveProject(appId, next)
     closeNav()
     setActiveProjectId(next)
-  }, [activeProjectId, appId, closeNav, projects, resetFileUi])
+  }, [activeProjectId, appId, closeNav, flushDirtyEdits, projects, resetFileUi])
 
   const saveProjects = useCallback(async (next) => {
     setProjects(next)
@@ -4189,6 +4233,10 @@ export default function App({ appId, token }) {
     const next = [...base, nextProject]
     try {
       await saveProjects(next)
+      // Flush dirty edits before changing activeProjectId — the project-change
+      // effect clears the editor buffer, so unsaved keystrokes would be lost.
+      // (handleNewProject sets activeProjectId directly, bypassing switchProject.)
+      await flushDirtyEdits()
       writeActiveProject(appId, id)
       setActiveProjectId(id)
       setRenamingId(id)
@@ -4196,7 +4244,7 @@ export default function App({ appId, token }) {
     } catch (e) {
       await modal.alert(e.message || String(e), { title: 'Could not create project' })
     }
-  }, [appId, modal, projects.length, readFreshProjects, saveProjects])
+  }, [appId, flushDirtyEdits, modal, projects.length, readFreshProjects, saveProjects])
 
   const commitRenameProject = useCallback(async (projectId, rawName) => {
     const clean = String(rawName || '').trim()
