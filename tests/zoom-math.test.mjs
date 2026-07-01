@@ -1,5 +1,5 @@
 // Unit tests for the PDF viewer's pure zoom helpers (clampScale, pinchScale,
-// anchoredZoomScroll). The helpers live in index.jsx inside the
+// anchoredZoomScroll). The helpers live in pdf/zoom.js inside the
 // `zoom-math:begin` / `zoom-math:end` fence as plain dependency-free JS, so
 // this test extracts that exact block and executes it directly — no esbuild
 // bundle, no react/pdfjs resolution needed (the whole-bundle import path is
@@ -17,10 +17,10 @@ const root = dirname(fileURLToPath(import.meta.url))
 const buildDir = join(root, '.build-zoom')
 
 async function loadZoomMath() {
-  const source = readFileSync(join(root, '..', 'index.jsx'), 'utf8')
+  const source = readFileSync(join(root, '..', 'pdf', 'zoom.js'), 'utf8')
   const begin = source.indexOf('/* zoom-math:begin')
   const end = source.indexOf('/* zoom-math:end */')
-  assert.ok(begin !== -1 && end > begin, 'zoom-math fence found in index.jsx')
+  assert.ok(begin !== -1 && end > begin, 'zoom-math fence found in pdf/zoom.js')
   const block = source.slice(begin, end)
   await rm(buildDir, { recursive: true, force: true })
   await mkdir(buildDir, { recursive: true })

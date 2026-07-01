@@ -203,7 +203,11 @@ test('path guards accept only safe paths inside files/', async () => {
 })
 
 test('file tree keeps an accessible composite keyboard contract', () => {
-  const source = readFileSync(join(root, '..', 'index.jsx'), 'utf8')
+  const source = [
+    readFileSync(join(root, '..', 'index.jsx'), 'utf8'),
+    readFileSync(join(root, '..', 'ui', 'FileNavPanel.jsx'), 'utf8'),
+    readFileSync(join(root, '..', 'ui', 'FileNode.jsx'), 'utf8'),
+  ].join('\n')
 
   assert.match(source, /role="tree"/)
   assert.match(source, /role="treeitem"/)

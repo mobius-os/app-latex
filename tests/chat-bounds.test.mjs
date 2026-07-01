@@ -1,5 +1,5 @@
 // Unit tests for the chat-pane resize bound (clampChatRatio). The helper lives
-// in index.jsx inside the `chat-bounds:begin` / `chat-bounds:end` fence as
+// in domain.js inside the `chat-bounds:begin` / `chat-bounds:end` fence as
 // plain dependency-free JS, so this test extracts that exact block and runs it
 // directly — no esbuild bundle, no react/pdfjs resolution (the whole-bundle
 // import path is what keeps path-guards' first test red in this environment).
@@ -16,10 +16,10 @@ const root = dirname(fileURLToPath(import.meta.url))
 const buildDir = join(root, '.build-chat-bounds')
 
 async function loadChatBounds() {
-  const source = readFileSync(join(root, '..', 'index.jsx'), 'utf8')
+  const source = readFileSync(join(root, '..', 'domain.js'), 'utf8')
   const begin = source.indexOf('/* chat-bounds:begin')
   const end = source.indexOf('/* chat-bounds:end */')
-  assert.ok(begin !== -1 && end > begin, 'chat-bounds fence found in index.jsx')
+  assert.ok(begin !== -1 && end > begin, 'chat-bounds fence found in domain.js')
   // Strip the `export` keyword so the extracted block runs as a plain module.
   const block = source.slice(begin, end).replace('export function', 'function')
     + '\nexport { clampChatRatio }\n'
