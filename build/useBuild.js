@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { BUILD_POLL_MS, BUILD_TIMEOUT_MS, DEFAULT_PROJECT_ID } from '../constants.js'
+import { BUILD_POLL_MS, BUILD_TIMEOUT_MS } from '../constants.js'
 
 // ----------------------------------------------------------------------
 // Build controller. Owns the source→PDF compile state machine and the
@@ -20,7 +20,7 @@ import { BUILD_POLL_MS, BUILD_TIMEOUT_MS, DEFAULT_PROJECT_ID } from '../constant
 // are never concurrent builds (the Build button is disabled while
 // building, and `build()` early-returns if already building).
 // ----------------------------------------------------------------------
-export function useBuild({ appId, token, storage, online, activeProjectId }) {
+export function useBuild({ appId, token, storage, online }) {
   const [buildStatus, setBuildStatus] = useState('idle') // idle|building|done|error
   const [buildLog, setBuildLog] = useState('')
   // Which .tex the current/last build is FOR. The hook tracks one build at a
@@ -175,10 +175,14 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
       await storage.setText('build/run-id.txt', runId)
       await storage.setText('build/target.txt', doc)
       // 2. Kick the server-side job. 202 = accepted; anything else is fatal.
-      const runJobUrl = activeProjectId === DEFAULT_PROJECT_ID
-        ? `/api/apps/${appId}/run-job?runId=${encodeURIComponent(runId)}`
-        : `/api/apps/${appId}/run-job?projectId=${encodeURIComponent(activeProjectId)}&runId=${encodeURIComponent(runId)}`
-      const r = await fetch(runJobUrl, {
+      // The platform's run-job handler binds no query params and passes build.sh
+      // only the app id, so a ?runId=/?projectId= here would be silently dropped.
+      // build.sh instead discovers its target from the per-run files written just
+      // above (build/runs/<runId>.target.txt), picks the project by the newest
+      // target it finds, serializes concurrent triggers, and claims each run once
+      // (see build.sh). We still poll our OWN build/runs/<runId>.json for this
+      // tab's verdict.
+      const r = await fetch(`/api/apps/${appId}/run-job`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       })
@@ -198,7 +202,7 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
       signalError((e && e.message) ? e.message : 'Build failed to start.', 'build-start')
       finishError((e && e.message) ? e.message : 'Build failed to start.')
     }
-  }, [activeProjectId, appId, token, storage, online, clearPoll, finishError, poll, signalError])
+  }, [appId, token, storage, online, clearPoll, finishError, poll, signalError])
 
   const rememberPdf = useCallback((doc, pdf) => {
     if (buildingRef.current) return

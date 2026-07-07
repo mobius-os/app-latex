@@ -206,7 +206,7 @@ export default function App({ appId, token }) {
   const [mainPath, setMainPath] = useState(null)
   const mainPathRef = useRef(null)
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
-  const build = useBuild({ appId, token, storage, online, activeProjectId })
+  const build = useBuild({ appId, token, storage, online })
   // Derived main-document state. Declared here, right after `build`, because
   // `onFilesMaybeChanged` (further down) reads `mainBuildError` in its dep
   // array; leaving these below that callback put the read in the temporal dead

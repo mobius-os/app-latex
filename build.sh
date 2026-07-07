@@ -1,9 +1,22 @@
 #!/bin/bash
 # On-demand LaTeX build, invoked by POST /api/apps/{id}/run-job (app_id is $1).
-# Reads the selected file from the active project's build/target.txt, compiles
-# it with tectonic, and writes the verdict to that same project's
-# build/status.json. A stray scheduled run with no target is a harmless no-op
-# (writes an error status the app ignores).
+#
+# The platform's run-job handler spawns this script with ONLY the app id — it
+# binds no query params, so no run id or project id reaches us (a client's
+# ?runId=/?projectId= on the POST is silently dropped by FastAPI). We therefore
+# discover WHAT to build from the app's own storage: the UI writes
+# build/runs/<id>.target.txt (and build/target.txt) immediately before POSTing,
+# and each browser tab polls build/runs/<id>.json for its own verdict.
+#
+# Because every POST spawns a separate build.sh with no run id, two tabs building
+# in the same project close together spawn two subprocesses that would otherwise
+# scan the same pending runs and invoke tectonic concurrently against the SAME
+# per-project tectonic-cache and files/*.pdf. Two coordination steps prevent
+# that: (1) an exclusive per-project lock serializes the whole compile so only
+# one build.sh touches this project's cache/output at a time, and (2) an atomic
+# per-run claim marker means each pending target is compiled exactly once. A trap
+# writes a verdict for any run this process claimed but couldn't finish, so a
+# polling tab never waits on a run that will never get an answer.
 set -uo pipefail
 APP_ID="${1:-}"
 BASE_STORAGE_DIR="/data/apps/${APP_ID}"
@@ -39,28 +52,14 @@ if [ -z "$PROJECT_ID" ]; then
   fi
 fi
 mkdir -p "$STORAGE_DIR/build/runs" "$STORAGE_DIR/tectonic-cache"
+RUNS_DIR="$STORAGE_DIR/build/runs"
+
 sanitize_run_id() {
   case "$1" in
     *[!A-Za-z0-9_-]* | "" ) printf '%s\n' "legacy" ;;
     * ) printf '%s\n' "$1" ;;
   esac
 }
-REQUESTED_RUN_ID="${MOBIUS_BUILD_RUN_ID:-${APP_BUILD_RUN_ID:-${3:-}}}"
-RUN_IDS=()
-if [ -n "$REQUESTED_RUN_ID" ]; then
-  RUN_IDS+=("$(sanitize_run_id "$REQUESTED_RUN_ID")")
-else
-  for target_file in "$STORAGE_DIR"/build/runs/*.target.txt; do
-    [ -f "$target_file" ] || continue
-    run_id="$(basename "$target_file" .target.txt)"
-    run_id="$(sanitize_run_id "$run_id")"
-    [ -f "$STORAGE_DIR/build/runs/${run_id}.json" ] && continue
-    RUN_IDS+=("$run_id")
-  done
-  if [ "${#RUN_IDS[@]}" -eq 0 ]; then
-    RUN_IDS+=("$(sanitize_run_id "$(cat "$STORAGE_DIR/build/run-id.txt" 2>/dev/null || echo legacy)")")
-  fi
-fi
 
 write_status() {  # $1=run_id $2=target $3=status $4=pdf(or empty) $5=log
   # Echo the target this verdict was built FROM ($TARGET, set below). target.txt
@@ -119,6 +118,101 @@ compile_one() {
   fi
 }
 
+# Serialize builds for THIS project. Hold an exclusive lock for the whole
+# compile so only one build.sh runs tectonic against this project's shared cache
+# and files/*.pdf at a time. Prefer flock; fall back to an atomic mkdir lock with
+# a stale-age escape when flock is unavailable so a build.sh that died holding it
+# can't wedge the project forever.
+LOCK_FILE="$STORAGE_DIR/build/.compile.lock"
+LOCK_DIR="$STORAGE_DIR/build/.compile.lock.d"
+USING_MKDIR_LOCK=0
+acquire_lock() {
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE" || return 1
+    # Wait for a sibling build to finish, then hold the lock for the whole
+    # compile; fd 9 closes (releasing it) when this process exits. The wait bound
+    # exceeds the app's 120s poll timeout, so a wedged holder degrades to the
+    # tab's own timeout rather than a hang.
+    flock -w 180 9 || return 1
+    return 0
+  fi
+  local waited=0 age
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    age=$(( $(date +%s) - $(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge 300 ]; then rm -rf "$LOCK_DIR" 2>/dev/null; continue; fi
+    [ "$waited" -ge 180 ] && return 1
+    sleep 1; waited=$((waited + 1))
+  done
+  USING_MKDIR_LOCK=1
+  return 0
+}
+
+CLAIMED_RUNS=()
+# Guarantee a verdict for every run we CLAIMED, even if we're killed mid-compile,
+# so a polling tab never waits out its full timeout on a run that never gets an
+# answer. Runs we already finished have a .json and are skipped. Also releases
+# the mkdir lock if we used that fallback (flock releases itself on exit).
+finalize() {
+  local r target
+  for r in "${CLAIMED_RUNS[@]:-}"; do
+    [ -n "$r" ] || continue
+    [ -e "$RUNS_DIR/${r}.json" ] && continue
+    target="$(cat "$RUNS_DIR/${r}.target.txt" 2>/dev/null || cat "$STORAGE_DIR/build/target.txt" 2>/dev/null || echo "")"
+    write_status "$r" "$target" error "" "Build was interrupted. Try again."
+  done
+  [ "$USING_MKDIR_LOCK" = 1 ] && rm -rf "$LOCK_DIR" 2>/dev/null
+}
+# EXIT covers normal/`exit` paths; route the termination signals through `exit`
+# so a killed build.sh (e.g. earlyoom SIGTERM) still runs finalize and leaves a
+# verdict instead of orphaning the run. SIGKILL can't be trapped — that case is
+# recovered by the next trigger's stale-claim reclaim in claim_run.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap finalize EXIT
+
+# Atomically claim a pending run so a double-trigger compiles each target exactly
+# once. Returns 0 if we now own the run, 1 to skip it. We hold the project lock,
+# so a claim marker WITHOUT a verdict was left by a build.sh that has since died;
+# clear it and take the claim ourselves rather than orphaning the run.
+claim_run() {
+  local run_id="$1"
+  [ -e "$RUNS_DIR/${run_id}.json" ] && return 1
+  if ! mkdir "$RUNS_DIR/${run_id}.claimed" 2>/dev/null; then
+    [ -e "$RUNS_DIR/${run_id}.json" ] && return 1
+    rm -rf "$RUNS_DIR/${run_id}.claimed" 2>/dev/null
+    mkdir "$RUNS_DIR/${run_id}.claimed" 2>/dev/null || return 1
+  fi
+  CLAIMED_RUNS+=("$run_id")
+  return 0
+}
+
+if ! acquire_lock; then
+  # A sibling build held the project lock past our wait (or it's wedged). Exit
+  # cleanly: our target is still pending, and the sibling — or the user's next
+  # build — compiles it, while the polling tab bounds itself with its own
+  # timeout. We claimed nothing, so finalize writes no verdict.
+  exit 0
+fi
+
+# Discover pending runs from the per-run target files the UI wrote before POSTing
+# run-job. Compile every currently-pending target under the lock, so whichever
+# build.sh runs last still clears anything an earlier one missed.
+RUN_IDS=()
+for target_file in "$RUNS_DIR"/*.target.txt; do
+  [ -f "$target_file" ] || continue
+  run_id="$(basename "$target_file" .target.txt)"
+  RUN_IDS+=("$(sanitize_run_id "$run_id")")
+done
+if [ "${#RUN_IDS[@]}" -eq 0 ]; then
+  # Legacy state: an older client wrote build/target.txt without a per-run target
+  # file. Recompile that single latest target under run id "legacy"; clear any
+  # stale legacy verdict/claim first so a repeat build isn't skipped.
+  rm -rf "$RUNS_DIR/legacy.json" "$RUNS_DIR/legacy.claimed" 2>/dev/null
+  RUN_IDS+=("legacy")
+fi
+
 for run_id in "${RUN_IDS[@]}"; do
+  claim_run "$run_id" || continue
   compile_one "$run_id"
 done
