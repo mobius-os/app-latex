@@ -7,19 +7,23 @@ import {
   FILE_CONTENT_CACHE_LIMIT,
   PROJECT_ID_RE,
 } from './constants.js'
-import { cleanIndexPaths, normalizeFileCacheSnapshot, projectPrefix } from './domain.js'
+import {
+  cleanIndexPaths,
+  isUserJsonProjectPath,
+  normalizeFileCacheSnapshot,
+  projectPrefix,
+} from './domain.js'
 
 
 export function makeStorage(appId, token) {
   const ms = (typeof window !== 'undefined' && window.mobius && window.mobius.storage) || null
   const hasRuntime = !!ms
   async function get(path) {
-    // Read with the TYPED getter matching how the path was written: .json
-    // paths hold JSON (get); everything else (.tex, build/target.txt) is raw
-    // text (getText). Mixing them throws assertReadKind in the runtime, so the
-    // read kind MUST mirror the write kind (setText/setJSON below).
+    // Read with the TYPED getter matching how the path was written: app-owned
+    // .json paths hold JSON (get); project files under files/ are user assets
+    // and stay raw text even when named config.json.
     if (ms) {
-      const isJson = path.endsWith('.json')
+      const isJson = path.endsWith('.json') && !isUserJsonProjectPath(path)
       if (isJson && typeof ms.get === 'function') return ms.get(path)
       if (!isJson && typeof ms.getText === 'function') return ms.getText(path)
     }

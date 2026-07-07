@@ -33,15 +33,21 @@ export function isTextProjectPath(path) {
     && !isBinaryProjectPath(path)
 }
 
-// `.json` paths under the project (files-index.json, main.json, chat_id.json,
-// and any .json the user makes) are MANAGED files: every other reader loads
-// them with the typed JSON getter, which throws assertReadKind if they were
-// written as text/plain. The text editor's debounced autosave writes
-// text/plain, so editing a .json as source would corrupt it for every other
-// reader. We make .json paths read-only in the editor instead — shown as
-// source, but never autosaved back as text.
+// App-owned JSON records (files-index.json, main.json, chat_id.json,
+// projects.json, build status) use the typed JSON storage getter. User project
+// files live under files/ and are editable text even when their extension is
+// .json, because LaTeX projects commonly include JSON config assets.
 export function isManagedJsonPath(path) {
-  return String(path || '').toLowerCase().endsWith('.json')
+  const value = String(path || '').toLowerCase()
+  return value.endsWith('.json') && !isSafeStoragePath(value)
+}
+
+export function isUserJsonProjectPath(path) {
+  const value = String(path || '').toLowerCase()
+  if (!value.endsWith('.json')) return false
+  if (isSafeStoragePath(value)) return true
+  const match = value.match(/^projects\/([^/]+)\/(files\/.+)$/)
+  return !!(match && PROJECT_ID_RE.test(match[1]) && isSafeStoragePath(match[2]))
 }
 
 export function pdfPathForTexDoc(path) {

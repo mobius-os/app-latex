@@ -26,6 +26,7 @@ import {
 import { CSS } from './theme.js'
 import {
   clampChatRatio,
+  cleanIndexPaths,
   extensionFor,
   isBinaryProjectPath,
   isManagedJsonPath,
@@ -69,6 +70,8 @@ import { BuildingIndicator } from './ui/BuildingIndicator.jsx'
 export {
   isSafeRelPath,
   isSafeStoragePath,
+  isManagedJsonPath,
+  isUserJsonProjectPath,
   normalizeFileCacheSnapshot,
   pdfFromBuildStatusForDoc,
   pdfPathForTexDoc,
@@ -1416,7 +1419,7 @@ export default function App({ appId, token }) {
   ])
 
   const handleSaveFile = useCallback(async () => {
-    // Managed .json paths are read-only in the editor — skip the text/plain
+    // App-owned JSON records are read-only in the editor — skip the text/plain
     // write that would corrupt them for typed-JSON readers.
     if (!selectedPath || selectedIsBinary || isManagedJsonPath(selectedPath) || fileSaving) {
       return savePromiseRef.current
@@ -1703,19 +1706,19 @@ export default function App({ appId, token }) {
     return renderEditor()
   }
 
-  // The editable source for the open text file (or a read-only view of a
-  // managed .json). Extracted so the desktop split can place it beside the PDF.
+  // The editable source for the open text file (or a read-only view of an
+  // app-owned JSON record). Extracted so the desktop split can place it beside the PDF.
   function renderEditor() {
     if (fileLoading) return <div className="preview-note">Loading source…</div>
     if (fileError) return <div className="preview-note">{fileError}</div>
-    // Managed .json files (files-index.json, main.json, chat_id.json, etc.) are
-    // shown read-only: editing them as text/plain here would corrupt them for
-    // every typed-JSON reader, so we don't autosave them. Surface that.
+    // App-owned JSON records are shown read-only: editing them as text/plain
+    // here would corrupt them for every typed-JSON reader, so we don't autosave
+    // them. User files such as files/config.json do not hit this branch.
     if (isManagedJsonPath(selectedPath)) {
       return (
         <div className="editor-readonly">
           <div className="readonly-note">
-            Managed file — edit via the app, not the source.
+            App metadata — edit via the app, not the source.
           </div>
           <CodeEditor
             value={fileContent}

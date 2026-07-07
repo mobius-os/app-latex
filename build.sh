@@ -38,56 +38,87 @@ if [ -z "$PROJECT_ID" ]; then
     STORAGE_DIR="$(dirname "$(dirname "$newest")")"
   fi
 fi
-mkdir -p "$STORAGE_DIR/build" "$STORAGE_DIR/tectonic-cache"
-TARGET="$(cat "$STORAGE_DIR/build/target.txt" 2>/dev/null || echo "")"
-write_status() {  # $1=status $2=pdf(or empty) $3=log
+mkdir -p "$STORAGE_DIR/build/runs" "$STORAGE_DIR/tectonic-cache"
+sanitize_run_id() {
+  case "$1" in
+    *[!A-Za-z0-9_-]* | "" ) printf '%s\n' "legacy" ;;
+    * ) printf '%s\n' "$1" ;;
+  esac
+}
+REQUESTED_RUN_ID="${MOBIUS_BUILD_RUN_ID:-${APP_BUILD_RUN_ID:-${3:-}}}"
+RUN_IDS=()
+if [ -n "$REQUESTED_RUN_ID" ]; then
+  RUN_IDS+=("$(sanitize_run_id "$REQUESTED_RUN_ID")")
+else
+  for target_file in "$STORAGE_DIR"/build/runs/*.target.txt; do
+    [ -f "$target_file" ] || continue
+    run_id="$(basename "$target_file" .target.txt)"
+    run_id="$(sanitize_run_id "$run_id")"
+    [ -f "$STORAGE_DIR/build/runs/${run_id}.json" ] && continue
+    RUN_IDS+=("$run_id")
+  done
+  if [ "${#RUN_IDS[@]}" -eq 0 ]; then
+    RUN_IDS+=("$(sanitize_run_id "$(cat "$STORAGE_DIR/build/run-id.txt" 2>/dev/null || echo legacy)")")
+  fi
+fi
+
+write_status() {  # $1=run_id $2=target $3=status $4=pdf(or empty) $5=log
   # Echo the target this verdict was built FROM ($TARGET, set below). target.txt
   # + status.json are a single shared pair per app, so the app-side poller uses
   # this to ignore a verdict produced by a concurrent build of a DIFFERENT doc
   # (another tab/device) instead of mapping its PDF onto the wrong source.
-  python3 - "$1" "$2" "$3" "$TARGET" "$STORAGE_DIR/build/status.json" <<'PY'
+  python3 - "$3" "$4" "$5" "$2" "$1" "$STORAGE_DIR/build/runs/${1}.json" "$STORAGE_DIR/build/status.json" <<'PY'
 import json, sys, datetime
-status, pdf, log, target, out = sys.argv[1:6]
-json.dump({
+status, pdf, log, target, run_id, run_out, latest_out = sys.argv[1:8]
+payload = {
   "status": status,
   "pdf": pdf or None,
   "log": log,
   "target": target or None,
+  "run_id": run_id or None,
   "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-}, open(out, "w"))
+}
+for out in (run_out, latest_out):
+    json.dump(payload, open(out, "w"))
 PY
 }
-if [ -z "$TARGET" ]; then
-  write_status error "" "No build target set."
-  exit 0
-fi
-TEX="${TARGET#files/}"
-# target.txt is app-written but treated as untrusted: reject parent-dir
-# traversal, absolute paths, and a leading dash (which tectonic would read as a
-# flag — argv smuggling), and require a .tex. Subdirectories (files/sub/x.tex)
-# stay valid. The `--` below ends option parsing as belt-and-suspenders.
-case "$TEX" in
-  -* | */-* | *..* | /*) write_status error "" "invalid build target"; exit 0 ;;
-esac
-case "$TEX" in
-  *.tex) : ;;
-  *) write_status error "" "build target must be a .tex file"; exit 0 ;;
-esac
-STEM="${TEX%.tex}"
-# Empty-source guard. A file that was never written, truncated, or contains only
-# whitespace makes tectonic fail with a raw "no input" error that the app
-# surfaces as an opaque "can't preview". Catch it here and write a friendly
-# status BEFORE invoking tectonic. The path checks above already guarantee $TEX
-# is traversal-free, so resolving it under files/ is safe.
-SRC="$STORAGE_DIR/files/$TEX"
-if [ ! -s "$SRC" ] || ! grep -q '[^[:space:]]' "$SRC" 2>/dev/null; then
-  write_status error "" "Nothing to compile — this file is empty."
-  exit 0
-fi
-LOG="$(cd "$STORAGE_DIR/files" && TECTONIC_CACHE_DIR="$STORAGE_DIR/tectonic-cache" \
-  tectonic --keep-logs --outfmt=pdf -- "$TEX" 2>&1)"
-if [ $? -eq 0 ]; then
-  write_status done "files/${STEM}.pdf" "$LOG"
-else
-  write_status error "" "$LOG"
-fi
+
+compile_one() {
+  local run_id="$1"
+  local target tex stem src log
+  target="$(cat "$STORAGE_DIR/build/runs/${run_id}.target.txt" 2>/dev/null || cat "$STORAGE_DIR/build/target.txt" 2>/dev/null || echo "")"
+  if [ -z "$target" ]; then
+    write_status "$run_id" "$target" error "" "No build target set."
+    return 0
+  fi
+  tex="${target#files/}"
+  # target.txt is app-written but treated as untrusted: reject parent-dir
+  # traversal, absolute paths, and a leading dash (which tectonic would read as
+  # a flag — argv smuggling), and require a .tex. Subdirectories stay valid.
+  case "$tex" in
+    -* | */-* | *..* | /*) write_status "$run_id" "$target" error "" "invalid build target"; return 0 ;;
+  esac
+  case "$tex" in
+    *.tex) : ;;
+    *) write_status "$run_id" "$target" error "" "build target must be a .tex file"; return 0 ;;
+  esac
+  stem="${tex%.tex}"
+  # Empty-source guard. A file that was never written, truncated, or contains
+  # only whitespace makes tectonic fail with a raw "no input" error.
+  src="$STORAGE_DIR/files/$tex"
+  if [ ! -s "$src" ] || ! grep -q '[^[:space:]]' "$src" 2>/dev/null; then
+    write_status "$run_id" "$target" error "" "Nothing to compile — this file is empty."
+    return 0
+  fi
+  log="$(cd "$STORAGE_DIR/files" && TECTONIC_CACHE_DIR="$STORAGE_DIR/tectonic-cache" \
+    tectonic --keep-logs --outfmt=pdf -- "$tex" 2>&1)"
+  if [ $? -eq 0 ]; then
+    write_status "$run_id" "$target" done "files/${stem}.pdf" "$log"
+  else
+    write_status "$run_id" "$target" error "" "$log"
+  fi
+}
+
+for run_id in "${RUN_IDS[@]}"; do
+  compile_one "$run_id"
+done

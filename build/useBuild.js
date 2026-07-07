@@ -12,9 +12,9 @@ import { BUILD_POLL_MS, BUILD_TIMEOUT_MS, DEFAULT_PROJECT_ID } from '../constant
 //                   → error  (status.json says {status:'error', log} OR
 //                             run-job refused OR the 120s cap elapsed)
 //
-// status.json 404s the entire time the build is running (the script only
-// writes it at the end), so a 404 during polling is "still building", not
-// a failure. We cap at BUILD_TIMEOUT_MS so a wedged/never-finishing build
+// build/runs/<id>.json 404s while the build is running (the script only writes
+// it at the end), so a 404 during polling is "still building", not a failure.
+// We cap at BUILD_TIMEOUT_MS so a wedged/never-finishing build
 // doesn't poll forever. Exactly one poll timer exists at a time: starting
 // a build clears any prior timer first, and unmount clears it too — there
 // are never concurrent builds (the Build button is disabled while
@@ -44,6 +44,10 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
   // a rapid double-click on the dirty-file path (build() is deferred behind an
   // async save); this ref flips before any await and is the real guard.
   const buildingRef = useRef(false)
+
+  const signalError = useCallback((message, source = 'build-start') => {
+    try { window.mobius?.signal?.('error', { message, source }) } catch {}
+  }, [])
 
   const clearPoll = useCallback(() => {
     buildGenerationRef.current += 1
@@ -104,7 +108,7 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
   // One poll tick: read build/status.json. 404/null → still building (or the
   // cap elapsed → error). A verdict object → done/error. onDone is called
   // with the built pdf path so the caller can flip the viewer + register it.
-  const poll = useCallback(async (doc, onDone, generation) => {
+  const poll = useCallback(async (doc, runId, onDone, generation) => {
     if (generation !== buildGenerationRef.current) return
     if (Date.now() > deadlineRef.current) {
       finishError('Build timed out (over 2 minutes). The first build downloads '
@@ -113,7 +117,7 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
     }
     let status = null
     try {
-      status = await storage.get('build/status.json')
+      status = await storage.get(`build/runs/${runId}.json`)
     } catch (e) {
       // Transient read failure — keep polling; the deadline still bounds us.
       status = null
@@ -127,7 +131,7 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
       // ours — otherwise we'd map a sibling's PDF onto this doc. (Verdicts
       // predating the `target` field have none and are accepted as before.)
       if (status.target && status.target !== doc) {
-        pollRef.current = setTimeout(() => poll(doc, onDone, generation), BUILD_POLL_MS)
+        pollRef.current = setTimeout(() => poll(doc, runId, onDone, generation), BUILD_POLL_MS)
         return
       }
       if (status.status === 'done') {
@@ -139,7 +143,7 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
       return
     }
     // Not ready yet (404 → null). Schedule the next tick.
-    pollRef.current = setTimeout(() => poll(doc, onDone, generation), BUILD_POLL_MS)
+    pollRef.current = setTimeout(() => poll(doc, runId, onDone, generation), BUILD_POLL_MS)
   }, [storage, finishDone, finishError])
 
   // Kick a build for `doc` (a "files/<name>.tex" path). onDone fires once the
@@ -158,23 +162,22 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
     clearPoll()
     buildingRef.current = true
     const generation = buildGenerationRef.current
+    const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
     setBuildDoc(doc)
     setBuildStatus('building')
     setBuildLog('')
     try {
-      // 0. Clear any verdict from a PRIOR build. The script only writes
-      // status.json when tectonic finishes, so between run-job and that
-      // write the OLD status.json still exists — the first poll would read
-      // last build's done/error and finish instantly with stale results.
-      // Removing it first means a poll sees 404 (still building) until the
-      // new run lands a fresh verdict. A 404 on the remove is fine.
-      await storage.remove('build/status.json')
-      // 1. Tell the build script which file to compile.
+      // 0. Clear any verdict for this run id. build/status.json remains a
+      // latest-build convenience only; this poller watches the run path.
+      await storage.remove(`build/runs/${runId}.json`)
+      // 1. Tell the build script which run/file to compile.
+      await storage.setText(`build/runs/${runId}.target.txt`, doc)
+      await storage.setText('build/run-id.txt', runId)
       await storage.setText('build/target.txt', doc)
       // 2. Kick the server-side job. 202 = accepted; anything else is fatal.
       const runJobUrl = activeProjectId === DEFAULT_PROJECT_ID
-        ? `/api/apps/${appId}/run-job`
-        : `/api/apps/${appId}/run-job?projectId=${encodeURIComponent(activeProjectId)}`
+        ? `/api/apps/${appId}/run-job?runId=${encodeURIComponent(runId)}`
+        : `/api/apps/${appId}/run-job?projectId=${encodeURIComponent(activeProjectId)}&runId=${encodeURIComponent(runId)}`
       const r = await fetch(runJobUrl, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
@@ -185,15 +188,17 @@ export function useBuild({ appId, token, storage, online, activeProjectId }) {
         finishError(
           `Could not start the build (server returned ${r.status}${detail ? `: ${detail}` : ''}).`,
         )
+        signalError(`run-job returned ${r.status}`, 'build-start')
         return
       }
-      // 3. Poll status.json until the script writes its verdict.
+      // 3. Poll this run's status until the script writes its verdict.
       deadlineRef.current = Date.now() + BUILD_TIMEOUT_MS
-      pollRef.current = setTimeout(() => poll(doc, onDone, generation), BUILD_POLL_MS)
+      pollRef.current = setTimeout(() => poll(doc, runId, onDone, generation), BUILD_POLL_MS)
     } catch (e) {
+      signalError((e && e.message) ? e.message : 'Build failed to start.', 'build-start')
       finishError((e && e.message) ? e.message : 'Build failed to start.')
     }
-  }, [activeProjectId, appId, token, storage, online, clearPoll, finishError, poll])
+  }, [activeProjectId, appId, token, storage, online, clearPoll, finishError, poll, signalError])
 
   const rememberPdf = useCallback((doc, pdf) => {
     if (buildingRef.current) return
