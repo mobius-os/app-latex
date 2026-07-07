@@ -212,6 +212,24 @@ test('path guards accept only safe paths inside files/', async () => {
   )
 })
 
+test('buildErrorKind classifies by the app\'s own message prefixes, not open substrings', async () => {
+  const { buildErrorKind } = await bundle()
+
+  // The app's own generated failure messages map to their kind.
+  assert.equal(buildErrorKind('You are offline. Building needs a connection — reconnect and try again.'), 'offline')
+  assert.equal(buildErrorKind('Build timed out (over 2 minutes). The first build downloads packages.'), 'timeout')
+  assert.equal(buildErrorKind('Could not start the build (server returned 500).'), 'start')
+  assert.equal(buildErrorKind('Build failed to start.'), 'start')
+  assert.equal(buildErrorKind('Nothing to compile — this file is empty.'), 'empty')
+
+  // A genuine compile failure whose raw log happens to contain "empty"/"offline"
+  // must stay 'compile' — this is the misclassification the anchoring fixes.
+  assert.equal(buildErrorKind('! Undefined control sequence.\n\\usepackage{emptypage}'), 'compile')
+  assert.equal(buildErrorKind('! LaTeX Error: File `offline.sty\' not found.'), 'compile')
+  assert.equal(buildErrorKind(''), 'compile')
+  assert.equal(buildErrorKind(null), 'compile')
+})
+
 test('file tree keeps an accessible composite keyboard contract', () => {
   const source = [
     readFileSync(join(root, '..', 'index.jsx'), 'utf8'),

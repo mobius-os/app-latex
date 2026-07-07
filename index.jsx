@@ -82,12 +82,19 @@ function signal(name, payload = {}) {
   try { window.mobius?.signal?.(name, payload) } catch {}
 }
 
-function buildErrorKind(log) {
-  const text = String(log || '').toLowerCase()
-  if (text.includes('timed out')) return 'timeout'
-  if (text.includes('offline')) return 'offline'
-  if (text.includes('could not start') || text.includes('server returned')) return 'start'
-  if (text.includes('nothing to compile') || text.includes('empty')) return 'empty'
+export function buildErrorKind(log) {
+  // Classify a FAILED build for the Reflection signal. buildLog is either one of
+  // the app's OWN generated messages (offline / could-not-start / timeout /
+  // empty-source) or, for a genuine compile failure, the raw tectonic output.
+  // Anchor on the app's own message PREFIXES instead of open substrings: a real
+  // compiler log can legitimately contain the words "offline" or "empty" (a
+  // package name, a bib entry), and an open `includes('empty')` would then
+  // mislabel a real compile error. Anything we don't recognize is 'compile'.
+  const text = String(log || '').trim().toLowerCase()
+  if (text.startsWith('build timed out')) return 'timeout'
+  if (text.startsWith('you are offline')) return 'offline'
+  if (text.startsWith('could not start the build') || text.startsWith('build failed to start')) return 'start'
+  if (text.startsWith('nothing to compile')) return 'empty'
   return 'compile'
 }
 
