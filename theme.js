@@ -13,9 +13,9 @@ export const CSS = `
   flex-direction: column;
   height: 100%;
   width: 100%;
-  background: var(--bg, #111614);
-  color: var(--text, #eef7f1);
-  font-family: var(--font, Inter, ui-sans-serif, system-ui, sans-serif);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   text-rendering: geometricPrecision;
@@ -65,16 +65,12 @@ export const CSS = `
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  outline: none;
   -webkit-tap-highlight-color: transparent;
   -webkit-user-select: none;
   user-select: none;
   transition: background 0.14s ease, color 0.14s ease, transform 0.08s ease;
 }
-/* Brand drawer-toggle feedback: neutral wash on hover/focus. Keep the focus outline suppressed here
-   because the rounded background is the intentional toggle affordance. */
-.nav-toggle:focus,
-.nav-toggle:focus-visible { outline: none; }
+/* Brand drawer-toggle feedback: neutral wash on hover/focus. */
 @media (hover: hover) {
   .nav-toggle:hover {
     background: var(--surface2, var(--bg-alt, var(--surface)));
@@ -97,7 +93,7 @@ export const CSS = `
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: var(--accent, var(--text));
+  background: var(--accent);
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
@@ -187,7 +183,7 @@ export const CSS = `
   align-items: center;
   justify-content: center;
   border: none;
-  border-radius: 7px;
+  border-radius: 8px;
   background: transparent;
   color: var(--muted);
   cursor: pointer;
@@ -281,7 +277,7 @@ export const CSS = `
   margin-top: 12px;
   min-height: 44px;
   padding: 8px 18px;
-  border-radius: 6px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
@@ -378,10 +374,10 @@ export const CSS = `
   gap: 2px;
 }
 .pdf-ctl-btn {
-  min-height: 40px;
-  min-width: 40px;
+  min-height: 44px;
+  min-width: 44px;
   padding: 4px 10px;
-  border-radius: 7px;
+  border-radius: 8px;
   border: none;
   background: none;
   color: var(--text);
@@ -517,15 +513,15 @@ export const CSS = `
 }
 .project-rename-input {
   max-width: 170px;
-  min-height: 36px;
-  padding: 6px 9px;
+  min-height: 44px;
+  padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg);
   color: var(--text);
-  font: 650 12px/1.2 var(--font);
-  outline: none;
+  font: 650 16px/1.2 var(--font);
 }
+.project-rename-input:focus:not(:focus-visible) { outline: none; }
 .project-rename-input:focus {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
@@ -594,7 +590,7 @@ export const CSS = `
   flex: 1 1 0;
   min-height: 44px;
   padding: 7px 10px;
-  border-radius: 6px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
@@ -609,8 +605,8 @@ export const CSS = `
 .drawer-btn:disabled { opacity: 0.45; cursor: default; }
 .icon-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 36px; height: 36px; padding: 0;
-  border-radius: 7px; border: 1px solid transparent;
+  width: 44px; height: 44px; min-height: 44px; padding: 0;
+  border-radius: 8px; border: 1px solid transparent;
   background: transparent; color: var(--muted);
   cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
 }
@@ -690,7 +686,7 @@ export const CSS = `
 	   the actions — Delete in particular — are reachable without a long-press. */
 	.tree-menu-btn {
 	  flex: 0 0 auto;
-	  width: 40px;
+	  width: 44px;
 	  min-height: 44px;
 	  display: inline-flex;
 	  align-items: center;
@@ -787,10 +783,11 @@ export const CSS = `
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
   border: none;
-  border-radius: 7px;
+  border-radius: 8px;
   background: none;
   color: var(--muted);
   opacity: 0.65;
@@ -1016,9 +1013,9 @@ export const CSS = `
 }
 .error-chip-fix {
   flex: 0 0 auto;
-  min-height: 28px;
+  min-height: 44px;
   padding: 3px 10px;
-  border-radius: 5px;
+  border-radius: 8px;
   border: none;
   background: var(--accent);
   color: var(--accent-fg);
@@ -1030,9 +1027,10 @@ export const CSS = `
 .error-chip-fix:active { filter: brightness(0.9); }
 .error-chip-dismiss {
   flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
-  border-radius: 5px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
+  border-radius: 8px;
   border: none;
   background: none;
   color: var(--muted);

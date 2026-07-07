@@ -1,11 +1,8 @@
 // ----------------------------------------------------------------------
-// Sync pill. Three observable states, in priority order:
-//   pending > 0 + offline  → "Offline · N pending"
-//   pending > 0 + online   → "Saving · N pending"
-//   offline + pending == 0 → "Offline"
-//   online + pending == 0  → null (idle steady state — don't clutter
-//                            the surface with a persistent "Saved"
-//                            sticker).
+// Sync pill. Observable states:
+//   offline → "Offline"
+//   online  → null (idle steady state — don't clutter the surface with a
+//                  persistent "Saved" sticker or transient pending count).
 // hasRuntime=false (older shell without the offline runtime) means
 // writes go straight to the server with no outbox to surface; we
 // hide the pill in that mode rather than fabricate a queue depth.

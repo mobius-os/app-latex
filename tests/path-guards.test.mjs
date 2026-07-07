@@ -43,7 +43,7 @@ async function bundle() {
   // Faithfully mirror the install compiler: externalize EXACTLY the canonical
   // RUNTIME_LIBS (backend/app/runtime_libs.py). esbuild then leaves those bare
   // imports unresolved in the bundle instead of choking on a missing package.
-  await execFileAsync('/home/hmzmrzx/projects/mobius/frontend/node_modules/.bin/esbuild', [
+  await execFileAsync(process.env.ESBUILD_BIN || 'esbuild', [
     join(root, '..', 'index.jsx'),
     '--bundle',
     '--format=esm',
@@ -114,6 +114,8 @@ test('path guards accept only safe paths inside files/', async () => {
   const {
     isSafeRelPath,
     isSafeStoragePath,
+    isManagedJsonPath,
+    isUserJsonProjectPath,
     normalizeFileCacheSnapshot,
     pdfFromBuildStatusForDoc,
     pdfPathForTexDoc,
@@ -135,6 +137,14 @@ test('path guards accept only safe paths inside files/', async () => {
   assert.equal(isSafeStoragePath('build/status.json'), false)
   assert.equal(isSafeStoragePath('files/../secret.tex'), false)
   assert.equal(isSafeStoragePath('files/notes/../../secret.tex'), false)
+
+  assert.equal(isManagedJsonPath('files-index.json'), true)
+  assert.equal(isManagedJsonPath('main.json'), true)
+  assert.equal(isManagedJsonPath('build/status.json'), true)
+  assert.equal(isManagedJsonPath('files/config.json'), false)
+  assert.equal(isUserJsonProjectPath('files/config.json'), true)
+  assert.equal(isUserJsonProjectPath('projects/draft/files/config.json'), true)
+  assert.equal(isUserJsonProjectPath('main.json'), false)
 
   const snapshot = normalizeFileCacheSnapshot({
     index: [
