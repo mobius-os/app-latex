@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { DEFAULT_PROJECT_ID } from '../constants.js'
 import { projectPrefix } from '../domain.js'
 
+function signal(name, payload = {}) {
+  try { window.mobius?.signal?.(name, payload) } catch {}
+}
+
 // ----------------------------------------------------------------------
 // Embedded shell chat. The runtime mounts the real ChatView into an
 // iframe, so this app does not duplicate SSE handling, composer state,
@@ -81,15 +85,22 @@ export function ChatPanel({
         return fn ? fn() : null
       },
       onTurnDone: () => { if (onFilesRef.current) onFilesRef.current() },
-      onError: ({ error: e }) => { setError(typeof e === 'string' ? e : 'Embedded chat reported an error.') },
+      onError: ({ error: e }) => {
+        const message = typeof e === 'string' ? e : 'Embedded chat reported an error.'
+        signal('error', { message, source: 'chat' })
+        setError(message)
+      },
     }).then((nextHandle) => {
       if (disposed) {
         nextHandle.destroy()
         return
       }
       handle = nextHandle
+      signal('chat_opened', {})
     }).catch((e) => {
-      if (!disposed) setError(e.message || 'Could not mount embedded chat.')
+      const message = e.message || 'Could not mount embedded chat.'
+      signal('error', { message, source: 'chat-mount' })
+      if (!disposed) setError(message)
     })
 
     return () => {

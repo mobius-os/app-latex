@@ -14,7 +14,6 @@
 // persistence wiring, and mounts the source/PDF/file/chat UI.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  APP_VERSION,
   CHAT_PANE_MIN_PX,
   DEFAULT_PROJECT_ID,
   FILE_CONTENT_CACHE_LIMIT,
@@ -78,6 +77,19 @@ export {
 } from './domain.js'
 export { ZOOM_MAX, ZOOM_MIN, anchoredZoomScroll, clampScale, pinchScale } from './pdf/zoom.js'
 export { clampChatRatio, parseBuildErrorChips } from './domain.js'
+
+function signal(name, payload = {}) {
+  try { window.mobius?.signal?.(name, payload) } catch {}
+}
+
+function buildErrorKind(log) {
+  const text = String(log || '').toLowerCase()
+  if (text.includes('timed out')) return 'timeout'
+  if (text.includes('offline')) return 'offline'
+  if (text.includes('could not start') || text.includes('server returned')) return 'start'
+  if (text.includes('nothing to compile') || text.includes('empty')) return 'empty'
+  return 'compile'
+}
 
 // ----------------------------------------------------------------------
 // Top-level app.
@@ -191,6 +203,7 @@ export default function App({ appId, token }) {
   const clearBuildPoll = build.clearPoll
   const seenBuildStatusRef = useRef('')
   const signalReadySentRef = useRef(false)
+  const buildStartedAtRef = useRef(0)
   // Bumped on signals that the open file's bytes may have changed underneath us
   // (a chat turn finished — the agent likely rewrote files — or the window
   // regained focus after another device edited them). Binary previews
@@ -830,7 +843,11 @@ export default function App({ appId, token }) {
     // so nudge it to re-fetch fresh bytes — the agent may have regenerated a
     // figure or the compiled PDF at the same path during this turn.
     if (online) bumpPreviewReload()
-  }, [syncProjectFromStorage, storage, online, bumpPreviewReload])
+    signal('agent_turn_applied', {
+      file_count: filesRef.current.filter((p) => !p.endsWith('/.keep')).length,
+      build_error: Boolean(mainBuildError),
+    })
+  }, [syncProjectFromStorage, storage, online, bumpPreviewReload, mainBuildError])
 
   // Gate every UI write to files-index.json. Until we've confirmed the
   // index against the server (indexLoaded), `files` may be a stale or
@@ -926,9 +943,9 @@ export default function App({ appId, token }) {
       setSelectedPath(path)
       closeNav()
       refreshPending()
-      try { if (window.mobius?.signal) window.mobius.signal('item_created', { type: 'tex-file' }) } catch (sigErr) {}
+      signal('item_created', { type: 'file' })
     } catch (e) {
-      try { if (window.mobius?.signal) window.mobius.signal('error', { message: e.message || String(e), source: 'create-file' }) } catch (sigErr) {}
+      signal('error', { message: e.message || String(e), source: 'create-file' })
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
   }, [storage, modal, closeNav, refreshPending, ensureIndexWritable])
@@ -985,7 +1002,9 @@ export default function App({ appId, token }) {
       await storage.setJSON('files-index.json', next)
       setFiles(next)
       refreshPending()
+      signal('item_created', { type: 'folder' })
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'create-folder' })
       await modal.alert(e.message || String(e), { title: 'Could not create folder' })
     }
   }, [storage, modal, refreshPending, ensureIndexWritable])
@@ -1027,7 +1046,9 @@ export default function App({ appId, token }) {
         setSelectedPath(nextReal || null)
       }
       refreshPending()
+      signal('item_deleted', { type: 'file' })
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'delete-file' })
       await modal.alert(e.message || String(e), { title: 'Could not delete' })
     }
   }, [selectedPath, storage, modal, refreshPending, ensureIndexWritable, build])
@@ -1045,6 +1066,8 @@ export default function App({ appId, token }) {
     if (items.length === 0) return
     const added = []
     const failed = []
+    let textCount = 0
+    let binaryCount = 0
     for (const f of items) {
       // Folder picker preserves the relative path; file picker gives just a
       // name. Normalise leading slashes and validate against the server's
@@ -1066,11 +1089,13 @@ export default function App({ appId, token }) {
           const text = await f.text()
           await storage.setText(path, text)
           setFileCache((prev) => ({ ...prev, [path]: text }))
+          textCount += 1
         } else {
           // Non-text: PUT the raw blob. We deliberately don't cache the body
           // (binary previews fetch on demand) — same policy as the existing
           // image/pdf path.
           await storage.setBlob(path, f, { contentType: f.type || 'application/octet-stream' })
+          binaryCount += 1
         }
         added.push(path)
       } catch (e) {
@@ -1087,10 +1112,12 @@ export default function App({ appId, token }) {
         await storage.setJSON('files-index.json', next)
         setFiles(next)
       } catch (e) {
+        signal('error', { message: e.message || String(e), source: 'upload-index' })
         await modal.alert(e.message || String(e), { title: 'Upload saved but index update failed' })
       }
       refreshPending()
     }
+    signal('file_uploaded', { count: added.length, text_count: textCount, binary_count: binaryCount })
     if (failed.length) {
       await modal.alert(
         `Couldn't upload ${failed.length} item(s): ${failed.slice(0, 6).join(', ')}`
@@ -1170,6 +1197,7 @@ export default function App({ appId, token }) {
       }
       refreshPending()
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'move-path' })
       await modal.alert(e.message || String(e), { title: 'Move failed' })
     }
   }, [appId, token, storage, modal, refreshPending, ensureIndexWritable, build])
@@ -1246,7 +1274,9 @@ export default function App({ appId, token }) {
       // folder (forgetDoc only matched a single exact key).
       build.forgetUnder(folderPath)
       refreshPending()
+      signal('item_deleted', { type: 'folder' })
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'delete-folder' })
       await modal.alert(e.message || String(e), { title: 'Delete failed' })
     }
   }, [appId, token, storage, modal, refreshPending, ensureIndexWritable, build])
@@ -1319,7 +1349,7 @@ export default function App({ appId, token }) {
     signalReadySentRef.current = true
     try {
       if (window.mobius?.signal) {
-        window.mobius.signal('app_ready', { item_count: files.length, version: APP_VERSION })
+        window.mobius.signal('app_ready', { item_count: files.length })
       }
     } catch (e) {}
   }, [indexLoaded, files.length])
@@ -1330,13 +1360,15 @@ export default function App({ appId, token }) {
     const prev = prevBuildStatusRef.current
     const cur = build.buildStatus
     prevBuildStatusRef.current = cur
-    if (!window.mobius?.signal) return
     if (prev === 'building' && cur === 'done') {
-      try { window.mobius.signal('build_succeeded', { doc: build.buildDoc || undefined }) } catch (e) {}
+      signal('build_succeeded', { duration_ms: Math.max(0, Date.now() - buildStartedAtRef.current) })
     } else if (prev === 'building' && cur === 'error') {
-      try { window.mobius.signal('build_failed', { doc: build.buildDoc || undefined }) } catch (e) {}
+      signal('build_failed', {
+        duration_ms: Math.max(0, Date.now() - buildStartedAtRef.current),
+        error_kind: buildErrorKind(build.buildLog),
+      })
     }
-  }, [build.buildStatus, build.buildDoc])
+  }, [build.buildStatus, build.buildLog])
   // ── /Signals ─────────────────────────────────────────────────────────────
 
   // Reset the viewer to source whenever the user switches files, so opening a
@@ -1380,9 +1412,8 @@ export default function App({ appId, token }) {
   }, [selectedPath])
 
   useEffect(() => {
-    // Never autosave a managed .json path as text/plain — that corrupts it for
-    // every typed-JSON reader (see isManagedJsonPath). Such paths are read-only
-    // in the editor.
+    // Never autosave an app-owned JSON record as text/plain — that corrupts it
+    // for typed-JSON readers. User project files under files/ remain editable.
     if (!selectedPath || selectedIsBinary || isManagedJsonPath(selectedPath) || !fileDirty) return undefined
     const path = selectedPath
     const body = fileContent
@@ -1539,6 +1570,8 @@ export default function App({ appId, token }) {
     const next = [...base, nextProject]
     try {
       await saveProjects(next)
+      signal('item_created', { type: 'project' })
+      signal('project_created', { project_count: next.length })
       // Flush dirty edits before changing activeProjectId — the project-change
       // effect clears the editor buffer, so unsaved keystrokes would be lost.
       // (handleNewProject sets activeProjectId directly, bypassing switchProject.)
@@ -1548,6 +1581,7 @@ export default function App({ appId, token }) {
       setRenamingId(id)
       openNavRef.current?.()
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'create-project' })
       await modal.alert(e.message || String(e), { title: 'Could not create project' })
     }
   }, [appId, flushDirtyEdits, modal, projects.length, readFreshProjects, saveProjects])
@@ -1561,6 +1595,7 @@ export default function App({ appId, token }) {
       const next = fresh.map((p) => (p.id === projectId ? { ...p, name: clean } : p))
       await saveProjects(next)
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'rename-project' })
       await modal.alert(e.message || String(e), { title: 'Could not rename project' })
     } finally {
       setRenamingId(null)
@@ -1601,7 +1636,9 @@ export default function App({ appId, token }) {
         writeActiveProject(appId, fallback)
         setActiveProjectId(fallback)
       }
+      signal('item_deleted', { type: 'project' })
     } catch (e) {
+      signal('error', { message: e.message || String(e), source: 'delete-project' })
       await modal.alert(e.message || String(e), { title: 'Could not delete project' })
     }
   }, [activeProjectId, appId, deleteProjectTree, modal, readFreshProjects, resetFileUi, saveProjects])
@@ -1616,13 +1653,20 @@ export default function App({ appId, token }) {
     // user just edited). handleSaveFile resolves once the write lands (or
     // fails silently into fileError); we build either way so a flaky save
     // doesn't strand the button.
-    const kick = () => build.build(mainPath, onBuildDone)
+    const kick = () => {
+      buildStartedAtRef.current = Date.now()
+      signal('build_started', {
+        file_count: filesRef.current.filter((p) => !p.endsWith('/.keep')).length,
+        has_cached_pdf: Boolean(pdfForMain),
+      })
+      build.build(mainPath, onBuildDone)
+    }
     if (fileDirty && !fileSaving && canEditSelected) {
       handleSaveFile().then(kick, kick)
     } else {
       kick()
     }
-  }, [mainPath, fileDirty, fileSaving, canEditSelected, build, onBuildDone, handleSaveFile])
+  }, [mainPath, fileDirty, fileSaving, canEditSelected, build, onBuildDone, handleSaveFile, pdfForMain])
 
   // The PDF view: the build target's compiled output (with the build's
   // running / failed states), since Build always compiles the target file.
