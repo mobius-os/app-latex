@@ -9,3 +9,4 @@ node_modules/
 tests/.build/
 tests/.build-zoom/
 tests/.build-chat-bounds/
+tests/.build-render/

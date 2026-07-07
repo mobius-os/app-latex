@@ -200,6 +200,25 @@ export default function App({ appId, token }) {
   const mainPathRef = useRef(null)
   useEffect(() => { mainPathRef.current = mainPath }, [mainPath])
   const build = useBuild({ appId, token, storage, online, activeProjectId })
+  // Derived main-document state. Declared here, right after `build`, because
+  // `onFilesMaybeChanged` (further down) reads `mainBuildError` in its dep
+  // array; leaving these below that callback put the read in the temporal dead
+  // zone and threw on the first render. They only depend on `mainPath` (state,
+  // above) and `build.*` (just declared), so this is their earliest valid home.
+  //
+  // Whether there is a compilable main document. The [Source | PDF] toggle
+  // and the Build button are meaningful exactly when one exists — Build
+  // always compiles the MAIN file and the PDF view shows its output, so both
+  // controls track the main doc, not the currently-open file (Overleaf model).
+  const hasMain = !!mainPath
+  // The PDF compiled from the MAIN document this session, if any: a
+  // { pdf, ver } record (ver is the build token, see useBuild). The PDF view
+  // is gated on this so a never-built doc can't show a blank canvas.
+  const pdfForMain = (mainPath && build.pdfByDoc[mainPath]) || null
+  // Is the main doc currently building / did its last build fail? (build is
+  // single-flight in the hook, keyed by buildDoc.)
+  const mainBuilding = build.buildStatus === 'building' && build.buildDoc === mainPath
+  const mainBuildError = build.buildStatus === 'error' && build.buildDoc === mainPath
   const clearBuildPoll = build.clearPoll
   const seenBuildStatusRef = useRef('')
   const signalReadySentRef = useRef(false)
@@ -1285,19 +1304,6 @@ export default function App({ appId, token }) {
   const selectedIsBinary = selectedPath ? isBinaryProjectPath(selectedPath) : false
   const canEditSelected = !!selectedPath && !selectedIsBinary && !fileLoading && !fileError
   const selectedIsTex = selectedExt === 'tex'
-  // Whether there is a compilable main document. The [Source | PDF] toggle
-  // and the Build button are meaningful exactly when one exists — Build
-  // always compiles the MAIN file and the PDF view shows its output, so both
-  // controls track the main doc, not the currently-open file (Overleaf model).
-  const hasMain = !!mainPath
-  // The PDF compiled from the MAIN document this session, if any: a
-  // { pdf, ver } record (ver is the build token, see useBuild). The PDF view
-  // is gated on this so a never-built doc can't show a blank canvas.
-  const pdfForMain = (mainPath && build.pdfByDoc[mainPath]) || null
-  // Is the main doc currently building / did its last build fail? (build is
-  // single-flight in the hook, keyed by buildDoc.)
-  const mainBuilding = build.buildStatus === 'building' && build.buildDoc === mainPath
-  const mainBuildError = build.buildStatus === 'error' && build.buildDoc === mainPath
 
   // Dismissible error chips: parsed from buildLog '! ' lines when build failed.
   const [dismissedChips, setDismissedChips] = useState([])
