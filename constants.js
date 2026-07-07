@@ -1,4 +1,4 @@
-export const APP_VERSION = '2.14.3'
+export const APP_VERSION = '2.14.4'
 export const DEFAULT_PROJECT_ID = 'default'
 export const PROJECTS_KEY = 'projects.json'
 export const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
