@@ -13,13 +13,29 @@ export const CSS = `
   flex-direction: column;
   height: 100%;
   width: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font);
+  max-width: 100%;
+  background: var(--bg, #0d0d0d);
+  color: var(--text, #ececec);
+  font-family: var(--font, Inter, ui-sans-serif, system-ui, sans-serif);
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
   text-rendering: geometricPrecision;
+  overscroll-behavior: contain;
 }
+/* /mobius-ui:Root */
+
+/* mobius-ui:Scrollskin v2 — keep in sync; hidden by default, content stays scrollable. */
+.latex-root :where(.build-log, .pdf-viewer, .project-menu, .drawer-tree, .cm-scroller) {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.latex-root :where(.build-log, .pdf-viewer, .project-menu, .drawer-tree, .cm-scroller)::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+/* /mobius-ui:Scrollskin */
 
 /* mobius-ui:Toolbar v1 — keep in sync with app-webstudio (ws- prefixed) */
 /* Two-zone bar: a left zone (drawer toggle + filename) that flexes +
@@ -68,22 +84,34 @@ export const CSS = `
   -webkit-tap-highlight-color: transparent;
   -webkit-user-select: none;
   user-select: none;
+  touch-action: manipulation;
   transition: background 0.14s ease, color 0.14s ease, transform 0.08s ease;
 }
 /* Brand drawer-toggle feedback: neutral wash on hover/focus. */
+.nav-toggle:focus:not(:focus-visible) { outline: none; }
 @media (hover: hover) {
   .nav-toggle:hover {
     background: var(--surface2, var(--bg-alt, var(--surface)));
   }
 }
 .nav-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
   background: var(--surface2, var(--bg-alt, var(--surface)));
+}
+.nav-toggle:active {
+  background: var(--surface2, var(--bg-alt, var(--surface)));
+  transform: scale(0.94);
+}
+.nav-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  background: var(--accent-dim, color-mix(in srgb, var(--accent) 12%, transparent));
 }
 /* The real app icon as the brand mark inside the drawer toggle. */
 .latex-brand-icon {
   width: 34px;
   height: 34px;
-  border-radius: 6px;
+  border-radius: 8px;
   object-fit: cover;
   flex-shrink: 0;
   display: block;
@@ -346,10 +374,7 @@ export const CSS = `
   touch-action: pan-x pan-y;
   overscroll-behavior: contain;
   position: relative;
-  /* Classic (non-overlay) scrollbars shrink clientWidth after the first
-     paint, so fit-width computed pre-scrollbar overflows ~15px. Reserving
-     the gutter keeps clientWidth stable from the start. */
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
 }
 /* Control bar — a SOLID row that sits BELOW the scroller as its own flex
    line, so it never covers the PDF (owner feedback #5). It's outside the
@@ -538,7 +563,7 @@ export const CSS = `
   border: 1px solid var(--border-light, var(--border));
   border-radius: 12px;
   background: var(--bg);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.32);
 }
 .project-list {
   display: flex;
@@ -581,8 +606,7 @@ export const CSS = `
 .files-label {
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
+  letter-spacing: 0;
   color: var(--muted);
 }
 .files-actions { display: flex; gap: 2px; }
@@ -610,10 +634,12 @@ export const CSS = `
   background: transparent; color: var(--muted);
   cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation;
 }
-.icon-btn:hover { background: var(--surface2, var(--surface)); color: var(--text); }
+@media (hover: hover) {
+  .icon-btn:hover { background: var(--surface2, var(--surface)); color: var(--text); }
+  .icon-btn--danger:hover { color: var(--danger, #f87171); }
+}
 .icon-btn:active:not(:disabled) { background: var(--surface3, var(--surface2)); transform: scale(0.94); }
 .icon-btn:disabled { opacity: 0.3; cursor: default; }
-.icon-btn--danger:hover { color: var(--danger, #f87171); }
 .project-row {
   display: flex; align-items: center; gap: 4px;
   padding: 7px 8px 7px 10px;
@@ -705,9 +731,11 @@ export const CSS = `
 	.tree-menu-btn:focus-visible { opacity: 1; }
 	/* Hover is a NEUTRAL grey wash (same family as the press), not an accent
 	   tint — accent is reserved for the open state below. */
-	.tree-menu-btn:hover {
-	  color: var(--text);
-	  background: var(--surface);
+	@media (hover: hover) {
+	  .tree-menu-btn:hover {
+	    color: var(--text);
+	    background: var(--surface);
+	  }
 	}
 	/* Pressed — NEUTRAL feedback. The press must not re-assert the open-state
 	   accent; it acknowledges the tap with a grey wash + scale (touch has no
@@ -738,8 +766,10 @@ export const CSS = `
 	/* Hover is a NEUTRAL surface wash — same as the shell drawer's
 	   .drawer__item:hover (var(--surface)). Accent is reserved for the
 	   selected/active row, not for hover. */
-	.tree-file:hover, .tree-folder:hover {
-	  background: var(--surface);
+	@media (hover: hover) {
+	  .tree-file:hover, .tree-folder:hover {
+	    background: var(--surface);
+	  }
 	}
 	/* Keyboard focus ring — matches the shell drawer's .drawer__item
 	   :focus-visible (2px accent outline, 2px offset). Replaces the old
@@ -795,11 +825,17 @@ export const CSS = `
   -webkit-tap-highlight-color: transparent;
   touch-action: manipulation;
 }
-.tree-set-main:hover,
 .tree-set-main:focus-visible {
   color: var(--accent);
   opacity: 1;
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+@media (hover: hover) {
+  .tree-set-main:hover {
+    color: var(--accent);
+    opacity: 1;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
 }
 .tree-set-main:focus-visible {
   outline: 2px solid var(--accent);
@@ -834,7 +870,7 @@ export const CSS = `
      (12px) over a hairline --border-light edge. */
   border: 1px solid var(--border-light);
   border-radius: 12px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.32);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1042,7 +1078,7 @@ export const CSS = `
   justify-content: center;
   -webkit-tap-highlight-color: transparent;
 }
-.error-chip-dismiss:hover { color: var(--text); }
+@media (hover: hover) { .error-chip-dismiss:hover { color: var(--text); } }
 .error-chip-dismiss:active { background: var(--surface2, var(--surface)); }
 
 /* mobius-ui:Sheet v1 */
@@ -1062,7 +1098,7 @@ export const CSS = `
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.28);
   width: 100%;
   max-width: 360px;
   padding: 18px 20px;
