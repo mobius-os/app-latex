@@ -11,6 +11,10 @@ import {
 } from '../pdf/zoom.js'
 import { ToolIcon } from './ToolIcon.jsx'
 
+function signal(name, payload = {}) {
+  try { window.mobius?.signal?.(name, payload) } catch {}
+}
+
 // PDF preview — a real pdf.js canvas render. Mobile browsers refuse to
 // render a blob-URL PDF inline in an <iframe> (they offer an "open
 // externally" button instead), so we fetch the bytes ourselves and
@@ -364,6 +368,9 @@ export function PdfPreview({ storage, path, version, appId, token, storagePrefix
   const canDownload = !!(appId && token && path)
   const onDownload = useCallback(() => {
     if (!canDownload) return
+    // The 'user got a usable PDF out' success signal. Fire-and-forget, no path
+    // in the payload (a filename can carry document content — keep it PII-free).
+    signal('pdf_downloaded')
     // Segment-encode the path so a filename containing #, ?, spaces, etc.
     // survives the URL: encode each segment but keep the '/' separators (the
     // storage route is a {path:path} matcher). encodeURIComponent on the whole
