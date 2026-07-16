@@ -1924,6 +1924,7 @@ export default function App({ appId, token }) {
   return (
     <div className="latex-root">
       <style>{CSS}</style>
+      <h1 className="latex-sr-only">LaTeX</h1>
       {/* Two-zone top bar: left = drawer toggle + open filename, right =
           source/PDF segmented toggle + Build (+ sync pill) + chat toggle on the
           far right. The grid is 1fr auto so the filename grows and the controls

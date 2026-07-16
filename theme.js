@@ -203,10 +203,8 @@ export const CSS = `
 }
 .seg-btn {
   width: 44px;
-  /* ~40px inside the 2px-padded wrapper; the wrapper's own height keeps the
-     overall control ~44px so the touch target stays compliant. */
-  height: 40px;
-  min-height: 40px;
+  height: 44px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -505,7 +503,7 @@ export const CSS = `
 }
 .project-trigger {
   max-width: 170px;
-  min-height: 36px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -516,6 +514,10 @@ export const CSS = `
   color: var(--text);
   font: 650 12px/1.2 var(--font);
   cursor: pointer;
+}
+.latex-sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
 }
 .project-trigger svg {
   flex: 0 0 auto;
@@ -572,7 +574,7 @@ export const CSS = `
 }
 .project-item {
   width: 100%;
-  min-height: 40px;
+  min-height: 44px;
   padding: 7px 9px;
   border: none;
   border-radius: 8px;
