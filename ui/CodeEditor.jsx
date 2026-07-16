@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react'
 import { EditorState, Compartment } from '@codemirror/state'
-import { EditorView, keymap } from '@codemirror/view'
+import { Decoration, EditorView, ViewPlugin, keymap } from '@codemirror/view'
 import { history, historyKeymap, defaultKeymap, indentWithTab } from '@codemirror/commands'
+import { sourceKind, sourceTokens } from '../source-syntax.js'
 
 // CodeMirror plain-source editor — a parallel copy of the Editor app's
 // non-markdown editor (app-editor/index.jsx), so the .tex source editor and
@@ -20,11 +21,38 @@ const cmThemePlain = EditorView.theme({
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)', borderLeftWidth: '2px' },
   '.cm-selectionBackground': { backgroundColor: 'color-mix(in srgb, var(--accent) 22%, transparent)' },
   '&.cm-focused .cm-selectionBackground': { backgroundColor: 'color-mix(in srgb, var(--accent) 30%, transparent)' },
+  '.cm-syn-comment': { color: 'var(--code-comment)', fontStyle: 'italic' },
+  '.cm-syn-string': { color: 'var(--code-string)' },
+  '.cm-syn-keyword, .cm-syn-command': { color: 'var(--code-keyword)', fontWeight: '650' },
+  '.cm-syn-literal': { color: 'var(--code-literal)' },
+  '.cm-syn-number': { color: 'var(--code-number)' },
+  '.cm-syn-tag': { color: 'var(--code-tag)' },
 })
 
-function buildPlainExtensions(onDocChange) {
+function sourceHighlight(path) {
+  if (!sourceKind(path)) return []
+  return ViewPlugin.fromClass(class {
+    constructor(view) { this.decorations = this.build(view) }
+    update(update) {
+      if (update.docChanged || update.viewportChanged) this.decorations = this.build(update.view)
+    }
+    build(view) {
+      const marks = []
+      for (const { from, to } of view.visibleRanges) {
+        const text = view.state.sliceDoc(from, to)
+        for (const token of sourceTokens(path, text)) {
+          marks.push(Decoration.mark({ class: token.className }).range(from + token.from, from + token.to))
+        }
+      }
+      return Decoration.set(marks, true)
+    }
+  }, { decorations: (plugin) => plugin.decorations })
+}
+
+function buildPlainExtensions(onDocChange, path) {
   return [
     history(),
+    sourceHighlight(path),
     EditorView.lineWrapping,
     keymap.of([indentWithTab, ...historyKeymap, ...defaultKeymap]),
     cmThemePlain,
@@ -68,7 +96,7 @@ export function CodeEditor({ value, markdown: isMd, readOnly, docKey, onChange }
       lastEmitted.current = text
       if (onChangeRef.current) onChangeRef.current(text)
     }
-    const base = buildPlainExtensions(emit)
+    const base = buildPlainExtensions(emit, docKey)
     const extensions = [
       ...base,
       roCompartment.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]),

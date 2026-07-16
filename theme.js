@@ -17,6 +17,12 @@ export const CSS = `
   background: var(--bg, #0d0d0d);
   color: var(--text, #ececec);
   font-family: var(--font, Inter, ui-sans-serif, system-ui, sans-serif);
+  --code-comment: var(--muted);
+  --code-string: color-mix(in srgb, #42a85d 76%, var(--text));
+  --code-keyword: color-mix(in srgb, var(--accent) 74%, var(--text));
+  --code-literal: color-mix(in srgb, #1598bc 78%, var(--text));
+  --code-number: color-mix(in srgb, #d77a24 78%, var(--text));
+  --code-tag: color-mix(in srgb, #d94e63 76%, var(--text));
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
