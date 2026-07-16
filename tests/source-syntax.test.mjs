@@ -14,3 +14,9 @@ test('recognises LaTeX source and highlights commands, math, comments, and numbe
 test('leaves unknown files unstyled', () => {
   assert.deepEqual(sourceTokens('files/image.bin', 'const value = 2'), [])
 })
+
+test('digit-leading css hex colors are not number tokens, units still are', () => {
+  const tokens = sourceTokens('style.css', '.a { color: #1598bc; width: 12px; }')
+  const numbers = tokens.filter((t) => t.className === 'cm-syn-number')
+  assert.deepEqual(numbers.map((t) => t.from), [28])
+})
