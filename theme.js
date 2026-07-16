@@ -162,8 +162,8 @@ export const CSS = `
   touch-action: manipulation;
 }
 .toolbar-btn--primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-hover, var(--accent));
+  border-color: var(--accent-hover, var(--accent));
   color: var(--accent-fg);
 }
 .toolbar-btn:disabled {
@@ -1055,7 +1055,7 @@ export const CSS = `
   padding: 3px 10px;
   border-radius: 8px;
   border: none;
-  background: var(--accent);
+  background: var(--accent-hover, var(--accent));
   color: var(--accent-fg);
   font-size: 11px;
   font-weight: 700;
@@ -1155,9 +1155,9 @@ export const CSS = `
 }
 .modal-btn:active { filter: brightness(0.92); }
 .modal-btn--primary {
-  background: var(--accent);
+  background: var(--accent-hover, var(--accent));
   color: var(--accent-fg);
-  border-color: var(--accent);
+  border-color: var(--accent-hover, var(--accent));
 }
 .modal-btn--danger {
   background: var(--danger);

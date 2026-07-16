@@ -237,7 +237,7 @@ test('file tree keeps an accessible composite keyboard contract', () => {
     readFileSync(join(root, '..', 'ui', 'FileNode.jsx'), 'utf8'),
   ].join('\n')
 
-  assert.match(source, /role="tree"/)
+  assert.match(source, /role=\{files\.length \? 'tree' : undefined\}/)
   assert.match(source, /role="treeitem"/)
   assert.match(source, /role="group"/)
   assert.match(source, /tabIndex=\{0\}/)

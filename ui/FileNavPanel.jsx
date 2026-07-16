@@ -233,6 +233,7 @@ export function FileNavPanel({
         className={`file-drawer ${shown ? 'file-drawer--open' : ''} ${pinned ? 'file-drawer--pinned' : ''}`}
         aria-label="File tree"
         aria-hidden={!shown}
+        inert={!shown ? true : undefined}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
@@ -302,9 +303,9 @@ export function FileNavPanel({
         <div
           ref={treeRef}
           className="drawer-tree"
-          role="tree"
-          aria-label="Project files"
-          tabIndex={0}
+          role={files.length ? 'tree' : undefined}
+          aria-label={files.length ? 'Project files' : undefined}
+          tabIndex={files.length ? 0 : undefined}
           onFocus={handleTreeFocus}
           onKeyDown={handleTreeKeyDown}
         >
