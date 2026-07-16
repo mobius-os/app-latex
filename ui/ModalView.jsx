@@ -95,6 +95,8 @@ export function ModalView({ state }) {
               ref={inputRef}
               className="modal-input"
               type="text"
+              aria-label={state.title}
+              name="modal_response"
               value={value}
               onChange={(e) => setValue(e.target.value)}
               placeholder={state.placeholder}
