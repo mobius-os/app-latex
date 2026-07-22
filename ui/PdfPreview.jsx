@@ -9,6 +9,7 @@ import {
   clampScale,
   pinchScale,
 } from '../pdf/zoom.js'
+import { configurePdfJsWorker } from '../pdf/worker.js'
 import { ToolIcon } from './ToolIcon.jsx'
 
 function signal(name, payload = {}) {
@@ -183,8 +184,10 @@ export function PdfPreview({ storage, path, version, appId, token, storagePrefix
     }
     ;(async () => {
       try {
-        const pdfjs = await import('pdfjs-dist')
-        pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
+        const pdfjs = configurePdfJsWorker(
+          await import('pdfjs-dist'),
+          window.location.href,
+        )
         let blob
         try {
           // getBlobFresh re-reads from the server (cache:'no-store') so a
