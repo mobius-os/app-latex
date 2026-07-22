@@ -14,6 +14,7 @@
     "storage.js",
     "source-syntax.js",
     "pdf/zoom.js",
+    "pdf/worker.js",
     "build/useBuild.js",
     "ui/CodeEditor.jsx",
     "ui/ImagePreview.jsx",
