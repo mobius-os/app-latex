@@ -30,10 +30,10 @@ export function FileNavPanel({
   renamingId, onCommitProjectRename, onCancelProjectRename,
   pinned = false,
 }) {
-  // On desktop (>=860px) the panel is a persistent left rail, never an overlay:
-  // it's always visible, the scrim/focus-trap/focus-return don't apply, and
-  // swipe-to-close is a no-op.
-  const shown = open || pinned
+  // On desktop (>=860px) the panel is a docked rail while open. It still obeys
+  // the same logo toggle as the overlay drawer, so `open` — not `pinned` — is
+  // the single source of truth for visibility and accessibility.
+  const shown = open
   const root = useMemo(() => buildTree(files), [files])
   const treeRef = useRef(null)
   const drawerRef = useRef(null)
@@ -55,9 +55,9 @@ export function FileNavPanel({
   }, [])
 
   const onTouchStart = useCallback((e) => {
-    if (!open || e.touches.length !== 1) return
+    if (pinned || !open || e.touches.length !== 1) return
     dragStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }
-  }, [open])
+  }, [open, pinned])
 
   const onTouchMove = useCallback((e) => {
     if (!dragStart.current || e.touches.length !== 1) return
@@ -230,7 +230,7 @@ export function FileNavPanel({
       )}
       <aside
         ref={drawerRef}
-        className={`file-drawer ${shown ? 'file-drawer--open' : ''} ${pinned ? 'file-drawer--pinned' : ''}`}
+        className={`file-drawer ${open ? 'file-drawer--open' : ''} ${pinned ? 'file-drawer--pinned' : ''}`}
         aria-label="File tree"
         aria-hidden={!shown}
         inert={!shown ? true : undefined}

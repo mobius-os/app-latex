@@ -1,4 +1,4 @@
-export const APP_VERSION = '2.14.4'
+export const APP_VERSION = '2.15.4'
 export const DEFAULT_PROJECT_ID = 'default'
 export const PROJECTS_KEY = 'projects.json'
 export const PROJECT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -30,6 +30,10 @@ export const CHAT_RATIO_VERSION = 1
 export const CHAT_PILL_MIN_PX = 64
 export const CHAT_DIVIDER_PX = 10
 export const CHAT_PANE_MIN_PX = CHAT_PILL_MIN_PX + CHAT_DIVIDER_PX
+// Keep both sides of the desktop source/PDF workspace usable while allowing
+// either pane to become the focus. The ratio clamp falls back to 50/50 if a
+// narrow host cannot honor both floors.
+export const WORKSPACE_PANE_MIN_PX = 220
 
 export const BUILD_POLL_MS = 2000
 export const BUILD_TIMEOUT_MS = 120000

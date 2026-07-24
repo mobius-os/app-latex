@@ -21,6 +21,7 @@ import {
   PROJECTS_KEY,
   SOURCE_AUTOSAVE_MS,
   SOURCE_SYNC_MS,
+  WORKSPACE_PANE_MIN_PX,
 } from './constants.js'
 import { CSS } from './theme.js'
 import {
@@ -133,7 +134,14 @@ export default function App({ appId, token }) {
   // reconnect (last-write-wins per path) and destroys files. Gating the
   // write — not just guarding after — makes that bad state unreachable.
   const [indexLoaded, setIndexLoaded] = useState(false)
-  const [navOpen, setNavOpen] = useState(false)
+  // The desktop rail starts open, like the docked Möbius drawer, but remains
+  // genuinely toggleable. Compact layouts keep the existing closed-by-default
+  // overlay behavior.
+  const [navOpen, setNavOpen] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(min-width: 860px)').matches
+      : false
+  )
   const navHandleRef = useRef(null)
   const navOpenRef = useRef(false)
   useEffect(() => { navOpenRef.current = navOpen }, [navOpen])
@@ -178,8 +186,8 @@ export default function App({ appId, token }) {
   // viewMode: 'source' = CodeMirror editor, 'pdf' = compiled PDF viewer.
   const [viewMode, setViewMode] = useState('source') // 'source' | 'pdf'
   // Desktop split: at >=860px the editor and PDF sit side-by-side (Overleaf's
-  // two-pane layout) and the file tree is a persistent rail, so the [Source|PDF]
-  // toggle is unnecessary. Below that we stay single-pane + toggle (phone/tablet).
+  // two-pane layout) and the file tree is a toggleable docked rail, so the
+  // [Source|PDF] toggle is unnecessary. Below that we stay single-pane + toggle.
   // Drives only the .tex branch; everything else renders identically at any width.
   const [isWide, setIsWide] = useState(() =>
     typeof window !== 'undefined' && typeof window.matchMedia === 'function'
@@ -199,6 +207,27 @@ export default function App({ appId, token }) {
       else mq.removeListener(onChange)
     }
   }, [])
+  // Crossing the responsive boundary resets to the natural mode: docked-open
+  // on desktop, overlay-closed on compact screens. Detach any mobile history
+  // handle before switching so a later Back cannot close an unrelated view.
+  const previousWideRef = useRef(isWide)
+  useEffect(() => {
+    if (previousWideRef.current === isWide) return
+    previousWideRef.current = isWide
+    const handle = navHandleRef.current
+    navHandleRef.current = null
+    try { handle?.close?.() } catch {}
+    navOpenRef.current = isWide
+    setNavOpen(isWide)
+  }, [isWide])
+  const workspaceRef = useRef(null)
+  const [workspaceRatio, setWorkspaceRatio] = useState(() => {
+    try {
+      const value = Number(localStorage.getItem(`latex:workspace-ratio:${appId}`))
+      if (value > 0 && value < 1) return value
+    } catch {}
+    return 0.5
+  })
   // The designated MAIN document — the single root .tex that Build
   // compiles and the PDF view renders. Persisted in main.json and
   // defaulted (below) to the first .tex (preferring files/welcome.tex).
@@ -248,6 +277,11 @@ export default function App({ appId, token }) {
     if (typeof localStorage === 'undefined') return
     try { localStorage.setItem(chatRatioKey(appId), String(chatRatio)) } catch {}
   }, [appId, chatRatio])
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return
+    try { localStorage.setItem(`latex:workspace-ratio:${appId}`, String(workspaceRatio)) } catch {}
+  }, [appId, workspaceRatio])
 
   useEffect(() => {
     let cancelled = false
@@ -343,6 +377,57 @@ export default function App({ appId, token }) {
     }
   }, [])
 
+  const beginWorkspaceResize = useCallback((event) => {
+    event.preventDefault()
+    const workspace = workspaceRef.current
+    if (!workspace) return
+    const total = workspace.getBoundingClientRect().width
+    if (!total) return
+    const startX = event.clientX
+    const startPx = total * workspaceRatio
+    const divider = event.currentTarget
+    const pointerId = event.pointerId
+    divider.setPointerCapture?.(pointerId)
+    const onMove = (moveEvent) => {
+      const desiredPx = startPx + moveEvent.clientX - startX
+      setWorkspaceRatio(clampChatRatio(desiredPx, total, WORKSPACE_PANE_MIN_PX))
+    }
+    const endDrag = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', endDrag)
+      window.removeEventListener('pointercancel', endDrag)
+      divider.removeEventListener('lostpointercapture', endDrag)
+      try { divider.releasePointerCapture?.(pointerId) } catch {}
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', endDrag)
+    window.addEventListener('pointercancel', endDrag)
+    divider.addEventListener('lostpointercapture', endDrag)
+  }, [workspaceRatio])
+
+  const handleWorkspaceResizeKey = useCallback((event) => {
+    const total = workspaceRef.current?.getBoundingClientRect().width || 0
+    if (!total) return
+    const step = total * 0.05
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      setWorkspaceRatio((ratio) => clampChatRatio(
+        ratio * total - step, total, WORKSPACE_PANE_MIN_PX,
+      ))
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      setWorkspaceRatio((ratio) => clampChatRatio(
+        ratio * total + step, total, WORKSPACE_PANE_MIN_PX,
+      ))
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      setWorkspaceRatio(clampChatRatio(0, total, WORKSPACE_PANE_MIN_PX))
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      setWorkspaceRatio(clampChatRatio(total, total, WORKSPACE_PANE_MIN_PX))
+    }
+  }, [])
+
   // Persist the file-cache snapshot whenever the index, contents, or
   // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
   // inside writeFileCache. The path field lets an offline reload land
@@ -382,17 +467,25 @@ export default function App({ appId, token }) {
   }, [online, refreshPending])
 
   const closeNav = useCallback(() => {
-    try { navHandleRef.current?.close?.() } catch {}
+    const handle = navHandleRef.current
     navHandleRef.current = null
+    navOpenRef.current = false
+    try { handle?.close?.() } catch {}
     setNavOpen(false)
   }, [])
 
   const openNav = useCallback(async () => {
     if (navOpenRef.current) return
     navOpenRef.current = true
+    if (isWide) {
+      setNavOpen(true)
+      return
+    }
     if (window.mobius?.nav?.open) {
       const handle = window.mobius.nav.open('latex-drawer', () => {
+        if (navHandleRef.current !== handle) return
         navHandleRef.current = null
+        navOpenRef.current = false
         setNavOpen(false)
       })
       navHandleRef.current = handle
@@ -400,7 +493,7 @@ export default function App({ appId, token }) {
       if (navHandleRef.current !== handle) return
     }
     setNavOpen(true)
-  }, [])
+  }, [isWide])
   useEffect(() => { openNavRef.current = openNav }, [openNav])
 
   const toggleNav = useCallback(() => {
@@ -1749,8 +1842,26 @@ export default function App({ appId, token }) {
     // by .split-editor so source doesn't stretch edge-to-edge on a wide monitor.
     if (selectedIsTex && hasMain && isWide) {
       return (
-        <div className="split">
+        <div
+          ref={workspaceRef}
+          className="split"
+          style={{ '--workspace-editor-width': `${workspaceRatio * 100}%` }}
+        >
           <div className="split-editor">{renderEditor()}</div>
+          <div
+            className="workspace-divider"
+            role="separator"
+            aria-label="Resize source and PDF areas"
+            aria-orientation="vertical"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(workspaceRatio * 100)}
+            tabIndex={0}
+            onPointerDown={beginWorkspaceResize}
+            onKeyDown={handleWorkspaceResizeKey}
+          >
+            <span className="workspace-divider-bar" aria-hidden="true" />
+          </div>
           <div className="split-pdf">{renderPdfView()}</div>
         </div>
       )
@@ -1840,7 +1951,7 @@ export default function App({ appId, token }) {
     )
     if (!chatOpen) {
       return (
-        <div ref={bodyRef} className="body">
+        <div ref={bodyRef} className={`body ${navOpen ? 'body--drawer-open' : ''}`}>
           {fileNav}
           <main className="content">{renderMain()}</main>
         </div>
@@ -1849,7 +1960,7 @@ export default function App({ appId, token }) {
     return (
       <div
         ref={bodyRef}
-        className="body body--chat-open"
+        className={`body body--chat-open ${navOpen ? 'body--drawer-open' : ''}`}
         style={{ '--chat-ratio': chatRatio, '--chat-pane-min': `${CHAT_PANE_MIN_PX}px` }}
       >
         {fileNav}
