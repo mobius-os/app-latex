@@ -1239,9 +1239,11 @@ export const CSS = `
 @media (min-width: 860px) {
   .body {
     display: grid;
-    grid-template-columns: 264px minmax(0, 1fr);
+    grid-template-columns: 0 minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto auto;
+    transition: grid-template-columns 0.2s ease;
   }
+  .body--drawer-open { grid-template-columns: 264px minmax(0, 1fr); }
   /* Chat open: row 3 takes the --chat-ratio share of the body height (the
      panel's own %-height rule is neutralised below — the grid row IS the
      height in this layout), clamped between --chat-pane-min (pill + divider)
@@ -1261,8 +1263,13 @@ export const CSS = `
     grid-row: 1 / -1;
     width: auto;
     max-width: none;
+    min-width: 0;
     transform: none;
     border-right: 1px solid var(--border);
+  }
+  .body:not(.body--drawer-open) .file-drawer--pinned {
+    visibility: hidden;
+    border-right-color: transparent;
   }
   /* Content / divider / chat stack down the right column. */
   .content { grid-column: 2; grid-row: 1; }
@@ -1272,12 +1279,43 @@ export const CSS = `
      lines stay readable; the PDF pane takes the remaining width. */
   .split { display: flex; flex: 1 1 auto; height: 100%; min-height: 0; }
   .split-editor {
-    flex: 0 1 620px;
+    flex: 0 0 var(--workspace-editor-width, 50%);
     min-width: 0;
     display: flex;
     flex-direction: column;
-    border-right: 1px solid var(--border);
     overflow: hidden;
+  }
+  .workspace-divider {
+    position: relative;
+    z-index: 2;
+    flex: 0 0 1px;
+    width: 1px;
+    background: var(--border);
+    cursor: ew-resize;
+    touch-action: none;
+    user-select: none;
+  }
+  .workspace-divider::before {
+    content: "";
+    position: absolute;
+    inset: 0 -7px;
+  }
+  .workspace-divider-bar {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 3px;
+    height: 36px;
+    border-radius: 999px;
+    background: var(--muted);
+    opacity: 0;
+    transform: translate(-50%, -50%);
+    transition: opacity 0.14s ease, background 0.14s ease;
+  }
+  .workspace-divider:hover .workspace-divider-bar,
+  .workspace-divider:focus-visible .workspace-divider-bar {
+    opacity: 1;
+    background: var(--accent);
   }
   .split-pdf { flex: 1 1 0; min-width: 0; overflow: hidden; }
   /* Single-pane prose states (build errors, notes, the empty placeholder) get

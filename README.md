@@ -24,8 +24,8 @@ Möbius fetches the manifest, shows you the requested permissions and runtime de
 
 Three working regions, mobile-first:
 
-- **Source/PDF workspace** — edit the selected source file directly, build the main `.tex` document, then inspect the compiled PDF without leaving the app. Images and PDFs opened from the file tree render through authenticated blob reads.
-- **File tree (left drawer)** — tap the menu icon to slide it out. Shows everything under `files/`. The drawer supports new files, new folders, uploads, drag-to-move, rename, delete, and setting the main document.
+- **Source/PDF workspace** — edit the selected source file directly, build the main `.tex` document, then inspect the compiled PDF without leaving the app. On desktop, drag the divider (or focus it and use the arrow keys) to rebalance the panes. Images and PDFs opened from the file tree render through authenticated blob reads.
+- **File tree (left drawer)** — tap the app icon to toggle it. It docks beside the workspace on desktop and slides over it on compact screens. Shows everything under `files/`. The drawer supports new files, new folders, uploads, drag-to-move, rename, delete, and setting the main document.
 - **Chat panel (bottom)** — type what you want; the sub-agent edits files in your app storage and replies with a one-line summary of what it changed. The current file and file index refresh after chat turns.
 
 ## How it works
