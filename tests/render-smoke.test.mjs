@@ -46,6 +46,7 @@ const RUNTIME_LIBS = [
   '@codemirror/lang-markdown',
   '@lezer/highlight',
   'katex',
+  '@openai/apps-sdk-ui/components/Icon',
 ]
 
 // React specifiers get real (if shallow) hook behaviour so the App body can run;

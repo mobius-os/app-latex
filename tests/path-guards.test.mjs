@@ -12,11 +12,9 @@ const root = dirname(fileURLToPath(import.meta.url))
 const buildDir = join(root, '.build')
 const bundled = join(buildDir, 'index.mjs')
 
-// Mirror the platform's canonical RUNTIME_LIBS (backend/app/runtime_libs.py).
-// The install compiler externalizes exactly this set; the test bundler must
-// too, or esbuild tries to resolve bare specifiers (react, @codemirror/*, etc.)
-// it has no node_modules for and the bundle fails — masking the path guards we
-// actually want to assert on. Keep this list in sync with runtime_libs.py.
+// Bare UI/runtime imports are irrelevant to these pure path-guard tests. Leave
+// them unresolved in the test bundle and synthesize callable exports below, so
+// a clean checkout does not need to reproduce the platform's frontend install.
 const RUNTIME_LIBS = [
   'react',
   'react/jsx-runtime',
@@ -35,14 +33,14 @@ const RUNTIME_LIBS = [
   '@codemirror/lang-markdown',
   '@lezer/highlight',
   'katex',
+  '@openai/apps-sdk-ui/components/Icon',
 ]
 
 async function bundle() {
   await rm(buildDir, { recursive: true, force: true })
   await mkdir(buildDir, { recursive: true })
-  // Faithfully mirror the install compiler: externalize EXACTLY the canonical
-  // RUNTIME_LIBS (backend/app/runtime_libs.py). esbuild then leaves those bare
-  // imports unresolved in the bundle instead of choking on a missing package.
+  // esbuild leaves these bare imports unresolved in the bundle instead of
+  // choking on packages that the pure exports under test never exercise.
   await execFileAsync(process.env.ESBUILD_BIN || 'esbuild', [
     join(root, '..', 'index.jsx'),
     '--bundle',
