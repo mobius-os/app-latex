@@ -38,7 +38,7 @@ export function bootstrapPrompt() {
 export function ChatPanel({
   appId, token, storage,
   onFilesMaybeChanged,
-  quickActions,
+  guidance,
   getContext,
   activeProjectId,
 }) {
@@ -51,8 +51,8 @@ export function ChatPanel({
   // streaming turn mid-flight. The turn-done handler reads the ref instead.
   const onFilesRef = useRef(onFilesMaybeChanged)
   useEffect(() => { onFilesRef.current = onFilesMaybeChanged }, [onFilesMaybeChanged])
-  const quickActionsRef = useRef(quickActions)
-  useEffect(() => { quickActionsRef.current = quickActions }, [quickActions])
+  const guidanceRef = useRef(guidance)
+  useEffect(() => { guidanceRef.current = guidance }, [guidance])
   const getContextRef = useRef(getContext)
   useEffect(() => { getContextRef.current = getContext }, [getContext])
   const systemPrompt = useMemo(() => bootstrapPrompt(), [])
@@ -79,7 +79,7 @@ export function ChatPanel({
       title: 'LaTeX',
       systemPrompt,
       picker: true,
-      quickActions: quickActionsRef.current,
+      guidance: guidanceRef.current,
       getContext: () => {
         const fn = getContextRef.current
         return fn ? fn() : null
