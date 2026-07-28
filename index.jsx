@@ -1420,18 +1420,14 @@ export default function App({ appId, token }) {
     if (build.buildStatus === 'building') setDismissedChips([])
   }, [build.buildStatus])
 
-  // quickActions passed to window.mobius.chat: context-aware chips that appear
-  // in the embedded chat's empty state. Only "Fix compilation errors" when in
-  // error state; the other two are always present.
-  const quickActions = useMemo(() => {
-    const actions = []
-    if (mainBuildError) {
-      actions.push({ label: 'Fix compilation errors', prompt: 'Fix the compilation errors in the build log.' })
-    }
-    actions.push({ label: 'Continue my document', prompt: 'Continue writing the document where it left off.' })
-    actions.push({ label: 'Add a section', prompt: 'Add a new section to the document.' })
-    return actions
-  }, [mainBuildError])
+  // guidance passed to window.mobius.chat: a short informational line in the
+  // embedded chat's empty state, telling the user what the agent can do. It
+  // calls out the build errors when the document is currently failing.
+  const guidance = useMemo(() => (
+    mainBuildError
+      ? 'There are errors in the build log. Ask the agent to fix them, or tell it how to set up or modify your LaTeX project.'
+      : 'Tell the agent how to set up or modify your LaTeX project — draft a section, restructure the document, or fix formatting.'
+  ), [mainBuildError])
 
   // getContext: supplies the agent with current app state so it can act without
   // asking clarifying questions. Passed to both the split and fallback chat paths.
@@ -1984,7 +1980,7 @@ export default function App({ appId, token }) {
           token={token}
           storage={storage}
           onFilesMaybeChanged={onFilesMaybeChanged}
-          quickActions={quickActions}
+          guidance={guidance}
           getContext={getContext}
           activeProjectId={activeProjectId}
         />
