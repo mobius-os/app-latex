@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Minus, Plus } from '@openai/apps-sdk-ui/components/Icon'
 import {
   ZOOM_BTN_FACTOR,
   ZOOM_DOUBLE_TAP,
@@ -426,7 +427,7 @@ export function PdfPreview({ storage, path, version, appId, token, storagePrefix
             title="Zoom out"
             onClick={zoomOut}
             disabled={atMin}
-          >−</button>
+          ><Minus width="1em" height="1em" aria-hidden="true" /></button>
           <button
             type="button"
             className="pdf-ctl-btn pdf-zoom-pct"
@@ -441,7 +442,7 @@ export function PdfPreview({ storage, path, version, appId, token, storagePrefix
             title="Zoom in"
             onClick={zoomIn}
             disabled={atMax}
-          >+</button>
+          ><Plus width="1em" height="1em" aria-hidden="true" /></button>
         </div>
         {canDownload && (
           <button
