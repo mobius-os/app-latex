@@ -1086,6 +1086,7 @@ export const CSS = `
   justify-content: center;
   -webkit-tap-highlight-color: transparent;
 }
+.error-chip-dismiss svg, .pdf-ctl-btn svg { display: block; margin: auto; }
 @media (hover: hover) { .error-chip-dismiss:hover { color: var(--text); } }
 .error-chip-dismiss:active { background: var(--surface2, var(--surface)); }
 

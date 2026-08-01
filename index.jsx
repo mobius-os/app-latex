@@ -13,6 +13,7 @@
 // Only App lives here: it owns top-level project/file/editor/build/chat state,
 // persistence wiring, and mounts the source/PDF/file/chat UI.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { X } from '@openai/apps-sdk-ui/components/Icon'
 import {
   CHAT_PANE_MIN_PX,
   DEFAULT_PROJECT_ID,
@@ -2020,7 +2021,7 @@ export default function App({ appId, token }) {
               aria-label="Dismiss"
               onClick={() => dismissChip(chip)}
             >
-              ×
+              <X width="1em" height="1em" aria-hidden="true" />
             </button>
           </div>
         ))}
