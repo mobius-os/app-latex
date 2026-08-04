@@ -1,9 +1,8 @@
 // Unit tests for the PDF viewer's pure zoom helpers (clampScale, pinchScale,
 // anchoredZoomScroll). The helpers live in pdf/zoom.js inside the
 // `zoom-math:begin` / `zoom-math:end` fence as plain dependency-free JS, so
-// this test extracts that exact block and executes it directly — no esbuild
-// bundle, no react/pdfjs resolution needed (the whole-bundle import path is
-// what keeps path-guards' first test red in this environment).
+// this test extracts that exact block and executes it directly — no bundler,
+// no react/pdfjs resolution needed.
 import assert from 'node:assert/strict'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
