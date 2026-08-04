@@ -3,11 +3,10 @@ import { readFileSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import test from 'node:test'
 
-const execFileAsync = promisify(execFile)
+import { bundleModule } from './test-deps.mjs'
+
 const root = dirname(fileURLToPath(import.meta.url))
 const buildDir = join(root, '.build-offline-storage')
 
@@ -20,14 +19,11 @@ async function bundleStorage() {
     'export const useEffect = () => {}',
     'export const useState = (initial) => [typeof initial === "function" ? initial() : initial, () => {}]',
   ].join('\n'))
-  await execFileAsync(process.env.ESBUILD_BIN || 'esbuild', [
-    join(root, '..', 'storage.js'),
-    '--bundle',
-    '--format=esm',
-    '--platform=node',
-    `--alias:react=${reactStub}`,
-    `--outfile=${bundled}`,
-  ])
+  await bundleModule({
+    entry: join(root, '..', 'storage.js'),
+    outfile: bundled,
+    alias: { react: reactStub },
+  })
   return import(`${pathToFileURL(bundled)}?v=${Date.now()}`)
 }
 

@@ -1,8 +1,7 @@
 // Unit tests for the chat-pane resize bound (clampChatRatio). The helper lives
 // in domain.js inside the `chat-bounds:begin` / `chat-bounds:end` fence as
 // plain dependency-free JS, so this test extracts that exact block and runs it
-// directly — no esbuild bundle, no react/pdfjs resolution (the whole-bundle
-// import path is what keeps path-guards' first test red in this environment).
+// directly — no bundler, no react/pdfjs resolution needed.
 import assert from 'node:assert/strict'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'

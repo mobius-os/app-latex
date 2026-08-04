@@ -3,9 +3,9 @@ import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import test from 'node:test'
+
+import { bundleModule, externalImportNames } from './test-deps.mjs'
 
 // Render smoke test. The other suites bundle index.jsx only to check import
 // wiring and exercise PURE exported helpers — none of them ever CALLS the
@@ -18,14 +18,13 @@ import test from 'node:test'
 // missing `cleanIndexPaths` import (App's index-load path referenced an
 // undefined binding) and the `mainBuildError`-before-declaration TDZ.
 
-const execFileAsync = promisify(execFile)
 const root = dirname(fileURLToPath(import.meta.url))
 const buildDir = join(root, '.build-render')
 const bundled = join(buildDir, 'app.mjs')
 
 // Mirror the platform's canonical RUNTIME_LIBS (backend/app/runtime_libs.py).
 // The install compiler externalizes exactly this set; the test bundler must
-// too, or esbuild tries to resolve bare specifiers it has no node_modules for
+// too, or Rolldown tries to resolve bare specifiers it has no node_modules for
 // and the bundle fails. Keep this list in sync with runtime_libs.py.
 const RUNTIME_LIBS = [
   'react',
@@ -58,36 +57,17 @@ const JSX_SPECS = new Set(['react/jsx-runtime', 'react/jsx-dev-runtime'])
 async function bundleAndImport() {
   await rm(buildDir, { recursive: true, force: true })
   await mkdir(buildDir, { recursive: true })
-  await execFileAsync(process.env.ESBUILD_BIN || 'esbuild', [
-    join(root, '..', 'index.jsx'),
-    '--bundle',
-    '--format=esm',
-    '--platform=node',
-    '--jsx=automatic',
-    ...RUNTIME_LIBS.map((lib) => `--external:${lib}`),
-    `--outfile=${bundled}`,
-  ])
+  await bundleModule({
+    entry: join(root, '..', 'index.jsx'),
+    outfile: bundled,
+    external: RUNTIME_LIBS,
+  })
 
   // Discover which named/default bindings the bundle imports from each external
   // so every synthetic stub module provides exactly those exports (a missing
   // named export fails ESM instantiation with "does not provide an export
   // named X"). Same parse the path-guards suite uses.
-  const bundleSrc = readFileSync(bundled, 'utf8')
-  const exportsBySpec = {}
-  const importRe = /import\s+(?:([A-Za-z_$][\w$]*)\s*,?\s*)?(?:\{([^}]*)\})?\s*from\s*["']([^"']+)["']/g
-  for (const m of bundleSrc.matchAll(importRe)) {
-    const [, dflt, named, spec] = m
-    const set = (exportsBySpec[spec] ||= new Set())
-    if (dflt) set.add('default')
-    if (named) {
-      for (const piece of named.split(',')) {
-        const name = piece.trim().split(/\s+as\s+/).pop().trim()
-        if (name) set.add(name)
-      }
-    }
-  }
-  const serial = {}
-  for (const [spec, names] of Object.entries(exportsBySpec)) serial[spec] = [...names]
+  const serial = externalImportNames(readFileSync(bundled, 'utf8'))
 
   const hook = join(buildDir, 'runtime-lib-hook.mjs')
   await writeFile(hook, HOOK_SOURCE.replace('__EXPORTS__', JSON.stringify(serial)))

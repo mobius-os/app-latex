@@ -3,18 +3,17 @@ import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import test from 'node:test'
 
-const execFileAsync = promisify(execFile)
+import { bundleModule, externalImportNames } from './test-deps.mjs'
+
 const root = dirname(fileURLToPath(import.meta.url))
 const buildDir = join(root, '.build')
 const bundled = join(buildDir, 'index.mjs')
 
 // Bare UI/runtime imports are irrelevant to these pure path-guard tests. Leave
 // them unresolved in the test bundle and synthesize callable exports below, so
-// a clean checkout does not need to reproduce the platform's frontend install.
+// the bundle needs only the compiler itself, not the whole runtime-lib set.
 const RUNTIME_LIBS = [
   'react',
   'react/jsx-runtime',
@@ -39,41 +38,19 @@ const RUNTIME_LIBS = [
 async function bundle() {
   await rm(buildDir, { recursive: true, force: true })
   await mkdir(buildDir, { recursive: true })
-  // esbuild leaves these bare imports unresolved in the bundle instead of
-  // choking on packages that the pure exports under test never exercise.
-  await execFileAsync(process.env.ESBUILD_BIN || 'esbuild', [
-    join(root, '..', 'index.jsx'),
-    '--bundle',
-    '--format=esm',
-    '--platform=node',
-    '--jsx=automatic',
-    ...RUNTIME_LIBS.map((lib) => `--external:${lib}`),
-    `--outfile=${bundled}`,
-  ])
+  // Marking these bare imports external leaves them unresolved in the bundle
+  // instead of choking on packages that the pure exports under test never
+  // exercise.
+  await bundleModule({
+    entry: join(root, '..', 'index.jsx'),
+    outfile: bundled,
+    external: RUNTIME_LIBS,
+  })
   // The path-guard exports under test are pure — they never touch react,
   // @codemirror/*, pdfjs-dist, etc., so those packages need not be installed.
-  // esbuild emits 'import { A, B } from "pkg"' for each external, and ESM checks
-  // those NAMED bindings at instantiate time — so a single empty stub would fail
-  // ("does not provide an export named 'Compartment'"). We parse the named
-  // imports straight out of the emitted bundle and register a loader hook that
-  // serves each RUNTIME_LIB specifier as a synthetic module exporting exactly
-  // those names, so the stub stays in sync with whatever index.jsx imports.
-  const bundleSrc = readFileSync(bundled, 'utf8')
-  const exportsBySpec = {}
-  const importRe = /import\s+(?:([A-Za-z_$][\w$]*)\s*,?\s*)?(?:\{([^}]*)\})?\s*from\s*["']([^"']+)["']/g
-  for (const m of bundleSrc.matchAll(importRe)) {
-    const [, dflt, named, spec] = m
-    const set = (exportsBySpec[spec] ||= new Set())
-    if (dflt) set.add('default')
-    if (named) {
-      for (const piece of named.split(',')) {
-        const name = piece.trim().split(/\s+as\s+/).pop().trim()
-        if (name) set.add(name)
-      }
-    }
-  }
-  const serial = {}
-  for (const [spec, names] of Object.entries(exportsBySpec)) serial[spec] = [...names]
+  // We register a loader hook that serves each RUNTIME_LIB specifier as a
+  // synthetic module exporting exactly the names the bundle imports from it.
+  const serial = externalImportNames(readFileSync(bundled, 'utf8'))
   const hook = join(buildDir, 'runtime-lib-hook.mjs')
   // Each stub member must be callable AND chainable: index.jsx runs CodeMirror
   // calls at MODULE TOP LEVEL (e.g. `const t = EditorView.theme({...})`,
