@@ -47,10 +47,9 @@ export function findFrontendNodeModules() {
 
 export const frontendNodeModules = findFrontendNodeModules()
 
-// Reproduces esbuild's `--external:` matching so the RUNTIME_LIBS lists the
-// suites already carry keep their exact meaning: a plain entry matches that
-// specifier only (hence the explicit `react/jsx-runtime` alongside `react`),
-// and `*` matches any run of characters (`three/addons/*`).
+// Matches the RUNTIME_LIBS patterns the suites already carry: a plain entry
+// matches that specifier only (hence the explicit `react/jsx-runtime` alongside
+// `react`), and `*` matches any run of characters (`three/addons/*`).
 function externalMatcher(patterns) {
   const exact = new Set(patterns.filter((pattern) => !pattern.includes('*')))
   const globs = patterns
