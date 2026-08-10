@@ -138,18 +138,14 @@ export function makeStorage(appId, token) {
   async function updateJSON(path, mutate) {
     if (typeof mutate !== 'function') throw new TypeError('updateJSON requires a mutator')
 
-    const readVersioned = typeof ms?.getWithVersion === 'function'
-      ? ms.getWithVersion.bind(ms)
-      : (typeof ms?._getWithVersion === 'function' ? ms._getWithVersion.bind(ms) : null)
-
     // files-index.json and projects.json are shared by the open editor,
     // embedded agent, and other tabs. Guard their read/merge/write cycle while
     // online so a late whole-document write cannot erase a concurrent change.
     // Offline and older runtimes retain the existing queued-write behavior.
     const isOffline = typeof window !== 'undefined' && window.mobius?.online === false
-    if (readVersioned && typeof ms?.durableWrite === 'function' && !isOffline) {
+    if (typeof ms?.getWithVersion === 'function' && typeof ms?.durableWrite === 'function' && !isOffline) {
       for (let attempt = 0; attempt < JSON_UPDATE_RETRIES; attempt += 1) {
-        const { value, version } = await readVersioned(path, 'json')
+        const { value, version } = await ms.getWithVersion(path, 'json')
         const next = mutate(value)
         try {
           const options = version == null ? { ifNoneMatch: true } : { ifMatch: version }
