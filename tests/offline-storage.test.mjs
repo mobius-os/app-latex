@@ -87,3 +87,87 @@ test('offline manifest is implemented by typed Mobius storage operations', async
     await rm(buildDir, { recursive: true, force: true })
   }
 })
+
+test('shared JSON updates retry against the latest server version', async () => {
+  const writes = []
+  let reads = 0
+  globalThis.window = {
+    mobius: {
+      online: true,
+      storage: {
+        async getWithVersion(path, format) {
+          assert.equal(path, 'files-index.json')
+          assert.equal(format, 'json')
+          reads += 1
+          return reads === 1
+            ? { value: ['files/a.tex'], version: 'v1' }
+            : { value: ['files/a.tex', 'files/agent.tex'], version: 'v2' }
+        },
+        async durableWrite(path, value, options) {
+          writes.push({ path, value, options })
+          if (writes.length === 1) {
+            throw Object.assign(new Error('changed'), { code: 'conflict' })
+          }
+          return { synced: true }
+        },
+      },
+    },
+  }
+  try {
+    const { makeStorage } = await bundleStorage()
+    const api = makeStorage('latex', 'tok')
+    const result = await api.updateJSON('files-index.json', (current) => (
+      [...new Set([...(current || []), 'files/local.tex'])].sort()
+    ))
+    assert.deepEqual(result.value, [
+      'files/a.tex',
+      'files/agent.tex',
+      'files/local.tex',
+    ])
+    assert.deepEqual(writes.map(({ options }) => options), [
+      { ifMatch: 'v1' },
+      { ifMatch: 'v2' },
+    ])
+  } finally {
+    delete globalThis.window
+    await rm(buildDir, { recursive: true, force: true })
+  }
+})
+
+test('recursive file listing uses the runtime mirror', async () => {
+  const seen = []
+  globalThis.window = {
+    mobius: {
+      storage: {
+        async list(path) {
+          seen.push(path)
+          if (path === 'files/') return [
+            { type: 'directory', path: 'files/chapters' },
+            { type: 'file', path: 'files/main.tex' },
+          ]
+          if (path === 'files/chapters/') return [
+            { type: 'file', path: 'files/chapters/one.tex' },
+          ]
+          return []
+        },
+      },
+    },
+  }
+  const oldFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    throw new Error('listFiles must stay on the runtime storage boundary')
+  }
+  try {
+    const { makeStorage } = await bundleStorage()
+    const api = makeStorage('latex', 'tok')
+    assert.deepEqual(await api.listFiles('files/'), [
+      'files/chapters/one.tex',
+      'files/main.tex',
+    ])
+    assert.deepEqual(seen, ['files/', 'files/chapters/'])
+  } finally {
+    globalThis.fetch = oldFetch
+    delete globalThis.window
+    await rm(buildDir, { recursive: true, force: true })
+  }
+})

@@ -5,7 +5,7 @@
 //   constants.js      — shared scalar constants for projects, storage, chat, and polling
 //   theme.js          — the single app stylesheet (CSS)
 //   domain.js         — pure + DOM-level path, project, tree, PDF, chat, and log helpers
-//   storage.js        — storage shim, project wrapper, online signal, and local snapshots
+//   storage.js        — typed storage, guarded shared-document updates, and online signal
 //   pdf/zoom.js       — pure PDF zoom math helpers
 //   build/useBuild.js — source-to-PDF compile state machine and poll loop
 //   ui/*.jsx          — one React component per file
@@ -49,11 +49,8 @@ import {
   readActiveProject,
   readChatOpen,
   readChatRatio,
-  readFileCache,
-  removeFileCache,
   useOnline,
   writeActiveProject,
-  writeFileCache,
 } from './storage.js'
 import { useBuild } from './build/useBuild.js'
 import { CodeEditor } from './ui/CodeEditor.jsx'
@@ -73,7 +70,6 @@ export {
   isSafeStoragePath,
   isManagedJsonPath,
   isUserJsonProjectPath,
-  normalizeFileCacheSnapshot,
   pdfFromBuildStatusForDoc,
   pdfPathForTexDoc,
 } from './domain.js'
@@ -82,6 +78,17 @@ export { clampChatRatio, parseBuildErrorChips } from './domain.js'
 
 function signal(name, payload = {}) {
   try { window.mobius?.signal?.(name, payload) } catch {}
+}
+
+function rememberFileBody(cache, path, body) {
+  if (!path || typeof body !== 'string') return cache
+  if (cache[path] === body) return cache
+  const next = { ...cache }
+  delete next[path]
+  next[path] = body
+  const keys = Object.keys(next)
+  if (keys.length > FILE_CONTENT_CACHE_LIMIT) delete next[keys[0]]
+  return next
 }
 
 export function buildErrorKind(log) {
@@ -114,22 +121,18 @@ export default function App({ appId, token }) {
   const online = useOnline()
   const rawModal = useModal()
   const bodyRef = useRef(null)
-  // Hydrate files + recent contents from the localStorage snapshot
-  // synchronously on first render so an offline reload has SOMETHING
-  // to paint before any storage.get() resolves (or returns null
-  // offline). The server still gets fetched on mount and overwrites
-  // this with the canonical state when online.
-  const cached = useMemo(() => readFileCache(appId, activeProjectId), [appId, activeProjectId])
-  const [files, setFiles] = useState(() => cached?.index || [])
+  // The Mobius storage runtime owns the durable offline mirror and queued
+  // writes. This app keeps only a small in-memory buffer cache for the active
+  // session instead of maintaining a second, divergent localStorage copy.
+  const [files, setFiles] = useState([])
   // Mirror of `files` for reads inside long-lived async callbacks (the build
   // poll can resolve up to 120s after it captured its closure). Kept in sync
   // below so the closure-stale snapshot never drives an index write.
   const filesRef = useRef(files)
-  const [fileCache, setFileCache] = useState(() => cached?.contents || {})
-  // True once `files` reflects the server's index this session — either
-  // refreshFiles read it back or seeded it online. Until then `files` is
-  // only the localStorage snapshot (or empty), which may be stale or
-  // missing entries. We refuse to PERSIST files-index.json while this is
+  const [fileCache, setFileCache] = useState({})
+  // True once `files` reflects the authoritative index this session — either
+  // refreshFiles read it back or seeded it online. Until then `files` may be
+  // empty. We refuse to persist files-index.json while this is
   // false: an offline write derived from an unconfirmed list would queue
   // a short/empty index that drains over the server's real one on
   // reconnect (last-write-wins per path) and destroys files. Gating the
@@ -161,13 +164,11 @@ export default function App({ appId, token }) {
     return { node: rawModal.node, alert: wrap('alert'), confirm: wrap('confirm'), prompt: wrap('prompt') }
   }, [rawModal])
   const navToggleRef = useRef(null)
-  // Restore the file the user was viewing last session so an offline
-  // reload opens straight into their work-in-progress (assuming we
-  // have its body cached — handled by the cache-first load below).
-  const [selectedPath, setSelectedPath] = useState(() => cached?.lastPath || null)
+  const [selectedPath, setSelectedPath] = useState(null)
   const [fileContent, setFileContent] = useState('')
   const [fileLoading, setFileLoading] = useState(false)
   const [fileError, setFileError] = useState(null)
+  const [saveError, setSaveError] = useState(null)
   const [fileDirty, setFileDirty] = useState(false)
   const [fileSaving, setFileSaving] = useState(false)
   const fileContentRef = useRef(fileContent)
@@ -294,8 +295,16 @@ export default function App({ appId, token }) {
         try { next = normalizeProjects(await rawStorage.get(PROJECTS_KEY)) } catch { next = [] }
       }
       if (next.length === 0) {
-        next = [{ id: DEFAULT_PROJECT_ID, name: 'Project 1', createdAt: Date.now() }]
-        rawStorage.setJSON(PROJECTS_KEY, next).catch(() => {})
+        const seed = [{ id: DEFAULT_PROJECT_ID, name: 'Project 1', createdAt: Date.now() }]
+        try {
+          const updated = await rawStorage.updateJSON(PROJECTS_KEY, (current) => {
+            const existing = normalizeProjects(current)
+            return existing.length ? existing : seed
+          })
+          next = normalizeProjects(updated.value)
+        } catch {
+          next = seed
+        }
       }
       if (cancelled) return
       setProjects(next)
@@ -429,15 +438,6 @@ export default function App({ appId, token }) {
     }
   }, [])
 
-  // Persist the file-cache snapshot whenever the index, contents, or
-  // last-selected path change. Bounded above by FILE_CONTENT_CACHE_LIMIT
-  // inside writeFileCache. The path field lets an offline reload land
-  // on the file the user was last editing instead of bouncing to the
-  // first tree entry.
-  useEffect(() => {
-    writeFileCache(appId, activeProjectId, files, fileCache, selectedPath)
-  }, [appId, activeProjectId, files, fileCache, selectedPath])
-
   // Keep the ref in lock-step with `files` so async callbacks read the latest.
   useEffect(() => { filesRef.current = files }, [files])
   // Same for selectedPath — the build callback (resolves up to 120s later)
@@ -507,12 +507,9 @@ export default function App({ appId, token }) {
     navHandleRef.current = null
   }, [])
 
-  // Pull the canonical file list out of files-index.json. Falls back
-  // to ["files/welcome.tex"] when the index doesn't exist (older
-  // install, or the seed didn't apply for some reason). When the
-  // runtime is offline, storage.get returns null — we keep whatever
-  // we hydrated from the localStorage snapshot rather than blanking
-  // the tree.
+  // Pull the canonical file list out of files-index.json. If the index is
+  // absent, recover it from the real files/ tree. Offline reads resolve from
+  // the runtime's durable mirror.
   const refreshFiles = useCallback(async () => {
     try {
       const idx = await (online ? storage.getFresh('files-index.json') : storage.get('files-index.json'))
@@ -537,40 +534,41 @@ export default function App({ appId, token }) {
         // that case (the autosave will re-create the file at the path on its
         // next write), matching the selected-file loader's own dirty guard.
         const editingSelected = fileDirtyRef.current || fileSavingRef.current
-        if (selectedPath && !cleaned.includes(selectedPath) && !editingSelected) {
+        const currentPath = selectedPathRef.current
+        if (currentPath && !cleaned.includes(currentPath) && !editingSelected) {
           setSelectedPath(null)
           setFileContent('')
           setFileCache((prev) => {
-            if (!(selectedPath in prev)) return prev
+            if (!(currentPath in prev)) return prev
             const next = { ...prev }
-            delete next[selectedPath]
+            delete next[currentPath]
             return next
           })
         }
       } else if (idx === null && !online) {
-        // Offline + nothing in storage — keep the hydrated snapshot.
+        // Offline + nothing in the runtime mirror: leave the current tree.
         // The next online refresh reconciles with the server.
         return
       } else {
-        // Index missing or malformed — seed it from the welcome file
-        // if that exists, otherwise leave empty. Only attempt to
-        // re-seed when online; offline we'd just queue a write that
-        // collides with whatever lands first when we reconnect.
+        // Recover an absent/malformed index by enumerating the actual project
+        // tree, rather than guessing one welcome path and hiding every other
+        // file. updateJSON re-checks under CAS, so an agent that recreates the
+        // index between this read and write wins without being overwritten.
         if (!online) return
-        const probe = await (online ? storage.getFresh('files/welcome.tex') : storage.get('files/welcome.tex'))
-        const seed = probe ? ['files/welcome.tex'] : []
-        await storage.setJSON('files-index.json', seed)
-        filesRef.current = seed
-        setFiles(seed)
-        // We just wrote the index to the server online, so `files` is
-        // now authoritative — UI writes are safe from here.
+        const discovered = cleanIndexPaths(await storage.listFiles('files/'))
+        const { value: recovered } = await storage.updateJSON('files-index.json', (current) => (
+          Array.isArray(current) ? cleanIndexPaths(current) : discovered
+        ))
+        const cleaned = cleanIndexPaths(recovered)
+        filesRef.current = cleaned
+        setFiles(cleaned)
         setIndexLoaded(true)
       }
     } catch (e) {
       // Don't blank the UI on a transient read failure — just keep
       // the previous list and let the next poll retry.
     }
-  }, [storage, selectedPath, online])
+  }, [storage, online])
 
   useEffect(() => {
     if (!projectsReady) return
@@ -612,16 +610,11 @@ export default function App({ appId, token }) {
   // the state unblocks the maintenance pass.
   const mainResolvedRef = useRef(false)
   const [mainReady, setMainReady] = useState(false)
-  const hydratedProjectRef = useRef(activeProjectId)
-
   useEffect(() => {
     clearBuildPoll()
-    const switchingProject = hydratedProjectRef.current !== activeProjectId
-    hydratedProjectRef.current = activeProjectId
-    const snapshot = switchingProject ? null : readFileCache(appId, activeProjectId)
-    const nextFiles = snapshot?.index || []
+    const nextFiles = []
     filesRef.current = nextFiles
-    selectedPathRef.current = snapshot?.lastPath || null
+    selectedPathRef.current = null
     fileContentRef.current = ''
     fileDirtyRef.current = false
     fileSavingRef.current = false
@@ -630,12 +623,13 @@ export default function App({ appId, token }) {
     seenBuildStatusRef.current = ''
     signalReadySentRef.current = false
     setFiles(nextFiles)
-    setFileCache(snapshot?.contents || {})
+    setFileCache({})
     setIndexLoaded(false)
-    setSelectedPath(snapshot?.lastPath || null)
+    setSelectedPath(null)
     setFileContent('')
     setFileLoading(false)
     setFileError(null)
+    setSaveError(null)
     setFileDirty(false)
     setFileSaving(false)
     setMainPath(null)
@@ -773,9 +767,11 @@ export default function App({ appId, token }) {
           build.rememberPdf(doc, pdf)
         }
         if (indexLoaded && !filesRef.current.includes(pdf)) {
-          const next = cleanIndexPaths([...filesRef.current, pdf])
+          const { value } = await storage.updateJSON('files-index.json', (current) => (
+            cleanIndexPaths([...(Array.isArray(current) ? current : filesRef.current), pdf])
+          ))
+          const next = cleanIndexPaths(value)
           filesRef.current = next
-          await storage.setJSON('files-index.json', next)
           setFiles(next)
           refreshPending()
         }
@@ -799,7 +795,9 @@ export default function App({ appId, token }) {
     // reload, or an open image/PDF would flicker-refetch every 5s. A binary
     // preview only re-fetches on the discrete signals below (focus / tab
     // return), where another device may have rewritten the file.
-    const interval = setInterval(syncProjectFromStorage, PROJECT_SYNC_MS)
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') syncProjectFromStorage()
+    }, PROJECT_SYNC_MS)
     const onFocus = () => { syncProjectFromStorage(); bumpPreviewReload() }
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
@@ -818,7 +816,7 @@ export default function App({ appId, token }) {
 
   // Load the selected file's content. Cache-first for first paint, then
   // stale-while-revalidate while online: the editor starts from the
-  // local mirror/localStorage snapshot, subscribes to runtime revalidation
+  // runtime mirror or this session's small in-memory buffer, subscribes to revalidation
   // updates, and periodically asks storage to revalidate the active path.
   // Direct user edits autosave below, so the editor buffer and storage file
   // converge from both directions without a page reload.
@@ -826,6 +824,7 @@ export default function App({ appId, token }) {
   // For binary previews (images, PDF) the dedicated component does
   // its own blob fetch; we just clear textual state and let it render.
   useEffect(() => {
+    setSaveError(null)
     if (!selectedPath) {
       setFileContent('')
       setFileError(null)
@@ -851,7 +850,7 @@ export default function App({ appId, token }) {
       setFileContent(body)
       setFileError(null)
       setFileDirty(false)
-      setFileCache((prev) => (prev[path] === body ? prev : { ...prev, [path]: body }))
+      setFileCache((prev) => rememberFileBody(prev, path, body))
     }
 
     const applyMissing = () => {
@@ -870,7 +869,7 @@ export default function App({ appId, token }) {
 
     const unsubscribe = storage.subscribeText(path, (body) => {
       if (typeof body === 'string') applyBody(body)
-      else if (body == null) applyMissing()
+      else if (body == null && online) applyMissing()
     })
 
     // Cache hit — paint synchronously, then revalidate while online.
@@ -883,24 +882,17 @@ export default function App({ appId, token }) {
       setFileDirty(false)
     }
 
-    // Cache miss. Offline → show a friendly note rather than the
-    // "File not found" misnomer the old code used when storage.get
-    // returned null offline. Online → fetch + memoise.
-    if (!online && typeof cachedBody !== 'string') {
-      setFileContent('')
-      setFileError('Not available offline. Open this file once online to cache it.')
-      setFileLoading(false)
-      setFileDirty(false)
-    }
-
     const readLatest = () => {
-      if (!online) return
       if (fileDirtyRef.current || fileSavingRef.current) return
       if (!painted) setFileLoading(true)
       setFileError(null)
       storage.get(path).then((data) => {
         if (cancelled) return
-        if (data == null) applyMissing()
+        if (data == null && !online) {
+          setFileContent('')
+          setFileError('Not available offline. Open this file once online to cache it.')
+          setFileDirty(false)
+        } else if (data == null) applyMissing()
         else if (typeof data === 'string') applyBody(data)
         else applyBody(JSON.stringify(data, null, 2))
         painted = true
@@ -1047,28 +1039,21 @@ export default function App({ appId, token }) {
     }
     try {
       await storage.setText(path, '')
-      // Merge into the SERVER's current index, not the in-memory snapshot: a
-      // concurrent create/delete (another device, or this app's own rapid
-      // second mutation before filesRef syncs) could otherwise be clobbered by
-      // a whole-array PUT derived from a stale list.
-      const fresh = await storage.getFresh('files-index.json')
-      const base = Array.isArray(fresh) ? fresh : filesRef.current
-      const next = [...new Set([...base, path])].sort()
-      await storage.setJSON('files-index.json', next)
+      const { value } = await storage.updateJSON('files-index.json', (current) => (
+        cleanIndexPaths([...(Array.isArray(current) ? current : filesRef.current), path])
+      ))
+      const next = cleanIndexPaths(value)
       setFiles(next)
-      // Seed the cache with the empty body so a subsequent offline
-      // reload doesn't show "Not available offline" for a file we
-      // just created.
-      setFileCache((prev) => ({ ...prev, [path]: '' }))
+      setFileCache((prev) => rememberFileBody(prev, path, ''))
       setSelectedPath(path)
-      closeNav()
+      if (!isWide) closeNav()
       refreshPending()
       signal('item_created', { type: 'file' })
     } catch (e) {
       signal('error', { message: e.message || String(e), source: 'create-file' })
       await modal.alert(e.message || String(e), { title: 'Could not create file' })
     }
-  }, [storage, modal, closeNav, refreshPending, ensureIndexWritable])
+  }, [storage, modal, closeNav, isWide, refreshPending, ensureIndexWritable])
 
   const handleCreateFolder = useCallback(async () => {
     if (!(await ensureIndexWritable())) return
@@ -1115,11 +1100,10 @@ export default function App({ appId, token }) {
     const path = `${dir}/.keep`
     try {
       await storage.setText(path, '')
-      // Merge into the server's current index, not the stale in-memory list.
-      const fresh = await storage.getFresh('files-index.json')
-      const base = Array.isArray(fresh) ? fresh : filesRef.current
-      const next = [...new Set([...base, path])].sort()
-      await storage.setJSON('files-index.json', next)
+      const { value } = await storage.updateJSON('files-index.json', (current) => (
+        cleanIndexPaths([...(Array.isArray(current) ? current : filesRef.current), path])
+      ))
+      const next = cleanIndexPaths(value)
       setFiles(next)
       refreshPending()
       signal('item_created', { type: 'folder' })
@@ -1142,15 +1126,11 @@ export default function App({ appId, token }) {
     if (!ok) return
     try {
       await storage.remove(path)
-      // Remove from the server's current index, not the stale in-memory list, so
-      // a concurrent mutation isn't clobbered by a whole-array PUT.
-      const fresh = await storage.getFresh('files-index.json')
-      const base = Array.isArray(fresh) ? fresh : filesRef.current
-      const next = base.filter((p) => p !== path)
-      await storage.setJSON('files-index.json', next)
+      const { value } = await storage.updateJSON('files-index.json', (current) => (
+        cleanIndexPaths((Array.isArray(current) ? current : filesRef.current).filter((p) => p !== path))
+      ))
+      const next = cleanIndexPaths(value)
       setFiles(next)
-      // Drop the cached body so a future offline reload doesn't
-      // resurrect a deleted file.
       setFileCache((prev) => {
         if (!(path in prev)) return prev
         const ncache = { ...prev }
@@ -1208,7 +1188,7 @@ export default function App({ appId, token }) {
         if (isText) {
           const text = await f.text()
           await storage.setText(path, text)
-          setFileCache((prev) => ({ ...prev, [path]: text }))
+          setFileCache((prev) => rememberFileBody(prev, path, text))
           textCount += 1
         } else {
           // Non-text: PUT the raw blob. We deliberately don't cache the body
@@ -1224,12 +1204,10 @@ export default function App({ appId, token }) {
     }
     if (added.length) {
       try {
-        // Merge the uploaded paths into the server's current index, not the
-        // stale in-memory list, so a concurrent mutation isn't clobbered.
-        const fresh = await storage.getFresh('files-index.json')
-        const base = Array.isArray(fresh) ? fresh : filesRef.current
-        const next = [...new Set([...base, ...added])].sort()
-        await storage.setJSON('files-index.json', next)
+        const { value } = await storage.updateJSON('files-index.json', (current) => (
+          cleanIndexPaths([...(Array.isArray(current) ? current : filesRef.current), ...added])
+        ))
+        const next = cleanIndexPaths(value)
         setFiles(next)
       } catch (e) {
         signal('error', { message: e.message || String(e), source: 'upload-index' })
@@ -1287,12 +1265,10 @@ export default function App({ appId, token }) {
         if (p.startsWith(`${from}/`)) return to + p.slice(from.length)
         return p
       }
-      // Apply the rename to the server's current index, not the stale in-memory
-      // list, so a concurrent mutation isn't clobbered by a whole-array PUT.
-      const fresh = await storage.getFresh('files-index.json')
-      const base = Array.isArray(fresh) ? fresh : filesRef.current
-      const next = [...new Set(base.map(rewrite))].sort()
-      await storage.setJSON('files-index.json', next)
+      const { value } = await storage.updateJSON('files-index.json', (current) => (
+        cleanIndexPaths((Array.isArray(current) ? current : filesRef.current).map(rewrite))
+      ))
+      const next = cleanIndexPaths(value)
       setFiles(next)
       // Carry the cached body + selection + pdf mapping across the rename.
       setFileCache((prev) => {
@@ -1374,12 +1350,10 @@ export default function App({ appId, token }) {
       }
       // Drop every index entry under the folder, plus the cache + selection.
       const under = (p) => p === folderPath || p.startsWith(`${folderPath}/`)
-      // Remove from the server's current index, not the stale in-memory list, so
-      // a concurrent mutation isn't clobbered by a whole-array PUT.
-      const fresh = await storage.getFresh('files-index.json')
-      const base = Array.isArray(fresh) ? fresh : filesRef.current
-      const next = base.filter((p) => !under(p))
-      await storage.setJSON('files-index.json', next)
+      const { value } = await storage.updateJSON('files-index.json', (current) => (
+        cleanIndexPaths((Array.isArray(current) ? current : filesRef.current).filter((p) => !under(p)))
+      ))
+      const next = cleanIndexPaths(value)
       setFiles(next)
       setFileCache((prev) => {
         const out = {}
@@ -1493,11 +1467,12 @@ export default function App({ appId, token }) {
     // in this callback's closure may be stale (a chat turn or upload added an
     // entry meanwhile). Read the freshest list from the ref, merge the new
     // PDF, and persist once.
-    const cur = filesRef.current
-    if (cur.includes(pdfPath)) return
-    const next = [...cur, pdfPath].sort()
+    if (filesRef.current.includes(pdfPath)) return
     try {
-      await storage.setJSON('files-index.json', next)
+      const { value } = await storage.updateJSON('files-index.json', (current) => (
+        cleanIndexPaths([...(Array.isArray(current) ? current : filesRef.current), pdfPath])
+      ))
+      const next = cleanIndexPaths(value)
       setFiles(next)
       refreshPending()
     } catch (e) {
@@ -1510,7 +1485,7 @@ export default function App({ appId, token }) {
     setFileContent(value)
     setFileDirty(true)
     if (selectedPath) {
-      setFileCache((prev) => ({ ...prev, [selectedPath]: value }))
+      setFileCache((prev) => rememberFileBody(prev, selectedPath, value))
     }
   }, [selectedPath])
 
@@ -1529,12 +1504,13 @@ export default function App({ appId, token }) {
       // against a stale snapshot).
       const p = storage.setText(path, body).then(() => {
         if (selectedPathRef.current !== path) return
-        setFileCache((prev) => ({ ...prev, [path]: body }))
+        setFileCache((prev) => rememberFileBody(prev, path, body))
+        setSaveError(null)
         if (fileContentRef.current === body) setFileDirty(false)
         refreshPending()
       }).catch((e) => {
         if (selectedPathRef.current === path) {
-          setFileError(e.message || 'Could not save file.')
+          setSaveError(e.message || 'Could not save file.')
         }
       }).finally(() => {
         if (selectedPathRef.current === path) setFileSaving(false)
@@ -1559,15 +1535,16 @@ export default function App({ appId, token }) {
       return savePromiseRef.current
     }
     setFileSaving(true)
-    setFileError(null)
+    setSaveError(null)
     const p = (async () => {
       try {
         await storage.setText(selectedPath, fileContent)
         setFileDirty(false)
-        setFileCache((prev) => ({ ...prev, [selectedPath]: fileContent }))
+        setFileCache((prev) => rememberFileBody(prev, selectedPath, fileContent))
+        setSaveError(null)
         refreshPending()
       } catch (e) {
-        setFileError(e.message || 'Could not save file.')
+        setSaveError(e.message || 'Could not save file.')
       } finally {
         setFileSaving(false)
         savePromiseRef.current = null
@@ -1592,7 +1569,7 @@ export default function App({ appId, token }) {
     if (savePromiseRef.current) { try { await savePromiseRef.current } catch { /* error surfaced by the in-flight write */ } }
     if (fileDirtyRef.current) {
       await storage.setText(path, fileContentRef.current)
-      setFileCache((prev) => ({ ...prev, [path]: fileContentRef.current }))
+      setFileCache((prev) => rememberFileBody(prev, path, fileContentRef.current))
       setFileDirty(false)
     }
   }, [canEditSelected, selectedIsBinary, storage])
@@ -1615,6 +1592,7 @@ export default function App({ appId, token }) {
     setFileContent('')
     setFileLoading(false)
     setFileError(null)
+    setSaveError(null)
     setFileDirty(false)
     setFileSaving(false)
     setMainPath(null)
@@ -1634,9 +1612,17 @@ export default function App({ appId, token }) {
     setActiveProjectId(next)
   }, [activeProjectId, appId, closeNav, flushDirtyEdits, projects, resetFileUi])
 
-  const saveProjects = useCallback(async (next) => {
+  const updateProjects = useCallback(async (mutate) => {
+    const { value } = await rawStorage.updateJSON(PROJECTS_KEY, (current) => {
+      const normalized = normalizeProjects(current)
+      const base = normalized.length
+        ? normalized
+        : [{ id: DEFAULT_PROJECT_ID, name: 'Project 1', createdAt: Date.now() }]
+      return normalizeProjects(mutate(base))
+    })
+    const next = normalizeProjects(value)
     setProjects(next)
-    await rawStorage.setJSON(PROJECTS_KEY, next)
+    return next
   }, [rawStorage])
 
   const readFreshProjects = useCallback(async () => {
@@ -1666,13 +1652,15 @@ export default function App({ appId, token }) {
   const cancelRenameProject = useCallback(() => setRenamingId(null), [])
 
   const handleNewProject = useCallback(async () => {
-    const name = `Project ${projects.length + 1}`
-    const base = await readFreshProjects()
-    const id = uniqueProjectId(name, base)
-    const nextProject = { id, name, createdAt: Date.now() }
-    const next = [...base, nextProject]
+    let nextProject = null
     try {
-      await saveProjects(next)
+      const next = await updateProjects((base) => {
+        const name = `Project ${base.length + 1}`
+        const id = uniqueProjectId(name, base)
+        nextProject = { id, name, createdAt: Date.now() }
+        return [...base, nextProject]
+      })
+      const id = nextProject.id
       signal('item_created', { type: 'project' })
       signal('project_created', { project_count: next.length })
       // Flush dirty edits before changing activeProjectId — the project-change
@@ -1687,23 +1675,24 @@ export default function App({ appId, token }) {
       signal('error', { message: e.message || String(e), source: 'create-project' })
       await modal.alert(e.message || String(e), { title: 'Could not create project' })
     }
-  }, [appId, flushDirtyEdits, modal, projects.length, readFreshProjects, saveProjects])
+  }, [appId, flushDirtyEdits, modal, updateProjects])
 
   const commitRenameProject = useCallback(async (projectId, rawName) => {
     const clean = String(rawName || '').trim()
     try {
-      const fresh = await readFreshProjects()
-      const current = fresh.find((p) => p.id === projectId)
-      if (!current || !clean || clean === current.name) return
-      const next = fresh.map((p) => (p.id === projectId ? { ...p, name: clean } : p))
-      await saveProjects(next)
+      if (!clean) return
+      await updateProjects((base) => base.map((project) => (
+        project.id === projectId && project.name !== clean
+          ? { ...project, name: clean }
+          : project
+      )))
     } catch (e) {
       signal('error', { message: e.message || String(e), source: 'rename-project' })
       await modal.alert(e.message || String(e), { title: 'Could not rename project' })
     } finally {
       setRenamingId(null)
     }
-  }, [modal, readFreshProjects, saveProjects])
+  }, [modal, updateProjects])
 
   const handleDeleteProject = useCallback(async (projectId) => {
     const base = await readFreshProjects()
@@ -1728,12 +1717,19 @@ export default function App({ appId, token }) {
       await modal.alert('The default project and the last remaining project cannot be deleted.', { title: 'Cannot delete project' })
       return
     }
-    const next = fresh.filter((p) => p.id !== current.id)
-    const fallback = next.some((p) => p.id === DEFAULT_PROJECT_ID) ? DEFAULT_PROJECT_ID : next[0].id
+    let fallback = DEFAULT_PROJECT_ID
+    let removed = false
     try {
       await deleteProjectTree(current.id)
-      await saveProjects(next)
-      removeFileCache(appId, current.id)
+      await updateProjects((base) => {
+        const live = base.find((item) => item.id === current.id)
+        if (!live || live.id === DEFAULT_PROJECT_ID || base.length <= 1) return base
+        const next = base.filter((item) => item.id !== current.id)
+        fallback = next.some((item) => item.id === DEFAULT_PROJECT_ID) ? DEFAULT_PROJECT_ID : next[0].id
+        removed = true
+        return next
+      })
+      if (!removed) throw new Error('That project changed before it could be deleted.')
       if (activeProjectId === current.id) {
         resetFileUi()
         writeActiveProject(appId, fallback)
@@ -1744,7 +1740,7 @@ export default function App({ appId, token }) {
       signal('error', { message: e.message || String(e), source: 'delete-project' })
       await modal.alert(e.message || String(e), { title: 'Could not delete project' })
     }
-  }, [activeProjectId, appId, deleteProjectTree, modal, readFreshProjects, resetFileUi, saveProjects])
+  }, [activeProjectId, appId, deleteProjectTree, modal, readFreshProjects, resetFileUi, updateProjects])
 
   const handleBuild = useCallback(() => {
     // Build always compiles the MAIN document, regardless of which file is
@@ -1754,7 +1750,7 @@ export default function App({ appId, token }) {
     // Save the currently-open file's unsaved edits first so a compile picks
     // up on-screen changes to the main doc (or to any \input'd chapter the
     // user just edited). handleSaveFile resolves once the write lands (or
-    // fails silently into fileError); we build either way so a flaky save
+    // surfaces separately from loading errors); we build either way so a flaky save
     // doesn't strand the button.
     const kick = () => {
       buildStartedAtRef.current = Date.now()
@@ -1896,13 +1892,23 @@ export default function App({ appId, token }) {
       )
     }
     return (
-      <CodeEditor
-        value={fileContent}
-        markdown={false}
-        readOnly={false}
-        docKey={selectedPath}
-        onChange={handleEditorChange}
-      />
+      <div className="editor-with-status">
+        {saveError ? (
+          <div className="save-error" role="alert">
+            <span>{saveError}</span>
+            <button type="button" onClick={handleSaveFile} disabled={fileSaving}>
+              {fileSaving ? 'Saving…' : 'Retry'}
+            </button>
+          </div>
+        ) : null}
+        <CodeEditor
+          value={fileContent}
+          markdown={false}
+          readOnly={false}
+          docKey={selectedPath}
+          onChange={handleEditorChange}
+        />
+      </div>
     )
   }
 

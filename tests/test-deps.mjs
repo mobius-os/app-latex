@@ -26,6 +26,7 @@ function candidateNodeModules() {
   let dir = appRoot
   while (true) {
     candidates.push(join(dir, 'frontend', 'node_modules'))
+    candidates.push(join(dir, 'platform', 'frontend', 'node_modules'))
     candidates.push(join(dir, 'mobius', 'frontend', 'node_modules'))
     const parent = dirname(dir)
     if (parent === dir) break
