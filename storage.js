@@ -3,16 +3,14 @@ import {
   CHAT_OPEN_VERSION,
   CHAT_RATIO_VERSION,
   DEFAULT_PROJECT_ID,
-  FILE_CACHE_VERSION,
-  FILE_CONTENT_CACHE_LIMIT,
   PROJECT_ID_RE,
 } from './constants.js'
 import {
-  cleanIndexPaths,
   isUserJsonProjectPath,
-  normalizeFileCacheSnapshot,
   projectPrefix,
 } from './domain.js'
+
+const JSON_UPDATE_RETRIES = 4
 
 
 export function makeStorage(appId, token) {
@@ -137,6 +135,33 @@ export function makeStorage(appId, token) {
     if (!r.ok) throw new Error(`set ${path} → ${r.status}`)
     return { synced: true }
   }
+  async function updateJSON(path, mutate) {
+    if (typeof mutate !== 'function') throw new TypeError('updateJSON requires a mutator')
+
+    // files-index.json and projects.json are shared by the open editor,
+    // embedded agent, and other tabs. Guard their read/merge/write cycle while
+    // online so a late whole-document write cannot erase a concurrent change.
+    // Offline and older runtimes retain the existing queued-write behavior.
+    const isOffline = typeof window !== 'undefined' && window.mobius?.online === false
+    if (typeof ms?.getWithVersion === 'function' && typeof ms?.durableWrite === 'function' && !isOffline) {
+      for (let attempt = 0; attempt < JSON_UPDATE_RETRIES; attempt += 1) {
+        const { value, version } = await ms.getWithVersion(path, 'json')
+        const next = mutate(value)
+        try {
+          const options = version == null ? { ifNoneMatch: true } : { ifMatch: version }
+          const result = await ms.durableWrite(path, next, options)
+          return { value: next, result }
+        } catch (error) {
+          if (error?.code === 'conflict' && attempt + 1 < JSON_UPDATE_RETRIES) continue
+          throw error
+        }
+      }
+    }
+
+    const current = isOffline ? await get(path) : await getFresh(path)
+    const next = mutate(current)
+    return { value: next, result: await setJSON(path, next) }
+  }
   async function remove(path) {
     if (ms && typeof ms.remove === 'function') return ms.remove(path)
     const r = await fetch(`/api/storage/apps/${appId}/${path}`, {
@@ -164,6 +189,19 @@ export function makeStorage(appId, token) {
     }
     return entries
   }
+  async function listFiles(prefix = '') {
+    const files = []
+    const visit = async (dir) => {
+      const entries = await list(dir)
+      for (const entry of entries) {
+        if (!entry || typeof entry.path !== 'string') continue
+        if (entry.type === 'directory') await visit(`${entry.path.replace(/\/+$/, '')}/`)
+        else files.push(entry.path)
+      }
+    }
+    await visit(prefix)
+    return files
+  }
   async function pendingCount() {
     if (ms && typeof ms.pendingCount === 'function') {
       try { return await ms.pendingCount() } catch { return 0 }
@@ -176,8 +214,8 @@ export function makeStorage(appId, token) {
   }
   return {
     get, getFresh, getBlob, getBlobFresh,
-    setText, setBlob, setJSON, remove,
-    list,
+    setText, setBlob, setJSON, updateJSON, remove,
+    list, listFiles,
     subscribeText,
     pendingCount,
     hasRuntime,
@@ -198,8 +236,13 @@ export function makeProjectStorage(storage, activeProjectId) {
     setText: (path, text) => storage.setText(key(path), text),
     setBlob: (path, blob, options) => storage.setBlob(key(path), blob, options),
     setJSON: (path, obj) => storage.setJSON(key(path), obj),
+    updateJSON: (path, mutate) => storage.updateJSON(key(path), mutate),
     remove: (path) => storage.remove(key(path)),
     list: (path = '') => storage.list(key(path)),
+    listFiles: async (path = '') => {
+      const paths = await storage.listFiles(key(path))
+      return paths.map((item) => item.startsWith(prefix) ? item.slice(prefix.length) : item)
+    },
     subscribeText: (path, cb) => storage.subscribeText(key(path), cb),
   }
 }
@@ -233,15 +276,6 @@ export function useOnline() {
   return online
 }
 
-export function fileCacheKey(appId) {
-  return `latex:${appId}:files-cache:v${FILE_CACHE_VERSION}`
-}
-
-export function projectFileCacheKey(appId, projectId) {
-  if (projectId === DEFAULT_PROJECT_ID) return fileCacheKey(appId)
-  return `latex:${appId}:project:${projectId}:files-cache:v${FILE_CACHE_VERSION}`
-}
-
 export function activeProjectKey(appId) {
   return `latex:${appId}:activeProject`
 }
@@ -270,51 +304,4 @@ export function readChatRatio(appId) {
   const raw = Number(localStorage.getItem(chatRatioKey(appId)))
   if (!Number.isFinite(raw) || raw <= 0 || raw >= 1) return 0.5
   return Math.max(0.05, Math.min(0.95, raw))
-}
-
-export function readFileCache(appId, projectId = DEFAULT_PROJECT_ID) {
-  if (typeof localStorage === 'undefined') return null
-  try {
-    const raw = localStorage.getItem(projectFileCacheKey(appId, projectId))
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    return normalizeFileCacheSnapshot(parsed)
-  } catch {
-    return null
-  }
-}
-
-export function writeFileCache(appId, projectId, index, contents, lastPath) {
-  if (typeof localStorage === 'undefined') return
-  try {
-    const safeIndex = cleanIndexPaths(index)
-    // Trim contents to the index — orphaned bodies (deleted files)
-    // get GC'd here; only string bodies are kept (binary previews
-    // fetch from the server on demand).
-    const trimmed = {}
-    const indexSet = new Set(safeIndex)
-    const entries = Object.entries(contents)
-      .filter(([p, v]) => indexSet.has(p) && typeof v === 'string')
-      .slice(-FILE_CONTENT_CACHE_LIMIT)
-    for (const [p, v] of entries) trimmed[p] = v
-    localStorage.setItem(
-      projectFileCacheKey(appId, projectId),
-      JSON.stringify({
-        index: safeIndex,
-        contents: trimmed,
-        // lastPath persists across reloads so an offline reload
-        // reopens the file the user was last editing rather than
-        // jumping back to the first entry in the tree.
-        lastPath: (lastPath && indexSet.has(lastPath)) ? lastPath : null,
-      }),
-    )
-  } catch {
-    // Quota / disabled / serialization — leave the previous snapshot
-    // in place; the in-memory state still works this session.
-  }
-}
-
-export function removeFileCache(appId, projectId) {
-  if (typeof localStorage === 'undefined') return
-  try { localStorage.removeItem(projectFileCacheKey(appId, projectId)) } catch {}
 }

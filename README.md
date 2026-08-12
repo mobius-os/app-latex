@@ -37,8 +37,8 @@ The build button writes a per-run target at `build/runs/<run-id>.target.txt`, re
 ## Source layout
 
 - `index.jsx` owns top-level React state, project/file orchestration, build/chat wiring, and signal hooks.
-- `domain.js` holds pure path, project, PDF, and cache helpers.
-- `storage.js` wraps `window.mobius.storage`, including typed JSON/text/blob reads and project-prefix handling.
+- `domain.js` holds pure path, project, and PDF helpers.
+- `storage.js` wraps `window.mobius.storage`, including typed JSON/text/blob reads, project-prefix handling, and guarded shared-document updates.
 - `build/useBuild.js` owns the client-side source-to-PDF state machine.
 - `build.sh` is the server-side Tectonic job.
 - `theme.js`, `pdf/zoom.js`, and `ui/` contain styling, PDF zoom math, and focused UI components.
@@ -46,13 +46,20 @@ The build button writes a per-run target at `build/runs/<run-id>.target.txt`, re
 
 ### Data contracts
 
-- `files-index.json` is a typed JSON array of safe paths under `files/`. The agent is told to update this index whenever it creates or deletes a file; the UI also writes to it whenever you create, delete, upload, move, or build from the drawer/workspace. UI writes reject absolute paths, `.` / `..` segments, duplicate separators, and characters the storage backend rejects.
+- `files-index.json` is a typed JSON array of safe paths under `files/`. Agent and UI mutations merge under compare-and-swap retries, and an absent index is reconstructed by enumerating the real `files/` tree. UI writes reject absolute paths, `.` / `..` segments, duplicate separators, and characters the storage backend rejects.
 - User files under `files/` are project assets. Text assets, including `files/**/*.json`, are stored as text so they can be edited like LaTeX source; binary assets are stored as blobs.
 - App-owned JSON records such as `main.json`, `chat_id.json`, `projects.json`, `build/status.json`, and `build/runs/*.json` use typed JSON storage.
 
 ### Offline
 
 `offline_capable: true`. The app shell, file tree, cached source files, images, PDFs, and local edits go through `window.mobius.storage` when the runtime is present, including binary reads and uploads. The header sync pill is silent online and shows a plain `Offline` state when disconnected. Agent chat and server-side PDF builds still require the network.
+
+Text and binary assets keep their native storage kinds rather than passing
+through one universal document model. Live text subscriptions make agent edits
+appear in an open editor; shared list documents (`files-index.json` and
+`projects.json`) use guarded merge retries so another tab or agent cannot be
+erased by a late whole-array write. This provides safe convergence, not
+multi-user cursor presence or character-level coauthoring.
 
 ### Security
 

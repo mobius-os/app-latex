@@ -91,7 +91,6 @@ test('path guards accept only safe paths inside files/', async () => {
     isSafeStoragePath,
     isManagedJsonPath,
     isUserJsonProjectPath,
-    normalizeFileCacheSnapshot,
     pdfFromBuildStatusForDoc,
     pdfPathForTexDoc,
   } = await bundle()
@@ -120,26 +119,6 @@ test('path guards accept only safe paths inside files/', async () => {
   assert.equal(isUserJsonProjectPath('files/config.json'), true)
   assert.equal(isUserJsonProjectPath('projects/draft/files/config.json'), true)
   assert.equal(isUserJsonProjectPath('main.json'), false)
-
-  const snapshot = normalizeFileCacheSnapshot({
-    index: [
-      'files/z.tex',
-      'files/a.tex',
-      'files/../secret.tex',
-      'build/status.json',
-      'files/a.tex',
-    ],
-    contents: {
-      'files/a.tex': 'a',
-      'files/z.tex': 'z',
-      'files/../secret.tex': 'secret',
-      'files/orphan.tex': 'orphan',
-    },
-    lastPath: 'files/../secret.tex',
-  })
-  assert.deepEqual(snapshot.index, ['files/a.tex', 'files/z.tex'])
-  assert.deepEqual(snapshot.contents, { 'files/a.tex': 'a', 'files/z.tex': 'z' })
-  assert.equal(snapshot.lastPath, null)
 
   assert.equal(pdfPathForTexDoc('files/main.tex'), 'files/main.pdf')
   assert.equal(pdfPathForTexDoc('files/chapters/one.tex'), 'files/chapters/one.pdf')
