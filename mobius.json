@@ -2,45 +2,15 @@
   "id": "latex",
   "name": "LaTeX",
   "version": "2.15.7",
-  "description": "Write and compile LaTeX with live PDF preview and an agent that drafts your .tex.",
+  "description": "Create LaTeX Projects whose source, chats, PDF artifacts, and build history stay together.",
   "author": "mobius-os",
   "license": "MIT",
   "homepage": "https://github.com/mobius-os/app-latex",
   "entry": "index.jsx",
   "source_files": [
-    "constants.js",
-    "theme.js",
-    "domain.js",
-    "storage.js",
-    "source-syntax.js",
-    "pdf/zoom.js",
-    "pdf/worker.js",
-    "build/useBuild.js",
-    "ui/CodeEditor.jsx",
-    "ui/ImagePreview.jsx",
-    "ui/PdfPreview.jsx",
-    "ui/FileGlyph.jsx",
-    "ui/ChevronIcon.jsx",
-    "ui/PencilIcon.jsx",
-    "ui/PlusIcon.jsx",
-    "ui/NewFileIcon.jsx",
-    "ui/NewFolderIcon.jsx",
-    "ui/UploadIcon.jsx",
-    "ui/TrashIcon.jsx",
-    "ui/ToolIcon.jsx",
-    "ui/KebabIcon.jsx",
-    "ui/ChatBubbleIcon.jsx",
-    "ui/PlayIcon.jsx",
-    "ui/BuildingIndicator.jsx",
-    "ui/ContextMenu.jsx",
-    "ui/useLongPress.js",
-    "ui/FileNode.jsx",
-    "ui/ProjectSelector.jsx",
-    "ui/FileNavPanel.jsx",
-    "ui/ChatPanel.jsx",
-    "ui/useModal.jsx",
-    "ui/ModalView.jsx",
-    "ui/SyncPill.jsx"
+    "latex-project.md",
+    "project-builder.sh",
+    "templates/main.tex"
   ],
   "icon": "icon.png",
   "offline_capable": true,
@@ -48,33 +18,58 @@
     "cross_app_access": "none",
     "share_with_apps": "read"
   },
-  "storage_seeds": {
-    "files/welcome.tex": "files/welcome.tex",
-    "chat_id.json": null,
-    "files-index.json": [
-      "files/welcome.tex"
-    ]
-  },
   "runtime": {
     "imports": [
       "react",
       "react-dom",
-      "pdfjs-dist",
-      "@codemirror/state",
-      "@codemirror/view",
-      "@codemirror/commands",
-      "@codemirror/language",
       "@openai/apps-sdk-ui/components/Icon"
     ],
     "esm_deps": []
   },
   "offline": {
     "reads": true,
-    "writes": "queued",
+    "writes": "none",
     "execution": "none"
   },
-  "schedule": {
-    "job": "build.sh"
-  },
-  "embeds_agent": true
+  "embeds_agent": false,
+  "skills": [
+    "latex-project.md"
+  ],
+  "project_templates": [
+    {
+      "id": "document",
+      "name": "LaTeX document",
+      "description": "Write source with project chats and compile it into a PDF artifact.",
+      "guidance": "Work directly inside the project root. Keep LaTeX source and local assets together, and build the root .tex file as a PDF artifact.",
+      "skills": [
+        "latex-project.md"
+      ],
+      "dependencies": [
+        "tectonic"
+      ],
+      "files": {
+        "main.tex": "templates/main.tex"
+      },
+      "previews": [
+        {
+          "id": "document",
+          "name": "Document",
+          "kind": "pdf",
+          "path": "main.pdf"
+        }
+      ],
+      "artifact_types": [
+        {
+          "id": "latex",
+          "name": "PDF",
+          "extensions": [
+            "tex"
+          ],
+          "preview": "pdf",
+          "script": "project-builder.sh",
+          "output": "{stem}.pdf"
+        }
+      ]
+    }
+  ]
 }
