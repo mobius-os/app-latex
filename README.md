@@ -1,70 +1,26 @@
 # LaTeX
 
-A math-first LaTeX editor for [Möbius](https://github.com/mobius-os). Describe what you want to write in plain English; an AI sub-agent translates your prose into `.tex` files in app storage, and the app gives you an Overleaf-style Source/PDF workspace with an in-app pdf.js viewer.
+LaTeX is the document-project type for Möbius Projects. The app is a focused
+launcher for creating and reopening LaTeX projects; Projects owns their files,
+chats, build history, and PDF artifacts.
 
-<!-- TODO: docs/screenshot.png after first install. -->
+## Project contract
 
-## Install
+- Template type: `latex:document`
+- Starter source: `templates/main.tex`
+- Build action: `project-builder.sh`
+- Artifact: the selected root document compiled to PDF with Tectonic
+- Agent guidance: `latex-project.md`
 
-### Via the App Store (recommended)
+The installed app does not maintain a second file store or embedded editor.
+Source and assets stay inside the project root, and the platform provides the
+project workspace and artifact lifecycle.
 
-Open the **App Store** mini-app in Möbius, search for "LaTeX", tap **Install**.
+## Checks
 
-### Via paste-a-URL
-
-In the App Store, choose **Install from URL** and paste:
-
+```sh
+npm test
 ```
-https://raw.githubusercontent.com/mobius-os/app-latex/main/mobius.json
-```
 
-Möbius fetches the manifest, shows you the requested permissions and runtime dependencies, and installs with one tap.
-
-## What you get
-
-Three working regions, mobile-first:
-
-- **Source/PDF workspace** — edit the selected source file directly, build the main `.tex` document, then inspect the compiled PDF without leaving the app. On desktop, drag the divider (or focus it and use the arrow keys) to rebalance the panes. Images and PDFs opened from the file tree render through authenticated blob reads.
-- **File tree (left drawer)** — tap the app icon to toggle it. It docks beside the workspace on desktop and slides over it on compact screens. Shows everything under `files/`. The drawer supports new files, new folders, uploads, drag-to-move, rename, delete, and setting the main document.
-- **Chat panel (bottom)** — type what you want; the sub-agent edits files in your app storage and replies with a one-line summary of what it changed. The current file and file index refresh after chat turns.
-
-## How it works
-
-The chat panel creates a dedicated app chat and primes it with a short brief telling the sub-agent its working directory (`/data/apps/<your-app-id>/files/`), the file-index convention (see below), and the current main-document convention. The chat id is persisted to `chat_id.json` so the conversation survives reloads.
-
-The build button writes a per-run target at `build/runs/<run-id>.target.txt`, records the latest run id in `build/run-id.txt`, and runs the app schedule job. The app polls `build/runs/<run-id>.json`; `build/status.json` is still written as a latest-build convenience for older readers. Completed PDFs are tracked per main document and added to the file index when safe.
-
-## Source layout
-
-- `index.jsx` owns top-level React state, project/file orchestration, build/chat wiring, and signal hooks.
-- `domain.js` holds pure path, project, and PDF helpers.
-- `storage.js` wraps `window.mobius.storage`, including typed JSON/text/blob reads, project-prefix handling, and guarded shared-document updates.
-- `build/useBuild.js` owns the client-side source-to-PDF state machine.
-- `build.sh` is the server-side Tectonic job.
-- `theme.js`, `pdf/zoom.js`, and `ui/` contain styling, PDF zoom math, and focused UI components.
-- `tests/` uses Node's built-in test runner.
-
-### Data contracts
-
-- `files-index.json` is a typed JSON array of safe paths under `files/`. Agent and UI mutations merge under compare-and-swap retries, and an absent index is reconstructed by enumerating the real `files/` tree. UI writes reject absolute paths, `.` / `..` segments, duplicate separators, and characters the storage backend rejects.
-- User files under `files/` are project assets. Text assets, including `files/**/*.json`, are stored as text so they can be edited like LaTeX source; binary assets are stored as blobs.
-- App-owned JSON records such as `main.json`, `chat_id.json`, `projects.json`, `build/status.json`, and `build/runs/*.json` use typed JSON storage.
-
-### Offline
-
-`offline_capable: true`. The app shell, file tree, cached source files, images, PDFs, and local edits go through `window.mobius.storage` when the runtime is present, including binary reads and uploads. The header sync pill is silent online and shows a plain `Offline` state when disconnected. Agent chat and server-side PDF builds still require the network.
-
-Text and binary assets keep their native storage kinds rather than passing
-through one universal document model. Live text subscriptions make agent edits
-appear in an open editor; shared list documents (`files-index.json` and
-`projects.json`) use guarded merge retries so another tab or agent cannot be
-erased by a late whole-array write. This provides safe convergence, not
-multi-user cursor presence or character-level coauthoring.
-
-### Security
-
-Source files are edited as text, and PDFs render through pdf.js canvases rather than injected HTML. User-entered and uploaded paths are constrained to safe relative paths under `files/`; binary uploads use the Mobius storage runtime when available so they inherit its cache, size checks, and outbox behavior.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+The test suite validates the project manifest and launcher contract, compiles
+and shallow-renders the app entry, and syntax-checks the builder.
