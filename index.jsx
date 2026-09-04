@@ -33,7 +33,7 @@ body { margin: 0; }
 .lpx-list { display: grid; gap: 3px; }
 .lpx-project { width: 100%; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 7px 8px; border: 0; border-radius: 10px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
 .lpx-project:hover { background: var(--surface); }
-.lpx-project-icon { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.lpx-project-icon { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--project-row-accent, var(--text)) 22%, var(--border)); border-radius: 8px; color: color-mix(in srgb, var(--project-row-accent, var(--text)) 72%, var(--text)); background: color-mix(in srgb, var(--project-row-accent, var(--text)) 7%, var(--surface)); }
 .lpx-project-copy { min-width: 0; display: grid; gap: 2px; }
 .lpx-project-copy strong, .lpx-project-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lpx-project-copy strong { font-size: 13px; }
@@ -64,8 +64,8 @@ body { margin: 0; }
 
 function projectSubtitle(project) {
   const updated = project?.updated_at ? new Date(project.updated_at) : null
-  if (!updated || Number.isNaN(updated.getTime())) return 'LaTeX project'
-  return `Updated ${updated.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
+  if (!updated || Number.isNaN(updated.getTime())) return 'PDF'
+  return `PDF · Updated ${updated.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
 }
 
 export default function App({ appId }) {
@@ -92,8 +92,7 @@ export default function App({ appId }) {
     if (!projectApi || creating) return
     setCreating(true); setError('')
     try {
-      const project = await projectApi.create({ templateId: TEMPLATE_ID, name: 'Untitled LaTeX document' })
-      if (project?.id) await projectApi.open(project.id)
+      await projectApi.create({ templateId: TEMPLATE_ID, name: 'Untitled LaTeX document' })
     } catch (cause) { setError(cause?.message || 'Could not create a LaTeX project.') }
     finally { setCreating(false) }
   }
@@ -110,7 +109,7 @@ export default function App({ appId }) {
           </div>
           <div className="lpx-copy">
             <h1 className="lpx-title" id="lpx-title">LaTeX</h1>
-            <p className="lpx-description">Create document projects, edit source files with project chats, and build PDFs.</p>
+            <p className="lpx-description">Write LaTeX documents as projects, with project chats and source files, and build them into PDF artifacts.</p>
             <button type="button" className="lpx-primary" disabled={creating || !projectApi} onClick={() => void createProject()}>
               <Plus size={17} /> {creating ? 'Creating…' : 'New document'}
             </button>
@@ -121,18 +120,18 @@ export default function App({ appId }) {
 
         <section className="lpx-section" aria-labelledby="lpx-projects-title">
           <div className="lpx-section-head">
-            <h2 id="lpx-projects-title">LaTeX projects</h2>
+            <h2 id="lpx-projects-title">Recent projects</h2>
             <button type="button" className="lpx-secondary" disabled={!projectApi} onClick={() => projectApi?.browse()}>View all Projects</button>
           </div>
           {loading ? (
             <div className="lpx-empty" role="status"><p>Loading projects…</p></div>
           ) : projects.length === 0 ? (
-            <div className="lpx-empty"><FileDocument size={25} aria-hidden="true" /><p>No LaTeX projects yet.</p></div>
+            <div className="lpx-empty"><FileDocument size={25} aria-hidden="true" /><p>No documents yet. Start one above.</p></div>
           ) : (
             <div className="lpx-list">
-              {projects.map(project => (
+              {[...projects].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0)).map(project => (
                 <button key={project.id} type="button" className="lpx-project" onClick={() => projectApi?.open(project.id)}>
-                  <span className="lpx-project-icon" aria-hidden="true"><FileDocument size={16} /></span>
+                  <span className="lpx-project-icon" aria-hidden="true" style={{ '--project-row-accent': /^#[0-9a-f]{6}$/i.test(project.color || '') ? project.color : 'var(--text)' }}><FileDocument size={16} /></span>
                   <span className="lpx-project-copy"><strong>{project.name}</strong><small>{projectSubtitle(project)}</small></span>
                   <ChevronRight size={16} aria-hidden="true" />
                 </button>
