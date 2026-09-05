@@ -9,7 +9,7 @@ const builder = read('project-builder.sh')
 const guidance = read('latex-project.md')
 
 test('LaTeX declares one first-class document project contract', () => {
-  assert.equal(manifest.version, '3.0.0')
+  assert.equal(manifest.version, '3.0.1')
   assert.equal(manifest.embeds_agent, false)
   assert.deepEqual(manifest.source_files, [
     'latex-project.md',
@@ -37,11 +37,13 @@ test('the launcher delegates workspace ownership to Projects', () => {
     assert.match(source, new RegExp(`projectApi\\??\\.${operation}`))
   }
   assert.doesNotMatch(source, /mobius\?\.storage|mobius\.chat|localStorage/)
+  assert.doesNotMatch(source, /const project = await projectApi\.create/)
+  assert.match(source, /--project-row-accent/)
   assert.match(source, /min-height:\s*44px/)
   assert.match(source, /:focus-visible/)
 })
 
-test('the PDF builder and agent guidance stay project-scoped', () => {
+test('the PDF builder stays project-scoped while guidance supports standalone Pages', () => {
   for (const name of ['PROJECT_ROOT', 'PROJECT_SOURCE', 'PROJECT_OUTPUT_DIR']) {
     assert.match(builder, new RegExp(`\\$\\{${name}:\\?`))
   }
@@ -49,4 +51,7 @@ test('the PDF builder and agent guidance stay project-scoped', () => {
   assert.match(builder, /tectonic "\$PROJECT_SOURCE" --outdir "\$PROJECT_OUTPUT_DIR"/)
   assert.match(guidance, /Edit source files directly under `\$PROJECT_ROOT`/)
   assert.match(guidance, /Never delete or replace unrelated Project files/)
+  assert.match(guidance, /When there is no `\$PROJECT_ROOT`/)
+  assert.match(guidance, /"template_id": "latex:document"/)
+  assert.match(guidance, /Projects → New → Import existing/)
 })
