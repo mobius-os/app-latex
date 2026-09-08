@@ -2,7 +2,7 @@
   "id": "latex",
   "name": "LaTeX",
   "version": "3.0.1",
-  "description": "Create LaTeX Projects whose source, chats, PDF artifacts, and build history stay together.",
+  "description": "A Project app for LaTeX documents and PDF Creations.",
   "author": "mobius-os",
   "license": "MIT",
   "homepage": "https://github.com/mobius-os/app-latex",
@@ -39,8 +39,8 @@
     {
       "id": "document",
       "name": "LaTeX document",
-      "description": "Write source with project chats and compile it into a PDF artifact.",
-      "guidance": "Work directly inside the project root. Keep LaTeX source and local assets together, and build the root .tex file as a PDF artifact.",
+      "description": "Write source with project chats and compile it into a PDF Creation.",
+      "guidance": "Work directly inside the project root. Keep LaTeX source and local assets together, and build the root .tex file as a PDF Creation.",
       "skills": [
         "latex-project.md"
       ],
@@ -69,7 +69,8 @@
           "script": "project-builder.sh",
           "output": "{stem}.pdf"
         }
-      ]
+      ],
+      "kind": "latex"
     }
   ]
 }

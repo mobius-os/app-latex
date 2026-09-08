@@ -1,144 +1,144 @@
-import { useCallback, useEffect, useState } from 'react'
-import { ChevronRight, FileDocument, Plus } from '@openai/apps-sdk-ui/components/Icon'
+/* A focused project launcher: resume work first, with creation owned by Projects. */
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ChevronRight, FileDocument, FileCode, FilePresentation, Grid, WebsiteNetwork, Plus, Search } from '@openai/apps-sdk-ui/components/Icon'
 
-const TEMPLATE_ID = 'latex:document'
-
+const LOCAL_TEMPLATE_ID = 'document'
+const TYPES = {
+  website: { label: 'Website', icon: WebsiteNetwork },
+  'mini-app': { label: 'Mini-app', icon: FileCode },
+  visualization: { label: 'Visualization', icon: Grid },
+  document: { label: 'PDF', icon: FileDocument },
+  spreadsheet: { label: 'Spreadsheet', icon: Grid },
+  presentation: { label: 'Presentation', icon: FilePresentation },
+}
 const CSS = `
 * { box-sizing: border-box; }
-html, body, #root { min-height: 100%; }
 body { margin: 0; }
 .lpx-root { min-height: 100%; color: var(--text); background: var(--bg); font-family: var(--font); }
-.lpx-shell { width: min(900px, 100%); margin: 0 auto; padding: max(20px, env(safe-area-inset-top)) clamp(16px, 5vw, 44px) max(28px, env(safe-area-inset-bottom)); }
-.lpx-hero { display: grid; grid-template-columns: 210px minmax(0, 1fr); align-items: center; gap: clamp(24px, 6vw, 58px); padding: clamp(12px, 3vw, 26px) 0 clamp(28px, 6vw, 48px); }
-.lpx-visual { position: relative; min-height: 220px; display: grid; place-items: center; overflow: hidden; border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-light, var(--border))); border-radius: 24px; background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
-.lpx-paper { position: absolute; width: 116px; height: 154px; border: 1px solid color-mix(in srgb, var(--accent) 15%, var(--border)); border-radius: 8px; background: var(--bg); box-shadow: 0 14px 40px color-mix(in srgb, var(--accent) 12%, transparent); }
-.lpx-paper--back { transform: translate(-17px, 8px) rotate(-7deg); opacity: .72; }
-.lpx-paper--front { transform: translate(10px, -4px) rotate(3deg); }
-.lpx-paper::before, .lpx-paper::after { content: ''; position: absolute; left: 20px; right: 20px; height: 2px; border-radius: 2px; background: color-mix(in srgb, var(--muted) 22%, transparent); box-shadow: 0 13px 0 color-mix(in srgb, var(--muted) 16%, transparent), 0 26px 0 color-mix(in srgb, var(--muted) 16%, transparent); }
-.lpx-paper::before { top: 82px; }
-.lpx-paper::after { top: 121px; right: 42px; }
-.lpx-logo { position: relative; z-index: 2; width: 88px; height: 88px; object-fit: contain; filter: drop-shadow(0 12px 18px color-mix(in srgb, var(--accent) 20%, transparent)); }
-.lpx-copy { min-width: 0; }
-.lpx-title { display: flex; align-items: center; gap: 11px; margin: 0; font-size: clamp(28px, 5vw, 42px); line-height: 1; letter-spacing: -.045em; font-weight: 680; }
-.lpx-title-logo { display: none; width: 42px; height: 42px; object-fit: contain; }
-.lpx-description { max-width: 46ch; margin: 14px 0 22px; color: var(--muted); font-size: 15px; line-height: 1.55; }
-.lpx-primary, .lpx-secondary, .lpx-project { min-height: 44px; font: inherit; }
-.lpx-primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 16px; border: 1px solid var(--accent); border-radius: 11px; color: var(--accent-fg, white); background: var(--accent); font-size: 13px; font-weight: 700; cursor: pointer; }
-.lpx-primary:disabled { cursor: default; opacity: .55; }
-.lpx-section { border-top: 1px solid var(--border-light, var(--border)); padding-top: 18px; }
-.lpx-section-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
-.lpx-section-head h2 { margin: 0; font-size: 14px; letter-spacing: -.01em; }
-.lpx-secondary { padding: 0 8px; border: 0; color: var(--muted); background: transparent; font-size: 12px; font-weight: 650; cursor: pointer; }
-.lpx-secondary:hover { color: var(--text); }
-.lpx-list { display: grid; gap: 3px; }
-.lpx-project { width: 100%; display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 7px 8px; border: 0; border-radius: 10px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.lpx-shell { width: min(820px, 100%); margin: 0 auto; padding: 24px clamp(16px, 4vw, 36px) max(28px, env(safe-area-inset-bottom)); }
+.lpx-header { display: flex; align-items: center; gap: 16px; }
+.lpx-logo { width: 56px; height: 56px; object-fit: contain; flex: 0 0 auto; }
+.lpx-header h1 { margin: 0; font-size: 28px; font-weight: 650; letter-spacing: -.03em; }
+.lpx-description { margin: 8px 0 0; max-width: 52ch; font-size: 14px; line-height: 1.5; color: var(--muted); }
+.lpx-primary { min-height: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 16px; border: 0; border-radius: 10px; color: var(--accent-fg, white); background: var(--accent); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+.lpx-create { margin: 24px 0 28px; }
+.lpx-section { border-top: 1px solid var(--border); padding-top: 12px; }
+.lpx-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.lpx-section-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.lpx-secondary { min-height: 44px; padding: 0 8px; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 13px; cursor: pointer; }
+.lpx-secondary:hover { color: var(--text); background: var(--surface); border-radius: 8px; }
+.lpx-search { display: flex; gap: 10px; align-items: center; min-height: 44px; padding: 0 12px; margin: 10px 0 12px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--surface); }
+.lpx-search input { width: 100%; min-width: 0; min-height: 44px; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 14px; }
+.lpx-search:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lpx-search input::placeholder { color: var(--muted); }
+.lpx-list { display: grid; gap: 4px; }
+.lpx-project { width: 100%; min-height: 60px; display: flex; align-items: center; gap: 12px; padding: 8px; border: 0; border-radius: 10px; color: var(--text); background: transparent; font: inherit; text-align: left; cursor: pointer; }
 .lpx-project:hover { background: var(--surface); }
-.lpx-project-icon { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--project-row-accent, var(--text)) 22%, var(--border)); border-radius: 8px; color: color-mix(in srgb, var(--project-row-accent, var(--text)) 72%, var(--text)); background: color-mix(in srgb, var(--project-row-accent, var(--text)) 7%, var(--surface)); }
-.lpx-project-copy { min-width: 0; display: grid; gap: 2px; }
-.lpx-project-copy strong, .lpx-project-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lpx-project-copy strong { font-size: 13px; }
-.lpx-project-copy small { color: var(--muted); font-size: 10px; }
-.lpx-project > svg { color: var(--muted); }
-.lpx-empty { min-height: 126px; display: grid; place-content: center; justify-items: center; gap: 7px; padding: 20px; border: 1px dashed var(--border-light, var(--border)); border-radius: 13px; color: var(--muted); text-align: center; }
-.lpx-empty p { margin: 0; font-size: 12px; line-height: 1.45; }
-.lpx-error { margin: 0 0 14px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--danger, #c43d3d) 28%, var(--border)); border-radius: 10px; color: var(--danger, #c43d3d); background: color-mix(in srgb, var(--danger, #c43d3d) 7%, var(--surface)); font-size: 12px; }
-.lpx-primary:focus-visible, .lpx-secondary:focus-visible, .lpx-project:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-@media (max-width: 620px) {
-  .lpx-shell { padding-top: max(16px, env(safe-area-inset-top)); }
-  .lpx-hero { grid-template-columns: 1fr; gap: 14px; padding-top: 6px; }
-  .lpx-visual { min-height: 158px; }
-  .lpx-paper { width: 90px; height: 120px; }
-  .lpx-paper::before { top: 64px; }
-  .lpx-paper::after { top: 92px; }
-  .lpx-logo { width: 68px; height: 68px; }
-  .lpx-title { font-size: 30px; }
-  .lpx-description { margin: 10px 0 17px; font-size: 14px; }
+.lpx-project-icon { width: 36px; height: 36px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--project-row-accent, var(--text)) 25%, var(--border)); border-radius: 10px; color: var(--project-row-accent, var(--text)); background: var(--surface); }
+.lpx-project-copy { min-width: 0; flex: 1; display: grid; gap: 4px; }
+.lpx-project-copy strong { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lpx-project-copy small { font-size: 12px; color: var(--muted); }
+.lpx-project > svg { color: var(--muted); flex-shrink: 0; }
+.lpx-empty { padding: 28px 8px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+.lpx-empty p { margin: 0 0 8px; }
+.lpx-error { color: var(--danger); font-size: 14px; line-height: 1.5; }
+.lpx-error p { margin: 8px 0; }
+.lpx-footer { margin-top: 20px; }
+.lpx-primary:focus-visible, .lpx-secondary:focus-visible, .lpx-project:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lpx-root button:disabled { cursor: default; opacity: .55; }
+.lpx-root ::selection { color: var(--text); background: var(--accent-dim, var(--surface)); }
+@media (max-width: 520px) {
+  .lpx-shell { padding-top: 20px; }
+  .lpx-header { align-items: flex-start; gap: 12px; }
+  .lpx-logo { width: 48px; height: 48px; }
+  .lpx-header h1 { font-size: 25px; }
   .lpx-primary { width: 100%; }
-}
-@media (prefers-reduced-motion: no-preference) {
-  .lpx-primary, .lpx-project { transition: transform 140ms ease, background 140ms ease, filter 140ms ease; }
-  .lpx-primary:hover { filter: brightness(1.04); transform: translateY(-1px); }
-  .lpx-primary:active { transform: none; }
 }
 `
 
-function projectSubtitle(project) {
-  const updated = project?.updated_at ? new Date(project.updated_at) : null
-  if (!updated || Number.isNaN(updated.getTime())) return 'PDF'
-  return `PDF · Updated ${updated.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
-}
-
 export default function App({ appId }) {
+  const projectApi = window.mobius?.projects
   const [projects, setProjects] = useState([])
+  const [templates, setTemplates] = useState([])
   const [loading, setLoading] = useState(true)
   const [creating, setCreating] = useState(false)
+  const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')
-  const projectApi = window.mobius?.projects
-  const logoUrl = `/api/apps/${appId}/icon`
+  const [search, setSearch] = useState('')
 
   const refresh = useCallback(async ({ migrate = false } = {}) => {
-    if (!projectApi) { setError('Projects need a newer Möbius shell.'); setLoading(false); return }
-    setError('')
+    if (!projectApi?.templates) { setLoadError('Refresh Möbius to load Projects support.'); setLoading(false); return }
+    setLoading(true)
+    setLoadError('')
     try {
-      const rows = migrate && typeof projectApi.migrate === 'function' ? await projectApi.migrate() : await projectApi.list()
-      setProjects(Array.isArray(rows) ? rows : [])
-    } catch (cause) { setError(cause?.message || 'Projects are unavailable right now.') }
-    finally { setLoading(false) }
+      const [rows, types] = await Promise.all([
+        migrate ? projectApi.migrate() : projectApi.list(),
+        projectApi.templates(),
+      ])
+      setProjects(rows)
+      setTemplates(types)
+      window.mobius?.signal?.('app_ready', { item_count: rows.length })
+    } catch (cause) {
+      setLoadError(cause?.message || 'Could not load your projects. Try again.')
+    } finally { setLoading(false) }
   }, [projectApi])
-
   useEffect(() => { void refresh({ migrate: true }) }, [refresh])
 
   async function createProject() {
-    if (!projectApi || creating) return
+    const template = templates.find(row => row.id === LOCAL_TEMPLATE_ID)
+    if (!template || creating) return
     setCreating(true); setError('')
     try {
-      await projectApi.create({ templateId: TEMPLATE_ID, name: 'Untitled LaTeX document' })
-    } catch (cause) { setError(cause?.message || 'Could not create a LaTeX project.') }
+      await projectApi.create({ templateId: template.key, name: 'Untitled document' })
+      window.mobius?.signal?.('item_created', { type: 'document' })
+    } catch (cause) { setError(cause?.message || 'Could not create your document. Try again.') }
     finally { setCreating(false) }
   }
-
+  async function openProject(id) {
+    setError('')
+    try { await projectApi.open(id) }
+    catch (cause) { setError(cause?.message || 'Could not open this project. Refresh the list and try again.') }
+  }
+  async function browse() {
+    setError('')
+    try { await projectApi.browse() }
+    catch (cause) { setError(cause?.message || 'Could not open Projects. Try again.') }
+  }
+  const rows = useMemo(() => [...projects].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))
+    .filter(row => row.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())), [projects, search])
+  const canCreate = templates.some(row => row.id === LOCAL_TEMPLATE_ID)
   return (
     <main className="lpx-root">
       <style>{CSS}</style>
       <div className="lpx-shell">
-        <section className="lpx-hero" aria-labelledby="lpx-title">
-          <div className="lpx-visual" aria-hidden="true">
-            <span className="lpx-paper lpx-paper--back" />
-            <span className="lpx-paper lpx-paper--front" />
-            <img className="lpx-logo" src={logoUrl} alt="" />
-          </div>
-          <div className="lpx-copy">
-            <h1 className="lpx-title" id="lpx-title">LaTeX</h1>
-            <p className="lpx-description">Write LaTeX documents as projects, with project chats and source files, and build them into PDF artifacts.</p>
-            <button type="button" className="lpx-primary" disabled={creating || !projectApi} onClick={() => void createProject()}>
-              <Plus size={17} /> {creating ? 'Creating…' : 'New document'}
-            </button>
-          </div>
-        </section>
-
+        <header className="lpx-header">
+          <img className="lpx-logo" src={`/api/apps/${appId}/icon`} alt="" />
+          <div><h1>LaTeX</h1><p className="lpx-description">Write with project chats, keep your source together, and build a PDF.</p></div>
+        </header>
+        <div className="lpx-create">
+          <button type="button" className="lpx-primary" disabled={creating || !canCreate} onClick={() => void createProject()}><Plus width={18} height={18} aria-hidden="true" />{creating ? 'Creating…' : 'New document'}</button>
+          {!loading && !loadError && !canCreate && <p className="lpx-error" role="alert">This project type is unavailable. Refresh the list or check the app installation.</p>}
+        </div>
         {error && <p className="lpx-error" role="alert">{error}</p>}
-
         <section className="lpx-section" aria-labelledby="lpx-projects-title">
-          <div className="lpx-section-head">
-            <h2 id="lpx-projects-title">Recent projects</h2>
-            <button type="button" className="lpx-secondary" disabled={!projectApi} onClick={() => projectApi?.browse()}>View all Projects</button>
-          </div>
-          {loading ? (
-            <div className="lpx-empty" role="status"><p>Loading projects…</p></div>
-          ) : projects.length === 0 ? (
-            <div className="lpx-empty"><FileDocument size={25} aria-hidden="true" /><p>No documents yet. Start one above.</p></div>
-          ) : (
-            <div className="lpx-list">
-              {[...projects].sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0)).map(project => (
-                <button key={project.id} type="button" className="lpx-project" onClick={() => projectApi?.open(project.id)}>
-                  <span className="lpx-project-icon" aria-hidden="true" style={{ '--project-row-accent': /^#[0-9a-f]{6}$/i.test(project.color || '') ? project.color : 'var(--text)' }}><FileDocument size={16} /></span>
-                  <span className="lpx-project-copy"><strong>{project.name}</strong><small>{projectSubtitle(project)}</small></span>
-                  <ChevronRight size={16} aria-hidden="true" />
-                </button>
-              ))}
-            </div>
-          )}
+          <header className="lpx-section-head"><h2 id="lpx-projects-title">Your projects</h2><button type="button" className="lpx-secondary" disabled={loading} onClick={() => void refresh()}>{loading ? 'Refreshing…' : 'Refresh'}</button></header>
+          {loadError && <div className="lpx-error" role="alert"><p>{loadError}</p><button type="button" className="lpx-secondary" onClick={() => void refresh()}>Try again</button></div>}
+          {projects.length > 0 && <label className="lpx-search"><Search width={18} height={18} aria-hidden="true" /><input type="search" aria-label="Find a project" placeholder="Find a project" value={search} onChange={event => setSearch(event.target.value)} /></label>}
+          {loading && projects.length === 0 ? <p className="lpx-empty" role="status">Loading your projects…</p>
+            : !loadError && projects.length === 0 ? <div className="lpx-empty"><p>Your document projects will appear here.</p><p>Start one above, then use its chat to describe what you want to make.</p></div>
+            : rows.length === 0 && projects.length > 0 ? <div className="lpx-empty"><p>No projects match “{search}”.</p><button className="lpx-secondary" onClick={() => setSearch('')}>Clear search</button></div>
+            : <div className="lpx-list">{rows.map(project => {
+              const type = TYPES[project.template?.id] || { label: 'Project', icon: FileDocument }
+              const Icon = type.icon
+              const date = new Date(project.updated_at || '')
+              return <button type="button" className="lpx-project" key={project.id} onClick={() => void openProject(project.id)}>
+                <span className="lpx-project-icon" aria-hidden="true" style={{ '--project-row-accent': /^#[0-9a-f]{6}$/i.test(project.color || '') ? project.color : 'var(--text)' }}><Icon width={18} height={18} /></span>
+                <span className="lpx-project-copy"><strong>{project.name}</strong><small>{type.label}{!Number.isNaN(date.getTime()) && ` · ${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`}</small></span>
+                <ChevronRight width={16} height={16} aria-hidden="true" />
+              </button>
+            })}</div>}
         </section>
+        <footer className="lpx-footer"><button type="button" className="lpx-secondary" onClick={() => void browse()}>All Projects & project types <ChevronRight width={14} height={14} aria-hidden="true" /></button></footer>
       </div>
     </main>
   )

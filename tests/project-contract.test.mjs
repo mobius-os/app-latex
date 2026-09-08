@@ -31,9 +31,9 @@ test('LaTeX declares one first-class document project contract', () => {
 })
 
 test('the launcher delegates workspace ownership to Projects', () => {
-  assert.match(source, /const TEMPLATE_ID = 'latex:document'/)
+  assert.match(source, /const LOCAL_TEMPLATE_ID = 'document'/)
   assert.match(source, /window\.mobius\?\.projects/)
-  for (const operation of ['migrate', 'list', 'create', 'open', 'browse']) {
+  for (const operation of ['templates', 'migrate', 'list', 'create', 'open', 'browse']) {
     assert.match(source, new RegExp(`projectApi\\??\\.${operation}`))
   }
   assert.doesNotMatch(source, /mobius\?\.storage|mobius\.chat|localStorage/)
@@ -53,5 +53,5 @@ test('the PDF builder stays project-scoped while guidance supports standalone Pa
   assert.match(guidance, /Never delete or replace unrelated Project files/)
   assert.match(guidance, /When there is no `\$PROJECT_ROOT`/)
   assert.match(guidance, /"template_id": "latex:document"/)
-  assert.match(guidance, /Projects → New → Import existing/)
+  assert.match(guidance, /Add to Projects/)
 })
