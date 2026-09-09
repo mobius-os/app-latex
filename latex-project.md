@@ -1,6 +1,6 @@
 ---
 name: latex-project
-description: Build or edit a LaTeX document when the LaTeX app is installed. In a latex:document Project, edit PROJECT_ROOT and rebuild its PDF artifact. In an ordinary chat with no Project, compile LaTeX directly into a standalone Page while retaining source metadata so the owner can later import an editable Project copy.
+description: Build or edit a LaTeX document when the LaTeX app is installed. In a latex:document Project, edit PROJECT_ROOT and rebuild its PDF artifact. In an ordinary chat with no Project, compile LaTeX directly into a standalone Page while retaining source metadata so the owner can later manage the existing source in Projects.
 ---
 
 # LaTeX work
@@ -10,15 +10,16 @@ description: Build or edit a LaTeX document when the LaTeX app is installed. In 
 When there is no `$PROJECT_ROOT`, do not create a Project merely to produce the
 document.
 
-1. Author the `.tex` source and related local files in a temporary working
-   directory. Keep one clear root document, normally `main.tex`.
-2. Compile it with Tectonic and fix the first concrete error.
-3. Read the `artifacts` skill (the Pages app) and create a standalone
-   self-contained HTML Page that presents the compiled PDF from an inline
-   `data:` URL. The Page is the pure independently openable result.
-4. Also copy the editable inputs into
-   `sources/<artifact_id>/` under the Pages app's numeric storage tree.
-   Add this record metadata so Projects can recreate an editable document:
+1. Read the `artifacts` skill to resolve the installed Pages app and mint a
+   stable `artifact_id`. Author `.tex` source and related local files directly
+   in `/data/apps/<PAGES_APP_ID>/sources/<artifact_id>/`. Keep one clear root
+   document, normally `main.tex`; this is the durable editable source tree.
+2. Compile it with Tectonic into a separate build directory and fix the first
+   concrete error. Keep generated PDF/log files out of the editable tree.
+3. Create a standalone self-contained HTML Page presenting the compiled PDF
+   from an inline `data:` URL. Publish it as an immutable Page version using
+   `artifacts`; it remains independently openable without a Project.
+4. Add explicit builder provenance so Projects can manage the existing source:
 
 ```json
 {
@@ -33,8 +34,13 @@ document.
 
 List every source file needed to rebuild the document; never include generated
 PDF/log files. Write source files before atomically publishing the record. The
-owner can later choose **Projects → New → Import existing**; importing creates
-an independent copy and does not live-link edits back to the Page.
+owner can later choose **Add to Projects** to manage this same source tree,
+not an independent copy. For later edits, reuse the source tree and page id,
+preserve this metadata, and compile a new immutable preview version. If already
+managed by Projects, use that same Project's root and build workflow rather
+than making a second editable workspace. Existing Page versions stay unchanged.
+Agent-led work and collaboration do not require the Projects interface; public
+sharing and Git actions still require the owner's explicit approval.
 
 ## Inside a Project
 
