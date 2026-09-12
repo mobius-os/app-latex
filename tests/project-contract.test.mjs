@@ -25,7 +25,9 @@ test('LaTeX declares one first-class document project contract', () => {
   const template = manifest.project_templates[0]
   assert.equal(template.id, 'document')
   assert.equal(template.files['main.tex'], 'templates/main.tex')
-  assert.equal(template.previews[0].kind, 'pdf')
+  assert.deepEqual(template.previews[0], {
+    id: 'document', name: 'Document', source: 'main.tex', builder: 'latex',
+  })
   assert.equal(template.artifact_types[0].script, 'project-builder.sh')
   assert.equal(template.artifact_types[0].output, '{stem}.pdf')
 })
