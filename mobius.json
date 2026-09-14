@@ -54,8 +54,8 @@
         {
           "id": "document",
           "name": "Document",
-          "source": "main.tex",
-          "builder": "latex"
+          "kind": "pdf",
+          "path": "main.pdf"
         }
       ],
       "artifact_types": [
