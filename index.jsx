@@ -66,23 +66,33 @@ export default function App({ appId }) {
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
 
-  const refresh = useCallback(async ({ migrate = false } = {}) => {
+  const refresh = useCallback(async () => {
     if (!projectApi?.templates) { setLoadError('Refresh Möbius to load Projects support.'); setLoading(false); return }
     setLoading(true)
     setLoadError('')
     try {
       const [rows, types] = await Promise.all([
-        migrate ? projectApi.migrate() : projectApi.list(),
+        projectApi.list(),
         projectApi.templates(),
       ])
       setProjects(rows)
       setTemplates(types)
       window.mobius?.signal?.('app_ready', { item_count: rows.length })
     } catch (cause) {
-      setLoadError(cause?.message || 'Could not load your projects. Try again.')
+      setLoadError(window.mobius?.online === false
+        ? 'LaTeX needs a connection to load Projects. It will retry when you reconnect.'
+        : (cause?.message || 'Could not load your projects. Try again.'))
     } finally { setLoading(false) }
   }, [projectApi])
-  useEffect(() => { void refresh({ migrate: true }) }, [refresh])
+  useEffect(() => {
+    void refresh()
+    let initial = true
+    const detach = window.mobius?.onOnlineChange?.((online) => {
+      if (initial) { initial = false; return }
+      if (online) void refresh()
+    })
+    return () => { if (typeof detach === 'function') detach() }
+  }, [refresh])
 
   async function createProject() {
     const template = templates.find(row => row.id === LOCAL_TEMPLATE_ID)

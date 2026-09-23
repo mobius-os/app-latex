@@ -1,7 +1,7 @@
 {
   "id": "latex",
   "name": "LaTeX",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "description": "A Project app for LaTeX documents and PDF Creations.",
   "author": "mobius-os",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "templates/main.tex"
   ],
   "icon": "icon.png",
-  "offline_capable": true,
+  "offline_capable": false,
   "permissions": {
     "cross_app_access": "none",
     "share_with_apps": "read"
@@ -27,7 +27,7 @@
     "esm_deps": []
   },
   "offline": {
-    "reads": true,
+    "reads": false,
     "writes": "none",
     "execution": "none"
   },

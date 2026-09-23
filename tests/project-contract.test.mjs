@@ -9,15 +9,16 @@ const builder = read('project-builder.sh')
 const guidance = read('latex-project.md')
 
 test('LaTeX declares one first-class document project contract', () => {
-  assert.equal(manifest.version, '3.0.1')
+  assert.equal(manifest.version, '3.0.2')
   assert.equal(manifest.embeds_agent, false)
   assert.deepEqual(manifest.source_files, [
     'latex-project.md',
     'project-builder.sh',
     'templates/main.tex',
   ])
+  assert.equal(manifest.offline_capable, false)
   assert.deepEqual(manifest.offline, {
-    reads: true,
+    reads: false,
     writes: 'none',
     execution: 'none',
   })
@@ -35,11 +36,14 @@ test('LaTeX declares one first-class document project contract', () => {
 test('the launcher delegates workspace ownership to Projects', () => {
   assert.match(source, /const LOCAL_TEMPLATE_ID = 'document'/)
   assert.match(source, /window\.mobius\?\.projects/)
-  for (const operation of ['templates', 'migrate', 'list', 'create', 'open', 'browse']) {
+  for (const operation of ['templates', 'list', 'create', 'open', 'browse']) {
     assert.match(source, new RegExp(`projectApi\\??\\.${operation}`))
   }
+  assert.doesNotMatch(source, /projectApi\??\.migrate/)
   assert.doesNotMatch(source, /mobius\?\.storage|mobius\.chat|localStorage/)
   assert.doesNotMatch(source, /const project = await projectApi\.create/)
+  assert.match(source, /onOnlineChange/)
+  assert.match(source, /retry when you reconnect/)
   assert.match(source, /--project-row-accent/)
   assert.match(source, /min-height:\s*44px/)
   assert.match(source, /:focus-visible/)
