@@ -15,6 +15,7 @@ test('LaTeX declares one first-class document project contract', () => {
     'latex-project.md',
     'project-builder.sh',
     'templates/main.tex',
+    'latest-request.js',
   ])
   assert.equal(manifest.offline_capable, false)
   assert.deepEqual(manifest.offline, {
