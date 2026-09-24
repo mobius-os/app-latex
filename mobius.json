@@ -10,7 +10,8 @@
   "source_files": [
     "latex-project.md",
     "project-builder.sh",
-    "templates/main.tex"
+    "templates/main.tex",
+    "latest-request.js"
   ],
   "icon": "icon.png",
   "offline_capable": false,

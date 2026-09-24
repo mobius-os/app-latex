@@ -1,6 +1,7 @@
 /* A focused project launcher: resume work first, with creation owned by Projects. */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronRight, FileDocument, FileCode, FilePresentation, Grid, WebsiteNetwork, Plus, Search } from '@openai/apps-sdk-ui/components/Icon'
+import { makeLatestRequestGate } from './latest-request.js'
 
 const LOCAL_TEMPLATE_ID = 'document'
 const TYPES = {
@@ -65,8 +66,11 @@ export default function App({ appId }) {
   const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
+  const refreshGate = useRef(null)
+  if (!refreshGate.current) refreshGate.current = makeLatestRequestGate()
 
   const refresh = useCallback(async () => {
+    const requestId = refreshGate.current.begin()
     if (!projectApi?.templates) { setLoadError('Refresh Möbius to load Projects support.'); setLoading(false); return }
     setLoading(true)
     setLoadError('')
@@ -75,14 +79,18 @@ export default function App({ appId }) {
         projectApi.list(),
         projectApi.templates(),
       ])
+      if (!refreshGate.current.isCurrent(requestId)) return
       setProjects(rows)
       setTemplates(types)
       window.mobius?.signal?.('app_ready', { item_count: rows.length })
     } catch (cause) {
+      if (!refreshGate.current.isCurrent(requestId)) return
       setLoadError(window.mobius?.online === false
         ? 'LaTeX needs a connection to load Projects. It will retry when you reconnect.'
         : (cause?.message || 'Could not load your projects. Try again.'))
-    } finally { setLoading(false) }
+    } finally {
+      if (refreshGate.current.isCurrent(requestId)) setLoading(false)
+    }
   }, [projectApi])
   useEffect(() => {
     void refresh()
