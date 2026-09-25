@@ -10,7 +10,7 @@ description: Build or edit a LaTeX document when the LaTeX app is installed. In 
 When there is no `$PROJECT_ROOT`, do not create a Project merely to produce the
 document.
 
-1. Read the `artifacts` skill to resolve the installed Pages app and mint a
+1. Read the `pages` skill to resolve the installed Pages app and mint a
    stable `artifact_id`. Author `.tex` source and related local files directly
    in `/data/apps/<PAGES_APP_ID>/sources/<artifact_id>/`. Keep one clear root
    document, normally `main.tex`; this is the durable editable source tree.
@@ -18,7 +18,7 @@ document.
    concrete error. Keep generated PDF/log files out of the editable tree.
 3. Create a standalone self-contained HTML Page presenting the compiled PDF
    from an inline `data:` URL. Publish it as an immutable Page version using
-   `artifacts`; it remains independently openable without a Project.
+   `pages`; it remains independently openable without a Project.
 4. Add explicit builder provenance so Projects can manage the existing source:
 
 ```json
