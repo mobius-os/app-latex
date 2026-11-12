@@ -35,7 +35,12 @@ document.
 List every source file needed to rebuild the document; never include generated
 PDF/log files. Write source files before atomically publishing the record. The
 owner can later choose **Add to Projects** to manage this same source tree,
-not an independent copy. For later edits, reuse the source tree and page id,
+not an independent copy. A project linked this way appears under **Projects**
+only. The LaTeX app's own document list deliberately shows just documents
+created in the app, so tell the owner to look in Projects and do not call the
+exclusion a bug. If they want the document inside the LaTeX app itself, create
+it there (**New document**) and build its PDF artifact instead. For later
+edits, reuse the source tree and page id,
 preserve this metadata, and compile a new immutable preview version. If already
 managed by Projects, use that same Project's root and build workflow rather
 than making a second editable workspace. Existing Page versions stay unchanged.
@@ -53,6 +58,12 @@ do not modify the installed LaTeX app or its app-scoped storage.
   **Build as PDF** on a file) after meaningful source changes; fix the first
   concrete build error rather than guessing. The built artifact opens in its
   own viewer, independent of the project workspace.
+- From a chat, rebuild through the Project's build route instead of running
+  `project-builder.sh` yourself:
+  `mapi -f -X POST /api/projects/$PROJECT_ID/artifacts/<artifact_id>/build`.
+  List the artifact ids with `mapi -f /api/projects/$PROJECT_ID/artifacts`; read
+  the build log at `.../<artifact_id>/log`. The platform writes the output to
+  `artifacts/<artifact_id>/output/`, the only place the viewer reads.
 - Never delete or replace unrelated Project files while reorganizing a document.
 - Prefer portable LaTeX supported by Tectonic. If a package or font is missing,
   surface the exact dependency instead of silently substituting the document's
